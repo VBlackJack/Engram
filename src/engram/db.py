@@ -1,0 +1,214 @@
+# Copyright 2026 Julien Bombled
+# SPDX-License-Identifier: Apache-2.0
+
+"""SQLite connection safeguards and transactional migrations."""
+
+from __future__ import annotations
+
+import sqlite3
+from collections.abc import Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass
+
+from .config import DatabaseConfig
+
+MINIMUM_SQLITE_VERSION = (3, 51, 3)
+SQLITE_VERSION_COMPONENTS = 3
+
+
+class SQLiteVersionError(RuntimeError):
+    """Raised when the SQLite runtime is affected by the WAL-reset bug."""
+
+
+class DatabaseError(RuntimeError):
+    """Raised when database setup or migration cannot complete safely."""
+
+
+@dataclass(frozen=True, slots=True)
+class Migration:
+    """A numbered group of SQL statements applied atomically."""
+
+    version: int
+    statements: tuple[str, ...]
+
+
+MIGRATIONS = (
+    Migration(
+        version=1,
+        statements=(
+            """
+            CREATE TABLE entries (
+                id TEXT PRIMARY KEY,
+                kind TEXT NOT NULL CHECK (
+                    kind IN ('preference', 'decision', 'project_state', 'fact', 'episode')
+                ),
+                scope TEXT NOT NULL,
+                statement TEXT NOT NULL,
+                subject_keys TEXT NOT NULL DEFAULT '[]',
+                status TEXT NOT NULL CHECK (
+                    status IN ('active', 'superseded', 'quarantined', 'expired')
+                ),
+                promotion_state TEXT NOT NULL CHECK (
+                    promotion_state IN ('candidate', 'approved', 'rejected', 'promoted')
+                ),
+                source_type TEXT NOT NULL CHECK (
+                    source_type IN (
+                        'human', 'tool_verified', 'model_inferred', 'session_summary'
+                    )
+                ),
+                writer_model TEXT,
+                confidence TEXT NOT NULL CHECK (confidence IN ('high', 'medium', 'low')),
+                observed_at TEXT,
+                recorded_at TEXT NOT NULL,
+                valid_from TEXT,
+                valid_until TEXT,
+                expires_at TEXT,
+                idempotency_key TEXT NOT NULL UNIQUE,
+                supersedes TEXT NOT NULL DEFAULT '[]',
+                evidence TEXT NOT NULL DEFAULT '[]',
+                datacron_ref TEXT,
+                datacron_hash TEXT,
+                synced_at TEXT
+            )
+            """,
+            """
+            CREATE TABLE audit_log (
+                seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT NOT NULL,
+                actor TEXT NOT NULL,
+                action TEXT NOT NULL CHECK (
+                    action IN (
+                        'insert', 'attest', 'confidence_capped', 'idempotent_noop',
+                        'supersede', 'expire', 'purge'
+                    )
+                ),
+                entry_id TEXT,
+                detail_hash TEXT
+            )
+            """,
+            """
+            CREATE INDEX entries_expiration_idx
+            ON entries(status, expires_at)
+            """,
+        ),
+    ),
+)
+
+
+def open_database(config: DatabaseConfig) -> sqlite3.Connection:
+    """Open, validate, configure, and migrate an Engram database."""
+    config.path.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(
+        config.path,
+        timeout=config.busy_timeout_ms / 1000,
+        isolation_level=None,
+        check_same_thread=False,
+    )
+    connection.row_factory = sqlite3.Row
+    try:
+        verify_sqlite_version(connection)
+        _configure_connection(connection, config.busy_timeout_ms)
+        apply_migrations(connection)
+    except BaseException:
+        connection.close()
+        raise
+    return connection
+
+
+def verify_sqlite_version(
+    connection: sqlite3.Connection,
+    minimum: tuple[int, int, int] = MINIMUM_SQLITE_VERSION,
+) -> None:
+    """Fail closed when SQLite predates the WAL-reset bug fix."""
+    actual_text = _read_sqlite_version(connection)
+    actual = _parse_sqlite_version(actual_text)
+    if actual < minimum:
+        minimum_text = ".".join(str(part) for part in minimum)
+        raise SQLiteVersionError(
+            "SQLite "
+            f"{minimum_text} or newer is required; found {actual_text}. "
+            "Older runtimes are rejected because they do not contain the WAL-reset bug fix."
+        )
+
+
+def apply_migrations(connection: sqlite3.Connection) -> None:
+    """Apply each pending numbered migration in its own transaction."""
+    _ensure_version_table(connection)
+    current_version = _schema_version(connection)
+    latest_version = MIGRATIONS[-1].version if MIGRATIONS else 0
+    if current_version > latest_version:
+        raise DatabaseError(
+            f"Database schema version {current_version} is newer than supported "
+            f"version {latest_version}"
+        )
+
+    for migration in MIGRATIONS:
+        if migration.version <= current_version:
+            continue
+        with transaction(connection):
+            for statement in migration.statements:
+                connection.execute(statement)
+            connection.execute("UPDATE schema_version SET version = ?", (migration.version,))
+        current_version = migration.version
+
+
+@contextmanager
+def transaction(connection: sqlite3.Connection) -> Iterator[None]:
+    """Run a fail-closed immediate transaction."""
+    if connection.in_transaction:
+        raise DatabaseError("Nested database transactions are not supported")
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        yield
+    except BaseException:
+        connection.rollback()
+        raise
+    else:
+        connection.commit()
+
+
+def _read_sqlite_version(connection: sqlite3.Connection) -> str:
+    row = connection.execute("SELECT sqlite_version()").fetchone()
+    if row is None:
+        raise SQLiteVersionError("SQLite did not report a runtime version")
+    return str(row[0])
+
+
+def _parse_sqlite_version(version: str) -> tuple[int, int, int]:
+    parts = version.split(".")
+    if len(parts) < SQLITE_VERSION_COMPONENTS:
+        raise SQLiteVersionError(f"SQLite reported an invalid runtime version: {version}")
+    try:
+        return int(parts[0]), int(parts[1]), int(parts[2])
+    except ValueError as exc:
+        raise SQLiteVersionError(f"SQLite reported an invalid runtime version: {version}") from exc
+
+
+def _configure_connection(connection: sqlite3.Connection, busy_timeout_ms: int) -> None:
+    journal_mode_row = connection.execute("PRAGMA journal_mode = WAL").fetchone()
+    journal_mode = "" if journal_mode_row is None else str(journal_mode_row[0]).lower()
+    if journal_mode != "wal":
+        raise DatabaseError(f"SQLite refused WAL journal mode: {journal_mode or 'unknown'}")
+    connection.execute(f"PRAGMA busy_timeout = {busy_timeout_ms:d}")
+    connection.execute("PRAGMA foreign_keys = ON")
+    foreign_keys_row = connection.execute("PRAGMA foreign_keys").fetchone()
+    if foreign_keys_row is None or int(foreign_keys_row[0]) != 1:
+        raise DatabaseError("SQLite foreign key enforcement could not be enabled")
+
+
+def _ensure_version_table(connection: sqlite3.Connection) -> None:
+    with transaction(connection):
+        connection.execute("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL)")
+        row = connection.execute("SELECT COUNT(*) FROM schema_version").fetchone()
+        row_count = 0 if row is None else int(row[0])
+        if row_count == 0:
+            connection.execute("INSERT INTO schema_version(version) VALUES (0)")
+        elif row_count != 1:
+            raise DatabaseError("schema_version must contain exactly one row")
+
+
+def _schema_version(connection: sqlite3.Connection) -> int:
+    row = connection.execute("SELECT version FROM schema_version").fetchone()
+    if row is None:
+        raise DatabaseError("schema_version is empty")
+    return int(row[0])

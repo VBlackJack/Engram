@@ -1,0 +1,19 @@
+[database]
+path = "engram.db"
+busy_timeout_ms = 5000
+
+[ttl_days]
+preference = 0
+decision = 0
+fact = 0
+project_state = 30
+episode = 7
+
+[limits]
+max_statement_chars = 2000
+max_subject_keys = 8
+
+[logging]
+path = "logs/engram.log"
+file_level = "INFO"
+console_level = "INFO"
