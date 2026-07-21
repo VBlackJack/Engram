@@ -49,7 +49,8 @@ jobs:
           SQLITE_ARCHIVE="$archive" python -c "import hashlib, os, pathlib; value = hashlib.sha3_256(pathlib.Path(os.environ['SQLITE_ARCHIVE']).read_bytes()).hexdigest(); assert value == '98f2b3f3c11be6a03ea32346937b032c2472ebbd7a716bed36ca2f5693e7ce8b', value"
           tar --extract --gzip --file "$archive" --directory "$RUNNER_TEMP"
           cd "$RUNNER_TEMP/sqlite-autoconf-3530300"
-          ./configure --prefix="$RUNNER_TEMP/sqlite-3.53.3" --enable-shared --disable-static
+          CFLAGS="-O2 -DSQLITE_ENABLE_FTS5" ./configure \
+            --prefix="$RUNNER_TEMP/sqlite-3.53.3" --enable-shared --disable-static
           make -j2
           make install
           echo "LD_LIBRARY_PATH=$RUNNER_TEMP/sqlite-3.53.3/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
