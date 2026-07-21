@@ -119,3 +119,11 @@ class AuditRecord:
     action: AuditAction
     entry_id: str | None
     detail_hash: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class CandidateWriteResult:
+    """Candidate write outcome including retry idempotence information."""
+
+    entry: Entry
+    idempotent: bool

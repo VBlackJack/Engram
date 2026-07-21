@@ -8,7 +8,7 @@ from __future__ import annotations
 import os
 import tomllib
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +17,7 @@ from .models import EntryKind
 ENV_PREFIX = "ENGRAM_"
 DEFAULT_CONFIG_PATH = Path("engram.toml")
 SUPPORTED_LOG_LEVELS = frozenset({"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"})
+MAX_NETWORK_PORT = 65_535
 
 
 class ConfigError(ValueError):
@@ -71,6 +72,25 @@ class LoggingConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class ServerConfig:
+    """Streamable HTTP server and write backpressure settings."""
+
+    host: str = "127.0.0.1"
+    port: int = 8377
+    path: str = "/mcp"
+    write_wait_timeout_ms: int = 2000
+
+
+@dataclass(frozen=True, slots=True)
+class CapsuleConfig:
+    """Recall capsule token budget settings."""
+
+    default_token_budget: int = 600
+    min_token_budget: int = 150
+    max_token_budget: int = 1500
+
+
+@dataclass(frozen=True, slots=True)
 class AppConfig:
     """Complete Engram application configuration."""
 
@@ -78,12 +98,16 @@ class AppConfig:
     ttl_days: TtlConfig
     limits: LimitsConfig
     logging: LoggingConfig
+    server: ServerConfig = field(default_factory=ServerConfig)
+    capsule: CapsuleConfig = field(default_factory=CapsuleConfig)
 
 
 DEFAULT_DATABASE_CONFIG = DatabaseConfig()
 DEFAULT_TTL_CONFIG = TtlConfig()
 DEFAULT_LIMITS_CONFIG = LimitsConfig()
 DEFAULT_LOGGING_CONFIG = LoggingConfig()
+DEFAULT_SERVER_CONFIG = ServerConfig()
+DEFAULT_CAPSULE_CONFIG = CapsuleConfig()
 
 
 def load_config(
@@ -112,6 +136,8 @@ def load_config(
     ttl_days = _section(raw, "ttl_days")
     limits = _section(raw, "limits")
     logging_config = _section(raw, "logging")
+    server = _section(raw, "server")
+    capsule = _section(raw, "capsule")
     base_directory = config_path.parent
 
     result = AppConfig(
@@ -172,6 +198,37 @@ def load_config(
                 environment,
                 DEFAULT_LOGGING_CONFIG.console_level,
             ).upper(),
+        ),
+        server=ServerConfig(
+            host=_string_value(server, "host", environment, DEFAULT_SERVER_CONFIG.host),
+            port=_integer_value(server, "port", environment, DEFAULT_SERVER_CONFIG.port),
+            path=_string_value(server, "path", environment, DEFAULT_SERVER_CONFIG.path),
+            write_wait_timeout_ms=_integer_value(
+                server,
+                "write_wait_timeout_ms",
+                environment,
+                DEFAULT_SERVER_CONFIG.write_wait_timeout_ms,
+            ),
+        ),
+        capsule=CapsuleConfig(
+            default_token_budget=_integer_value(
+                capsule,
+                "default_token_budget",
+                environment,
+                DEFAULT_CAPSULE_CONFIG.default_token_budget,
+            ),
+            min_token_budget=_integer_value(
+                capsule,
+                "min_token_budget",
+                environment,
+                DEFAULT_CAPSULE_CONFIG.min_token_budget,
+            ),
+            max_token_budget=_integer_value(
+                capsule,
+                "max_token_budget",
+                environment,
+                DEFAULT_CAPSULE_CONFIG.max_token_budget,
+            ),
         ),
     )
     _validate_config(result)
@@ -250,6 +307,11 @@ def _resolve_path(base_directory: Path, configured_path: str) -> Path:
 
 
 def _validate_config(config: AppConfig) -> None:
+    _validate_storage_config(config)
+    _validate_server_config(config)
+
+
+def _validate_storage_config(config: AppConfig) -> None:
     if config.database.busy_timeout_ms <= 0:
         raise ConfigError("database.busy_timeout_ms must be greater than zero")
     ttl_values = (
@@ -269,3 +331,22 @@ def _validate_config(config: AppConfig) -> None:
         raise ConfigError(f"Unsupported file log level: {config.logging.file_level}")
     if config.logging.console_level not in SUPPORTED_LOG_LEVELS:
         raise ConfigError(f"Unsupported console log level: {config.logging.console_level}")
+
+
+def _validate_server_config(config: AppConfig) -> None:
+    if not 1 <= config.server.port <= MAX_NETWORK_PORT:
+        raise ConfigError("server.port must be between 1 and 65535")
+    if not config.server.path.startswith("/"):
+        raise ConfigError("server.path must start with a slash")
+    if config.server.write_wait_timeout_ms <= 0:
+        raise ConfigError("server.write_wait_timeout_ms must be greater than zero")
+    if config.capsule.min_token_budget <= 0:
+        raise ConfigError("capsule.min_token_budget must be greater than zero")
+    if config.capsule.max_token_budget < config.capsule.min_token_budget:
+        raise ConfigError("capsule.max_token_budget must be at least the minimum")
+    if not (
+        config.capsule.min_token_budget
+        <= config.capsule.default_token_budget
+        <= config.capsule.max_token_budget
+    ):
+        raise ConfigError("capsule.default_token_budget must be within the configured bounds")

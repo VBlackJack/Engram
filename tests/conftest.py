@@ -63,7 +63,7 @@ def app_config(tmp_path: Path) -> AppConfig:
 
 @pytest.fixture
 def sqlite_runtime_compatibility(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Isolate storage semantics from the older SQLite bundled by the test host."""
+    """Isolate unit-level storage semantics from the independent runtime guard."""
 
     def accept_runtime(
         connection: sqlite3.Connection,

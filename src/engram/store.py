@@ -12,18 +12,20 @@ import re
 import secrets
 import sqlite3
 import unicodedata
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager
 from datetime import UTC, date, datetime, timedelta
 from enum import StrEnum
 from threading import RLock
 from types import TracebackType
-from typing import Any, Self, cast
+from typing import Any, Literal, Self, cast, overload
 
 from .config import AppConfig
 from .db import open_database, transaction
 from .models import (
     AuditAction,
     AuditRecord,
+    CandidateWriteResult,
     Confidence,
     Entry,
     EntryKind,
@@ -48,6 +50,10 @@ class StoreClosedError(RuntimeError):
 
 class StoreValidationError(ValueError):
     """Raised when an entry hint violates the storage contract."""
+
+
+class StoreBusyError(RuntimeError):
+    """Raised when the bounded writer wait expires."""
 
 
 class EngramStore:
@@ -89,6 +95,40 @@ class EngramStore:
             self._connection.close()
             self._closed = True
 
+    @overload
+    def add_candidate(
+        self,
+        *,
+        kind: EntryKind | str,
+        scope: str,
+        statement: str,
+        writer_model: str,
+        confidence: Confidence | str = Confidence.MEDIUM,
+        subject_keys: Sequence[str] = (),
+        observed_at: datetime | None = None,
+        valid_from: date | None = None,
+        valid_until: date | None = None,
+        evidence: Sequence[Evidence] = (),
+        include_outcome: Literal[False] = False,
+    ) -> Entry: ...
+
+    @overload
+    def add_candidate(
+        self,
+        *,
+        kind: EntryKind | str,
+        scope: str,
+        statement: str,
+        writer_model: str,
+        confidence: Confidence | str = Confidence.MEDIUM,
+        subject_keys: Sequence[str] = (),
+        observed_at: datetime | None = None,
+        valid_from: date | None = None,
+        valid_until: date | None = None,
+        evidence: Sequence[Evidence] = (),
+        include_outcome: Literal[True],
+    ) -> CandidateWriteResult: ...
+
     def add_candidate(  # noqa: PLR0913
         self,
         *,
@@ -102,7 +142,8 @@ class EngramStore:
         valid_from: date | None = None,
         valid_until: date | None = None,
         evidence: Sequence[Evidence] = (),
-    ) -> Entry:
+        include_outcome: bool = False,
+    ) -> Entry | CandidateWriteResult:
         """Store an untrusted model inference with server-owned provenance fields."""
         actor = _required_text(writer_model, "writer_model")
         requested_confidence = _enum_value(Confidence, confidence, "confidence")
@@ -111,7 +152,7 @@ class EngramStore:
         if confidence_was_capped:
             effective_confidence = Confidence.MEDIUM
 
-        return self._add_entry(
+        entry, idempotent = self._add_entry(
             kind=kind,
             scope=scope,
             statement=statement,
@@ -129,6 +170,9 @@ class EngramStore:
             action=AuditAction.INSERT,
             confidence_was_capped=confidence_was_capped,
         )
+        if include_outcome:
+            return CandidateWriteResult(entry=entry, idempotent=idempotent)
+        return entry
 
     def add_attested(  # noqa: PLR0913
         self,
@@ -151,7 +195,7 @@ class EngramStore:
             raise StoreValidationError(
                 "add_attested only accepts human or tool_verified provenance"
             )
-        return self._add_entry(
+        entry, _ = self._add_entry(
             kind=kind,
             scope=scope,
             statement=statement,
@@ -169,6 +213,25 @@ class EngramStore:
             action=AuditAction.ATTEST,
             confidence_was_capped=False,
         )
+        return entry
+
+    @contextmanager
+    def write_access(self, timeout_ms: int | None = None) -> Iterator[None]:
+        """Acquire the process writer lock, optionally with a bounded wait."""
+        if timeout_ms is not None and timeout_ms <= 0:
+            raise StoreValidationError("timeout_ms must be greater than zero")
+        acquired = (
+            self._write_lock.acquire()
+            if timeout_ms is None
+            else self._write_lock.acquire(timeout=timeout_ms / 1000)
+        )
+        if not acquired:
+            raise StoreBusyError("server busy, retry")
+        try:
+            self._ensure_open()
+            yield
+        finally:
+            self._write_lock.release()
 
     def supersede(self, old_id: str, new_id: str, *, actor: str = "cli") -> None:
         """Mark the old entry superseded and link it from the replacement."""
@@ -294,6 +357,15 @@ class EngramStore:
             ).fetchall()
             return tuple(_audit_from_row(row) for row in rows)
 
+    def list_entries(self) -> tuple[Entry, ...]:
+        """Return payload rows newest first for the replaceable v0 retriever."""
+        with self._write_lock:
+            self._ensure_open()
+            rows = self._connection.execute(
+                "SELECT * FROM entries ORDER BY recorded_at DESC, id DESC"
+            ).fetchall()
+            return tuple(_entry_from_row(row) for row in rows)
+
     def _add_entry(  # noqa: PLR0913
         self,
         *,
@@ -313,7 +385,7 @@ class EngramStore:
         actor: str,
         action: AuditAction,
         confidence_was_capped: bool,
-    ) -> Entry:
+    ) -> tuple[Entry, bool]:
         normalized_kind = _enum_value(EntryKind, kind, "kind")
         normalized_scope = _normalize_scope(scope)
         normalized_statement = _normalize_statement(
@@ -346,7 +418,7 @@ class EngramStore:
                         entry_id=existing.id,
                         detail={"idempotency_key": idempotency_key},
                     )
-                    return existing
+                    return existing, True
 
                 ttl_days = self._config.ttl_days.for_kind(normalized_kind)
                 expires_at = None if ttl_days == 0 else now + timedelta(days=ttl_days)
@@ -393,7 +465,7 @@ class EngramStore:
                         },
                     )
         LOGGER.info("Stored %s entry %s", entry.kind.value, entry.id)
-        return entry
+        return entry, False
 
     def _insert_entry(self, entry: Entry) -> None:
         self._connection.execute(

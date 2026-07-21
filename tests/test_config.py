@@ -37,6 +37,17 @@ max_subject_keys = 8
 path = "logs/base.log"
 file_level = "INFO"
 console_level = "WARNING"
+
+[server]
+host = "127.0.0.1"
+port = 8377
+path = "/mcp"
+write_wait_timeout_ms = 2000
+
+[capsule]
+default_token_budget = 600
+min_token_budget = 150
+max_token_budget = 1500
 """.strip(),
         encoding="utf-8",
     )
@@ -46,6 +57,9 @@ console_level = "WARNING"
         "ENGRAM_TTL_DAYS_EPISODE": "3",
         "ENGRAM_LIMITS_MAX_SUBJECT_KEYS": "4",
         "ENGRAM_LOGGING_FILE_LEVEL": "debug",
+        "ENGRAM_SERVER_PORT": "9000",
+        "ENGRAM_SERVER_PATH": "/memory",
+        "ENGRAM_CAPSULE_DEFAULT_TOKEN_BUDGET": "700",
     }
 
     config = load_config(config_path, environ=environment)
@@ -57,6 +71,10 @@ console_level = "WARNING"
     assert config.limits.max_subject_keys == 4
     assert config.logging.file_level == "DEBUG"
     assert config.logging.path == (tmp_path / "logs" / "base.log").resolve()
+    assert config.server.port == 9000
+    assert config.server.path == "/memory"
+    assert config.server.write_wait_timeout_ms == 2000
+    assert config.capsule.default_token_budget == 700
 
 
 def test_load_config_rejects_invalid_limits(tmp_path: Path) -> None:
@@ -64,6 +82,17 @@ def test_load_config_rejects_invalid_limits(tmp_path: Path) -> None:
     config_path.write_text("[limits]\nmax_statement_chars = 0\n", encoding="utf-8")
 
     with pytest.raises(ConfigError, match="max_statement_chars"):
+        load_config(config_path, environ={})
+
+
+def test_load_config_rejects_invalid_capsule_bounds(tmp_path: Path) -> None:
+    config_path = tmp_path / "engram.toml"
+    config_path.write_text(
+        "[capsule]\nmin_token_budget = 500\nmax_token_budget = 400\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError, match="at least the minimum"):
         load_config(config_path, environ={})
 
 
