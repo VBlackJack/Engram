@@ -40,9 +40,51 @@ jobs:
       - name: Install locked dependencies
         run: uv sync --frozen --extra dev --python 3.14.3
 
-      # uv's managed CPython 3.14.3 build embeds a patched SQLite. Keep the
-      # explicit assertion: Engram refuses SQLite versions affected by the
-      # WAL-reset bug, regardless of the runner's system Python.
+      # The managed CPython build on GitHub currently embeds SQLite 3.50.4.
+      # Build the official 3.53.3 shared library and put it ahead of the
+      # bundled library for every later step.
+      - name: Install SQLite 3.53.3 (Ubuntu)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          archive="$RUNNER_TEMP/sqlite-autoconf-3530300.tar.gz"
+          curl --fail --silent --show-error --location \
+            https://www.sqlite.org/2026/sqlite-autoconf-3530300.tar.gz \
+            --output "$archive"
+          SQLITE_ARCHIVE="$archive" python -c "import hashlib, os, pathlib; value = hashlib.sha3_256(pathlib.Path(os.environ['SQLITE_ARCHIVE']).read_bytes()).hexdigest(); assert value == '98f2b3f3c11be6a03ea32346937b032c2472ebbd7a716bed36ca2f5693e7ce8b', value"
+          tar --extract --gzip --file "$archive" --directory "$RUNNER_TEMP"
+          cd "$RUNNER_TEMP/sqlite-autoconf-3530300"
+          ./configure --prefix="$RUNNER_TEMP/sqlite-3.53.3" --enable-shared --disable-static
+          make -j2
+          make install
+          echo "LD_LIBRARY_PATH=$RUNNER_TEMP/sqlite-3.53.3/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
+
+      # Windows CPython loads a separate sqlite3.dll. Replace only the DLL in
+      # the ephemeral managed runtime after checking SQLite's published SHA3.
+      - name: Install SQLite 3.53.3 (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP "sqlite-dll-win-x64-3530300.zip"
+          $extract = Join-Path $env:RUNNER_TEMP "sqlite-dll-win-x64-3530300"
+          Invoke-WebRequest `
+            -Uri "https://www.sqlite.org/2026/sqlite-dll-win-x64-3530300.zip" `
+            -OutFile $archive
+          $env:SQLITE_ARCHIVE = $archive
+          python -c "import hashlib, os, pathlib; value = hashlib.sha3_256(pathlib.Path(os.environ['SQLITE_ARCHIVE']).read_bytes()).hexdigest(); assert value == '3a494861ce24d1f330efbc6c3fb58ce4972f2cf8df4e43122246ed987109dc8a', value"
+          Expand-Archive -LiteralPath $archive -DestinationPath $extract
+          $pythonExe = (& uv python find 3.14.3).Trim()
+          $pythonRoot = Split-Path -Parent $pythonExe
+          $target = Get-ChildItem -Path $pythonRoot -Recurse -Filter "sqlite3.dll" |
+            Select-Object -First 1
+          if ($null -eq $target) {
+            throw "sqlite3.dll was not found in the managed Python runtime."
+          }
+          Copy-Item -LiteralPath (Join-Path $extract "sqlite3.dll") `
+            -Destination $target.FullName -Force
+
+      # Keep the explicit assertion: Engram refuses SQLite versions affected
+      # by the WAL-reset bug, regardless of the runner's system Python.
       - name: Verify SQLite safety floor
         run: >-
           uv run --frozen --extra dev --python 3.14.3 python -c

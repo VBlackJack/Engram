@@ -4,8 +4,9 @@
 
 ## 1. Install Engram
 
-Engram requires Python 3.13+ and SQLite 3.51.3+ inside that Python's `sqlite3` module. The most
-reproducible path is the Python 3.14.3 runtime managed by `uv`, currently built with SQLite 3.53.3.
+Engram requires Python 3.13+ and SQLite 3.51.3+ inside that Python's `sqlite3` module. Install with
+the Python 3.14.3 runtime managed by `uv`, then verify SQLite: a Python build may still embed an
+older library. CI explicitly replaces it with official SQLite 3.53.3.
 
 ```powershell
 git clone https://github.com/VBlackJack/Engram.git
