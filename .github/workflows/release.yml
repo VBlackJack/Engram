@@ -16,8 +16,6 @@ jobs:
   build:
     name: Verify and build Python distributions
     runs-on: ubuntu-latest
-    env:
-      UV_PYTHON_PREFERENCE: only-managed
     permissions:
       contents: read
     steps:
@@ -29,13 +27,11 @@ jobs:
         with:
           python-version: "3.13"
 
-      - name: Install uv and managed Python
-        run: |
-          python -m pip install uv==0.11.3
-          uv python install 3.14.3
+      - name: Install uv
+        run: python -m pip install uv==0.11.3
 
       - name: Install locked dependencies
-        run: uv sync --frozen --extra dev --python 3.14.3
+        run: uv sync --frozen --extra dev --python 3.13
 
       - name: Install SQLite 3.53.3
         run: |
@@ -53,22 +49,22 @@ jobs:
 
       - name: Verify SQLite and quality gates
         run: |
-          uv run --frozen --extra dev --python 3.14.3 python -c "import sqlite3; assert sqlite3.sqlite_version_info >= (3, 51, 3)"
-          uv run --frozen --extra dev --python 3.14.3 ruff check .
-          uv run --frozen --extra dev --python 3.14.3 ruff format --check .
-          uv run --frozen --extra dev --python 3.14.3 mypy
-          uv run --frozen --extra dev --python 3.14.3 pytest
+          uv run --frozen --extra dev --python 3.13 python -c "import sqlite3; assert sqlite3.sqlite_version_info >= (3, 51, 3)"
+          uv run --frozen --extra dev --python 3.13 ruff check .
+          uv run --frozen --extra dev --python 3.13 ruff format --check .
+          uv run --frozen --extra dev --python 3.13 mypy
+          uv run --frozen --extra dev --python 3.13 pytest
 
       - name: Verify tag matches package version
         if: startsWith(github.ref, 'refs/tags/')
         env:
           REF_NAME: ${{ github.ref_name }}
         run: >-
-          uv run --frozen --extra dev --python 3.14.3 python -c
+          uv run --frozen --extra dev --python 3.13 python -c
           "import os; from engram import __version__; assert os.environ['REF_NAME'] == f'v{__version__}'"
 
       - name: Build wheel and source archive
-        run: uv build --python 3.14.3
+        run: uv build --python 3.13
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f  # v6
