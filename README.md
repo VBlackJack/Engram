@@ -41,6 +41,20 @@ Les index FTS et vectoriels sont dérivés et reconstructibles :
 uv run engram reindex
 ```
 
+## Evaluation
+
+Le harnais versionné charge 72 entrées dans une base temporaire et note 64 requêtes avec des
+graders déterministes. Il ne contacte jamais le vault Datacron. Le mode `both` mesure aussi
+l'hybride si le modèle configuré répond :
+
+```powershell
+uv run engram eval --mode both --out local/eval
+```
+
+Le dossier de sortie contient `metrics.json`, avec le verdict P2 émis par le code, et
+`rapport-eval.md`, une synthèse française courte. Le modèle de référence est
+`nomic-embed-text-v1.5` via LM Studio; `bge-m3` reste une alternative configurable.
+
 ## Vérification
 
 ```powershell

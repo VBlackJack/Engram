@@ -32,6 +32,7 @@ max_token_budget = 1500
 [retrieval]
 mode = "fts"
 embeddings_endpoint = "http://127.0.0.1:1234/v1/embeddings"
+# Reference: nomic-embed-text-v1.5. Alternative: bge-m3.
 embeddings_model = ""
 embeddings_timeout_ms = 3000
 rrf_k = 60
