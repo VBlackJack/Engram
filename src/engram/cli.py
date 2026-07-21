@@ -9,6 +9,7 @@ import argparse
 import logging
 from pathlib import Path
 
+from . import __version__
 from .config import AppConfig, load_config
 from .consolidation.mcp_gateway import McpDatacronGateway
 from .consolidation.models import ConsolidationPlan
@@ -30,6 +31,7 @@ from .store import EngramStore
 def main() -> None:
     """Parse one supported command and execute its isolated workflow."""
     parser = argparse.ArgumentParser(prog="engram")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("serve", help="Run the streamable HTTP MCP server")
     commands.add_parser("reindex", help="Rebuild derived FTS and vector indexes")

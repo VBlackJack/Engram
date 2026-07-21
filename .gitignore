@@ -1,21 +1,61 @@
+# Local project material and generated evaluation/consolidation output
 local/
-.venv/
+
+# Python
 __pycache__/
 *.py[cod]
+*$py.class
+.Python
+.venv/
+venv/
+env/
+.tox/
+.nox/
+.hypothesis/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
 .coverage
+.coverage.*
 htmlcov/
 build/
 dist/
 *.egg-info/
+
+# Runtime data
 *.db
 *.db-journal
 *.db-shm
 *.db-wal
+*-wal
+*-shm
 *.sqlite
 *.sqlite3
 *.log
 engram.toml
 logs/
+
+# Secrets and machine-local environment
+.env
+.env.*
+!.env.example
+
+# Local client configuration
+.claude/
+CLAUDE.md
+
+# Editors and operating systems
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Public-repository safety nets for local planning material
+_stage*/
+AGENTS.md
+*brief*.md
+*review*.md
+*OM-[0-9][0-9]*

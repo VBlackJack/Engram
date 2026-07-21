@@ -1,92 +1,169 @@
 # Engram
 
-Engram est le memory broker de la trilogie :
+> L'hippocampe local de la trilogie : une memoire operationnelle partagee qui reste
+> explicable, bornee et consolidee vers Datacron apres revue humaine.
 
-- Datacron conserve la source de vérité Markdown et son historique.
-- Cortex recherche dans la documentation large.
-- Engram capture et rappelle une mémoire opérationnelle partagée entre assistants.
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+[![Python 3.13+](https://img.shields.io/badge/Python-3.13%2B-3776AB.svg)](pyproject.toml)
+[![MCP Streamable HTTP](https://img.shields.io/badge/MCP-Streamable%20HTTP-5A45FF.svg)](server.json)
+[![CI](https://github.com/VBlackJack/Engram/actions/workflows/ci.yml/badge.svg)](https://github.com/VBlackJack/Engram/actions/workflows/ci.yml)
 
-Ce dépôt contient un spike d'évaluation avec stockage SQLite et serveur MCP Streamable HTTP.
-Le serveur expose uniquement `remember` et `recall`. Le rappel utilise FTS5/BM25 par défaut,
-avec départage par récence et filet substring quand FTS5 ne trouve aucun résultat.
+Francais | [English](README.en.md)
+
+Engram est un serveur MCP local-first qui capture des souvenirs de travail et restitue des
+capsules compactes, classees selon leur confiance. Dans la trilogie, **Datacron** est le carnet
+Markdown durable et la source de verite, **Cortex** est le bibliothecaire de documentation large,
+et **Engram** est l'hippocampe : il maintient la memoire operationnelle entre clients puis propose
+sa consolidation vers Datacron.
+
+## Ce qui est en place
+
+| Capacite | Etat |
+| --- | --- |
+| Stockage | SQLite WAL, migrations, TTL, idempotence, supersession |
+| Ecriture | Un processus Engram est le writer unique |
+| Audit | Journal append-only sans contenu de souvenir |
+| MCP | Streamable HTTP, outils stricts `remember` et `recall` |
+| Recherche | FTS5/BM25 par defaut, hybride local optionnel derriere un flag |
+| Confiance | Provenance serveur, plafond de confiance, quarantaine anti-poisoning |
+| Rappel | Capsule bornee : current, next_action, relevant, conflicts, own_pending, sources |
+| Consolidation | Plan humain, ecriture Datacron par CAS, relecture, controle de fraicheur |
+| Evaluation | Corpus seede et graders deterministes, sans acces au vault Datacron |
+
+## Installation
+
+Prerequis :
+
+- Python 3.13 ou plus recent ;
+- `uv` 0.11.3 ou plus recent recommande ;
+- **SQLite 3.51.3 ou plus recent dans le runtime Python**.
+
+Le plancher SQLite est dur. Les versions 3.7.0 a 3.51.2 sont affectees par le bug WAL-reset
+documente par SQLite. Engram verifie `sqlite3.sqlite_version` a l'ouverture et refuse un runtime
+trop ancien. Voir [installation Windows](docs/fr/installation-windows.md) pour installer la DLL
+SQLite 3.53.x officielle. La page SQLite decrit le
+[bug WAL-reset](https://sqlite.org/wal.html#walreset) et publie les
+[binaires 3.53.3](https://www.sqlite.org/download.html).
+
+```powershell
+git clone https://github.com/VBlackJack/Engram.git
+cd Engram
+uv sync --extra dev --python 3.14.3
+uv run --python 3.14.3 python -c "import sqlite3; print(sqlite3.sqlite_version)"
+Copy-Item engram.example.toml engram.toml
+```
+
+Le paquet PyPI n'est pas publie dans cette release. L'installation se fait depuis les sources ou
+les artefacts wheel/sdist attaches a la release GitHub.
+
+## Demarrage rapide
+
+```powershell
+uv run --python 3.14.3 engram serve
+```
+
+Le point MCP par defaut est `http://127.0.0.1:8377/mcp`. Conserver cette adresse loopback : le
+serveur n'implemente pas d'authentification reseau.
+
+Ajoutez ensuite ce serveur a Claude Code, Codex ou Gemini, puis installez le
+[protocole client](docs/fr/client-protocol.md). Les blocs de configuration exacts sont dans le
+[guide de mise en place](docs/fr/setup.md).
 
 ## Configuration
 
-Engram exige Python 3.13 ou plus récent et SQLite 3.51.3 ou plus récent. Une version SQLite
-antérieure est refusée au démarrage à cause du correctif de réinitialisation WAL absent.
+Engram charge `engram.toml`. `ENGRAM_CONFIG` peut selectionner un autre fichier. Toute cle TOML
+peut etre surchargee par `ENGRAM_<SECTION>_<CLE>` ; les chemins relatifs sont resolus depuis le
+dossier du fichier TOML.
 
-Copier `engram.example.toml` vers `engram.toml`, puis adapter les valeurs. Chaque valeur peut
-être surchargée par une variable d'environnement préfixée `ENGRAM_`. Exemples :
-`ENGRAM_DATABASE_PATH`, `ENGRAM_TTL_DAYS_EPISODE` et `ENGRAM_LOGGING_FILE_LEVEL`.
-`ENGRAM_CONFIG` sélectionne un autre fichier TOML.
+| Section TOML | Variables principales | Role |
+| --- | --- | --- |
+| `[database]` | `ENGRAM_DATABASE_PATH`, `ENGRAM_DATABASE_BUSY_TIMEOUT_MS` | Base et attente SQLite |
+| `[ttl_days]` | `ENGRAM_TTL_DAYS_PREFERENCE`, `_DECISION`, `_FACT`, `_PROJECT_STATE`, `_EPISODE` | Duree par kind ; `0` desactive l'expiration |
+| `[limits]` | `ENGRAM_LIMITS_MAX_STATEMENT_CHARS`, `ENGRAM_LIMITS_MAX_SUBJECT_KEYS` | Bornes d'entree |
+| `[logging]` | `ENGRAM_LOGGING_PATH`, `_FILE_LEVEL`, `_CONSOLE_LEVEL` | Fichier et niveaux de log |
+| `[server]` | `ENGRAM_SERVER_HOST`, `_PORT`, `_PATH`, `_WRITE_WAIT_TIMEOUT_MS` | Endpoint HTTP et backpressure |
+| `[capsule]` | `ENGRAM_CAPSULE_DEFAULT_TOKEN_BUDGET`, `_MIN_TOKEN_BUDGET`, `_MAX_TOKEN_BUDGET` | Budget du rappel |
+| `[retrieval]` | `ENGRAM_RETRIEVAL_MODE`, `_EMBEDDINGS_ENDPOINT`, `_EMBEDDINGS_MODEL`, `_EMBEDDINGS_TIMEOUT_MS`, `_RRF_K` | FTS ou hybride local |
+| `[datacron]` | `ENGRAM_DATACRON_COMMAND`, `_ARGS`, `_VAULT_ROOT`, `_READ_PATHS`, `_WRITE_PATHS`, `_NEW_NOTE_DIRECTORY`, `_NEIGHBOR_LIMIT` | Gateway et confinement Datacron |
 
-La section `[server]` configure l'adresse, le port, le chemin MCP et le délai maximal
-d'acquisition du verrou d'écriture. La section `[capsule]` borne le budget des rappels.
-La section `[retrieval]` sélectionne `fts` ou le mode expérimental `hybrid`. Ce dernier exige
-un modèle et un endpoint local compatible OpenAI; une panne le dégrade explicitement en FTS.
-La section `[datacron]` configure le processus MCP stdio, le vault et ses allowlists. Les
-écritures restent désactivées tant que `write_paths` n'est pas explicitement renseigné.
+Pour une variable de liste, `ARGS` suit le decoupage shell et `READ_PATHS`/`WRITE_PATHS` utilisent
+le separateur de chemins de l'OS. Le fichier complet et ses valeurs sures sont dans
+[`engram.example.toml`](engram.example.toml). Les ecritures Datacron restent desactivees si
+`write_paths` est vide.
 
-## Serveur
+## Outils MCP
 
-```powershell
-uv run engram serve
+| Outil | Entrees essentielles | Resultat et politique |
+| --- | --- | --- |
+| `remember` | `statement`, `kind`, `scope`, `subject_keys`, `observed_at`, `evidence` | Cree un candidat `model_inferred`, `quarantined`, confiance au plus `medium` |
+| `recall` | `query`, `scope`, `kinds`, `include_conflicts`, `token_budget` | Retourne une capsule trust-aware ; seuls les candidats du client courant figurent dans `own_pending` |
+
+Kinds acceptes : `preference`, `decision`, `project_state`, `fact`, `episode`. Le serveur attribue
+la provenance ; un client ne peut jamais declarer lui-meme une source `human`.
+
+## Securite et vie privee
+
+- Toutes les donnees, l'index lexical, l'audit et les logs restent locaux.
+- Aucun appel a un LLM cloud ni aucune telemetrie n'est implemente.
+- Les candidats d'un client sont quarantaines pour eviter qu'une affirmation non attestee ne
+  devienne la verite partagee.
+- Le mode hybride contacte uniquement l'endpoint d'embeddings explicitement configure ; FTS est
+  le mode par defaut.
+- Les ecritures Datacron passent par des allowlists sous `_memory/`, une verification CAS et une
+  relecture.
+- Ne pas exposer le serveur sur `0.0.0.0` sans proxy d'authentification et controle reseau.
+
+Voir le [modele de securite complet](docs/fr/security.md).
+
+## Commandes CLI
+
+```text
+engram --version
+engram serve
+engram reindex
+engram eval --mode both --out local/eval
+engram consolidate --plan --out local/consolidation/plan.json
+engram consolidate --apply local/consolidation/plan.json
+engram consolidate --check-freshness
 ```
 
-Avec la configuration d'exemple, le point d'accès est `http://127.0.0.1:8377/mcp`. Les
-souvenirs déposés par `remember` restent en quarantaine. Ils ne sont visibles que dans
-`own_pending` pour le même client MCP, avec l'étiquette `unconfirmed candidate`.
+`consolidate --plan` ne modifie rien. Editez chaque `decision` du JSON (`approve` ou `reject`) avant
+`--apply`. Un hash Datacron divergent produit `stale` et exige un nouveau plan ; il n'est jamais
+force.
 
-Les index FTS et vectoriels sont dérivés et reconstructibles :
+## Limites actuelles
 
-```powershell
-uv run engram reindex
-```
+- Engram ne voit pas passivement les conversations : chaque client doit appeler `recall` et
+  `remember` selon le protocole documente.
+- Le transport est HTTP local. Le connecteur distant Claude Desktop exige une URL HTTPS publique ;
+  Claude Code se connecte directement a localhost.
+- Le mode hybride est experimental et depend d'un endpoint compatible OpenAI local. Il se degrade
+  explicitement vers FTS en cas de panne.
+- La publication PyPI et la soumission au MCP Registry sont differees. Le manifeste est pret pour
+  le paquet et son endpoint HTTP local.
+- Porter et les recherches par prefixe ne seront evalues que si l'usage reel montre des ratages
+  morphologiques.
 
-## Evaluation
+## Documentation
 
-Le harnais versionné charge 72 entrées dans une base temporaire et note 64 requêtes avec des
-graders déterministes. Il ne contacte jamais le vault Datacron. Le mode `both` mesure aussi
-l'hybride si le modèle configuré répond :
+| Demarrer | Comprendre | Exploiter en confiance |
+| --- | --- | --- |
+| [Installation](docs/fr/setup.md) | [Contrat de donnees](docs/fr/spec.md) | [Securite](docs/fr/security.md) |
+| [Windows et SQLite](docs/fr/installation-windows.md) | [Architecture](docs/fr/architecture.md) | [FAQ](docs/fr/faq.md) |
+| [Guide utilisateur](docs/fr/user-guide.md) | [Protocole client](docs/fr/client-protocol.md) | [Hub documentaire](docs/fr/index.md) |
 
-```powershell
-uv run engram eval --mode both --out local/eval
-```
-
-Le dossier de sortie contient `metrics.json`, avec le verdict P2 émis par le code, et
-`rapport-eval.md`, une synthèse française courte. Le modèle de référence est
-`nomic-embed-text-v1.5` via LM Studio; `bge-m3` reste une alternative configurable.
-
-## Consolidation Datacron
-
-Seules les entrées actives, approuvées et attestées par un humain ou un outil sont proposées.
-La planification ne modifie aucune donnée :
+## Developpement
 
 ```powershell
-uv run engram consolidate --plan --out local/consolidation/plan.json
+uv sync --extra dev --python 3.14.3
+uv run --python 3.14.3 ruff check .
+uv run --python 3.14.3 ruff format --check .
+uv run --python 3.14.3 mypy
+uv run --python 3.14.3 pytest
+uv build --python 3.14.3
 ```
 
-Relire `plan.md`, puis éditer dans `plan.json` chaque `decision` (`approve` ou `reject`) et,
-si nécessaire, `rel_path` ou `heading`. L'application relit chaque cible, impose le hash CAS,
-écrit via MCP, relit le résultat, puis seulement marque la mémoire comme promue :
+## Licence
 
-```powershell
-uv run engram consolidate --apply local/consolidation/plan.json
-uv run engram consolidate --check-freshness
-```
-
-Un conflit n'est jamais forcé : la proposition est signalée `stale` et doit être replannifiée.
-Le contrôle de fraîcheur ne réécrit pas Datacron; il masque du rappel courant toute promotion
-dont le hash a divergé.
-
-## Vérification
-
-```powershell
-uv sync --group dev
-uv run ruff check .
-uv run ruff format --check .
-uv run mypy
-uv run pytest
-```
-
-Licence Apache 2.0. Copyright 2026 Julien Bombled.
+Apache License 2.0. Copyright 2026 Julien Bombled. Voir [LICENSE](LICENSE) et les
+[notices tiers](THIRD_PARTY_NOTICES.md).

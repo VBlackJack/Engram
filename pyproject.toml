@@ -5,29 +5,46 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "engram-memory-broker"
 version = "2026.0721.04"
-description = "Shared memory broker evaluation spike"
-readme = "README.md"
+description = "Local-first MCP memory broker with trust-aware recall and reviewed consolidation."
+readme = "README.en.md"
 requires-python = ">=3.13"
 license = "Apache-2.0"
+license-files = ["LICENSE"]
 authors = [{ name = "Julien Bombled" }]
+keywords = ["mcp", "memory", "sqlite", "fts5", "local-first", "datacron"]
 classifiers = [
-  "Development Status :: 2 - Pre-Alpha",
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Topic :: Database :: Database Engines/Servers",
+  "Topic :: Software Development :: Libraries :: Python Modules",
+  "Typing :: Typed",
 ]
 dependencies = [
   "httpx==0.28.1",
   "mcp==1.28.1",
 ]
 
-[project.scripts]
-engram = "engram.cli:main"
-
-[dependency-groups]
+[project.optional-dependencies]
 dev = [
   "mypy>=1.18.2",
   "pytest>=8.4.2",
   "ruff>=0.14.0",
 ]
+
+[project.scripts]
+engram = "engram.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/VBlackJack/Engram"
+Documentation = "https://github.com/VBlackJack/Engram/blob/main/README.md"
+Source = "https://github.com/VBlackJack/Engram"
+Issues = "https://github.com/VBlackJack/Engram/issues"
+Changelog = "https://github.com/VBlackJack/Engram/blob/main/CHANGELOG.md"
 
 [tool.setuptools.packages.find]
 where = ["src", "."]

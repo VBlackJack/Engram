@@ -68,9 +68,9 @@ def test_fts_matches_lexical_subjects_and_diacritics(store: EngramStore) -> None
     accented = store.add_attested(
         kind="preference",
         scope="user",
-        statement="Le café est préféré le matin.",
+        statement="Le cafe est prefere le matin.",
         source_type=SourceType.HUMAN,
-        subject_keys=("routine/matinée",),
+        subject_keys=("routine/matinee",),
     )
     retriever = FtsRetriever(store)
 

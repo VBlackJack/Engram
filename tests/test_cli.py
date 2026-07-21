@@ -7,12 +7,28 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+import sys
 
-from engram.cli import _reindex
+import pytest
+
+from engram import __version__
+from engram.cli import _reindex, main
 from engram.config import AppConfig
 from engram.models import SourceType
 from engram.retrieval import FtsRetriever, RetrievalRequest
 from engram.store import EngramStore
+
+
+def test_version_command_reports_package_version(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(sys, "argv", ["engram", "--version"])
+    with pytest.raises(SystemExit) as exit_info:
+        main()
+
+    assert exit_info.value.code == 0
+    assert capsys.readouterr().out.strip() == f"engram {__version__}"
 
 
 def test_reindex_command_rebuilds_a_dropped_fts_table(app_config: AppConfig) -> None:

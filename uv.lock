@@ -242,7 +242,7 @@ dependencies = [
     { name = "mcp" },
 ]
 
-[package.dev-dependencies]
+[package.optional-dependencies]
 dev = [
     { name = "mypy" },
     { name = "pytest" },
@@ -253,14 +253,11 @@ dev = [
 requires-dist = [
     { name = "httpx", specifier = "==0.28.1" },
     { name = "mcp", specifier = "==1.28.1" },
+    { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.18.2" },
+    { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.4.2" },
+    { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.14.0" },
 ]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "mypy", specifier = ">=1.18.2" },
-    { name = "pytest", specifier = ">=8.4.2" },
-    { name = "ruff", specifier = ">=0.14.0" },
-]
+provides-extras = ["dev"]
 
 [[package]]
 name = "h11"

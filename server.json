@@ -1,0 +1,55 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.VBlackJack/engram",
+  "title": "Engram",
+  "description": "Local-first MCP memory broker with trust-aware recall and reviewed consolidation.",
+  "repository": {
+    "url": "https://github.com/VBlackJack/Engram",
+    "source": "github"
+  },
+  "websiteUrl": "https://github.com/VBlackJack/Engram",
+  "version": "2026.0721.04",
+  "packages": [
+    {
+      "registryType": "pypi",
+      "registryBaseUrl": "https://pypi.org",
+      "identifier": "engram-memory-broker",
+      "version": "2026.0721.04",
+      "runtimeHint": "uvx",
+      "transport": {
+        "type": "streamable-http",
+        "url": "http://{ENGRAM_SERVER_HOST}:{ENGRAM_SERVER_PORT}{ENGRAM_SERVER_PATH}"
+      },
+      "packageArguments": [
+        {
+          "type": "positional",
+          "value": "serve"
+        }
+      ],
+      "environmentVariables": [
+        {
+          "name": "ENGRAM_CONFIG",
+          "description": "Absolute path to the Engram TOML configuration file.",
+          "isRequired": true,
+          "format": "filepath"
+        },
+        {
+          "name": "ENGRAM_SERVER_HOST",
+          "description": "Local address used by the Streamable HTTP server.",
+          "default": "127.0.0.1"
+        },
+        {
+          "name": "ENGRAM_SERVER_PORT",
+          "description": "Local TCP port used by the Streamable HTTP server.",
+          "default": "8377",
+          "format": "number"
+        },
+        {
+          "name": "ENGRAM_SERVER_PATH",
+          "description": "HTTP path used by the MCP endpoint.",
+          "default": "/mcp"
+        }
+      ]
+    }
+  ]
+}
