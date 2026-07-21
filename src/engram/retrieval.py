@@ -95,6 +95,8 @@ class FtsRetriever:
         normalized_scope = _normalized_scope(request.scope)
         entries: list[Entry] = []
         for entry in self._store.list_entries():
+            if entry.stale:
+                continue
             if normalized_scope is not None and entry.scope != normalized_scope:
                 continue
             if request.kinds is not None and entry.kind not in request.kinds:

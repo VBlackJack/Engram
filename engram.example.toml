@@ -36,3 +36,13 @@ embeddings_endpoint = "http://127.0.0.1:1234/v1/embeddings"
 embeddings_model = ""
 embeddings_timeout_ms = 3000
 rrf_k = 60
+
+[datacron]
+command = "datacron-mcp"
+args = []
+# Empty values inherit the Datacron server environment and keep writes disabled by default.
+vault_root = ""
+read_paths = []
+write_paths = []
+new_note_directory = "_memory/engram"
+neighbor_limit = 8

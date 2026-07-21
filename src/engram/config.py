@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import os
+import shlex
 import tomllib
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -111,6 +112,19 @@ class RetrievalConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class DatacronConfig:
+    """Datacron stdio transport and vault confinement settings."""
+
+    command: str = "datacron-mcp"
+    args: tuple[str, ...] = ()
+    vault_root: Path | None = None
+    read_paths: tuple[Path, ...] = ()
+    write_paths: tuple[Path, ...] = ()
+    new_note_directory: str = "_memory/engram"
+    neighbor_limit: int = 8
+
+
+@dataclass(frozen=True, slots=True)
 class AppConfig:
     """Complete Engram application configuration."""
 
@@ -121,6 +135,7 @@ class AppConfig:
     server: ServerConfig = field(default_factory=ServerConfig)
     capsule: CapsuleConfig = field(default_factory=CapsuleConfig)
     retrieval: RetrievalConfig = field(default_factory=RetrievalConfig)
+    datacron: DatacronConfig = field(default_factory=DatacronConfig)
 
 
 DEFAULT_DATABASE_CONFIG = DatabaseConfig()
@@ -130,6 +145,7 @@ DEFAULT_LOGGING_CONFIG = LoggingConfig()
 DEFAULT_SERVER_CONFIG = ServerConfig()
 DEFAULT_CAPSULE_CONFIG = CapsuleConfig()
 DEFAULT_RETRIEVAL_CONFIG = RetrievalConfig()
+DEFAULT_DATACRON_CONFIG = DatacronConfig()
 
 
 def load_config(
@@ -161,6 +177,7 @@ def load_config(
     server = _section(raw, "server")
     capsule = _section(raw, "capsule")
     retrieval = _section(raw, "retrieval")
+    datacron = _section(raw, "datacron")
     base_directory = config_path.parent
 
     result = AppConfig(
@@ -282,6 +299,53 @@ def load_config(
                 DEFAULT_RETRIEVAL_CONFIG.rrf_k,
             ),
         ),
+        datacron=DatacronConfig(
+            command=_string_value(
+                datacron,
+                "command",
+                environment,
+                DEFAULT_DATACRON_CONFIG.command,
+            ),
+            args=_string_tuple_value(
+                datacron,
+                "args",
+                environment,
+                DEFAULT_DATACRON_CONFIG.args,
+            ),
+            vault_root=_optional_path_value(
+                base_directory,
+                datacron,
+                "vault_root",
+                environment,
+                DEFAULT_DATACRON_CONFIG.vault_root,
+            ),
+            read_paths=_path_tuple_value(
+                base_directory,
+                datacron,
+                "read_paths",
+                environment,
+                DEFAULT_DATACRON_CONFIG.read_paths,
+            ),
+            write_paths=_path_tuple_value(
+                base_directory,
+                datacron,
+                "write_paths",
+                environment,
+                DEFAULT_DATACRON_CONFIG.write_paths,
+            ),
+            new_note_directory=_string_value(
+                datacron,
+                "new_note_directory",
+                environment,
+                DEFAULT_DATACRON_CONFIG.new_note_directory,
+            ),
+            neighbor_limit=_integer_value(
+                datacron,
+                "neighbor_limit",
+                environment,
+                DEFAULT_DATACRON_CONFIG.neighbor_limit,
+            ),
+        ),
     )
     _validate_config(result)
     return result
@@ -363,6 +427,50 @@ def _optional_string_value(
     return value.strip()
 
 
+def _string_tuple_value(
+    section: dict[str, Any],
+    key: str,
+    environment: Mapping[str, str],
+    default: tuple[str, ...],
+) -> tuple[str, ...]:
+    value = _raw_value(section, key, environment, list(default))
+    if isinstance(value, str):
+        return tuple(shlex.split(value, posix=os.name != "nt"))
+    if isinstance(value, list) and all(isinstance(item, str) and item.strip() for item in value):
+        return tuple(item.strip() for item in value)
+    raise ConfigError(f"Configuration value must be a string array: {key}")
+
+
+def _optional_path_value(
+    base_directory: Path,
+    section: dict[str, Any],
+    key: str,
+    environment: Mapping[str, str],
+    default: Path | None,
+) -> Path | None:
+    value = _raw_value(section, key, environment, "" if default is None else str(default))
+    if not isinstance(value, str):
+        raise ConfigError(f"Configuration value must be a path string: {key}")
+    return None if not value.strip() else _resolve_path(base_directory, value.strip())
+
+
+def _path_tuple_value(
+    base_directory: Path,
+    section: dict[str, Any],
+    key: str,
+    environment: Mapping[str, str],
+    default: tuple[Path, ...],
+) -> tuple[Path, ...]:
+    value = _raw_value(section, key, environment, [str(path) for path in default])
+    if isinstance(value, str):
+        parts = tuple(part.strip() for part in value.split(os.pathsep) if part.strip())
+    elif isinstance(value, list) and all(isinstance(item, str) and item.strip() for item in value):
+        parts = tuple(item.strip() for item in value)
+    else:
+        raise ConfigError(f"Configuration value must be a path array: {key}")
+    return tuple(_resolve_path(base_directory, part) for part in parts)
+
+
 def _retrieval_mode(value: str) -> RetrievalMode:
     try:
         return RetrievalMode(value.casefold())
@@ -381,6 +489,7 @@ def _validate_config(config: AppConfig) -> None:
     _validate_storage_config(config)
     _validate_server_config(config)
     _validate_retrieval_config(config)
+    _validate_datacron_config(config)
 
 
 def _validate_storage_config(config: AppConfig) -> None:
@@ -434,3 +543,16 @@ def _validate_retrieval_config(config: AppConfig) -> None:
         raise ConfigError("retrieval.rrf_k must be greater than zero")
     if config.retrieval.mode is RetrievalMode.HYBRID and not config.retrieval.embeddings_model:
         raise ConfigError("retrieval.embeddings_model is required in hybrid mode")
+
+
+def _validate_datacron_config(config: AppConfig) -> None:
+    if config.datacron.neighbor_limit <= 0:
+        raise ConfigError("datacron.neighbor_limit must be greater than zero")
+    target = Path(config.datacron.new_note_directory)
+    if (
+        target.is_absolute()
+        or ".." in target.parts
+        or not target.parts
+        or target.parts[0] != "_memory"
+    ):
+        raise ConfigError("datacron.new_note_directory must be confined inside _memory")

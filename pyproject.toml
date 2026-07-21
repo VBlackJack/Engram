@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "engram-memory-broker"
-version = "2026.0721.03"
+version = "2026.0721.04"
 description = "Shared memory broker evaluation spike"
 readme = "README.md"
 requires-python = ">=3.13"

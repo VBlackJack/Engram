@@ -72,6 +72,9 @@ class AuditAction(StrEnum):
     SUPERSEDE = "supersede"
     EXPIRE = "expire"
     PURGE = "purge"
+    PROMOTE = "promote"
+    MARK_STALE = "mark_stale"
+    MARK_FRESH = "mark_fresh"
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,6 +107,7 @@ class Entry:
     idempotency_key: str
     supersedes: tuple[str, ...]
     evidence: tuple[Evidence, ...]
+    stale: bool
     datacron_ref: str | None
     datacron_hash: str | None
     synced_at: datetime | None

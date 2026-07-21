@@ -24,6 +24,8 @@ La section `[server]` configure l'adresse, le port, le chemin MCP et le délai m
 d'acquisition du verrou d'écriture. La section `[capsule]` borne le budget des rappels.
 La section `[retrieval]` sélectionne `fts` ou le mode expérimental `hybrid`. Ce dernier exige
 un modèle et un endpoint local compatible OpenAI; une panne le dégrade explicitement en FTS.
+La section `[datacron]` configure le processus MCP stdio, le vault et ses allowlists. Les
+écritures restent désactivées tant que `write_paths` n'est pas explicitement renseigné.
 
 ## Serveur
 
@@ -54,6 +56,28 @@ uv run engram eval --mode both --out local/eval
 Le dossier de sortie contient `metrics.json`, avec le verdict P2 émis par le code, et
 `rapport-eval.md`, une synthèse française courte. Le modèle de référence est
 `nomic-embed-text-v1.5` via LM Studio; `bge-m3` reste une alternative configurable.
+
+## Consolidation Datacron
+
+Seules les entrées actives, approuvées et attestées par un humain ou un outil sont proposées.
+La planification ne modifie aucune donnée :
+
+```powershell
+uv run engram consolidate --plan --out local/consolidation/plan.json
+```
+
+Relire `plan.md`, puis éditer dans `plan.json` chaque `decision` (`approve` ou `reject`) et,
+si nécessaire, `rel_path` ou `heading`. L'application relit chaque cible, impose le hash CAS,
+écrit via MCP, relit le résultat, puis seulement marque la mémoire comme promue :
+
+```powershell
+uv run engram consolidate --apply local/consolidation/plan.json
+uv run engram consolidate --check-freshness
+```
+
+Un conflit n'est jamais forcé : la proposition est signalée `stale` et doit être replannifiée.
+Le contrôle de fraîcheur ne réécrit pas Datacron; il masque du rappel courant toute promotion
+dont le hash a divergé.
 
 ## Vérification
 

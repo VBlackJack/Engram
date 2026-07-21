@@ -106,7 +106,7 @@ def test_database_uses_wal_and_numbered_migration(
     assert foreign_keys is not None
     assert foreign_keys[0] == 1
     assert schema_version is not None
-    assert schema_version[0] == 2
+    assert schema_version[0] == 3
     assert derived_tables == {"entries_fts", "entry_vectors"}
 
 

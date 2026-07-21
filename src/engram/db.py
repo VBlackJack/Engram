@@ -119,6 +119,40 @@ MIGRATIONS = (
             CREATE_VECTOR_TABLE_SQL,
         ),
     ),
+    Migration(
+        version=3,
+        statements=(
+            """
+            ALTER TABLE entries
+            ADD COLUMN is_stale INTEGER NOT NULL DEFAULT 0
+            CHECK (is_stale IN (0, 1))
+            """,
+            "ALTER TABLE audit_log RENAME TO audit_log_v2",
+            """
+            CREATE TABLE audit_log (
+                seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT NOT NULL,
+                actor TEXT NOT NULL,
+                action TEXT NOT NULL CHECK (
+                    action IN (
+                        'insert', 'attest', 'confidence_capped', 'idempotent_noop',
+                        'supersede', 'expire', 'purge', 'promote', 'mark_stale',
+                        'mark_fresh'
+                    )
+                ),
+                entry_id TEXT,
+                detail_hash TEXT
+            )
+            """,
+            """
+            INSERT INTO audit_log(seq, ts, actor, action, entry_id, detail_hash)
+            SELECT seq, ts, actor, action, entry_id, detail_hash
+            FROM audit_log_v2
+            ORDER BY seq
+            """,
+            "DROP TABLE audit_log_v2",
+        ),
+    ),
 )
 
 

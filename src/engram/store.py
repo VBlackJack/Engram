@@ -372,6 +372,87 @@ class EngramStore:
             ).fetchall()
             return tuple(_entry_from_row(row) for row in rows)
 
+    def mark_promoted(
+        self,
+        entry_id: str,
+        *,
+        datacron_ref: str,
+        datacron_hash: str,
+        actor: str = "cli",
+    ) -> Entry:
+        """Record a verified Datacron promotion and its exact content hash."""
+        normalized_entry_id = _required_text(entry_id, "entry_id")
+        normalized_ref = _required_text(datacron_ref, "datacron_ref")
+        normalized_hash = _required_text(datacron_hash, "datacron_hash")
+        normalized_actor = _required_text(actor, "actor")
+        with self._write_lock:
+            self._ensure_open()
+            now = self._now()
+            with transaction(self._connection):
+                row = self._fetch_entry_row(normalized_entry_id)
+                if row is None:
+                    raise KeyError(f"Entry does not exist: {normalized_entry_id}")
+                entry = _entry_from_row(row)
+                _require_promotable(entry)
+                self._connection.execute(
+                    """
+                    UPDATE entries
+                    SET promotion_state = ?, datacron_ref = ?, datacron_hash = ?,
+                        synced_at = ?, is_stale = 0
+                    WHERE id = ?
+                    """,
+                    (
+                        PromotionState.PROMOTED.value,
+                        normalized_ref,
+                        normalized_hash,
+                        _format_datetime(now),
+                        normalized_entry_id,
+                    ),
+                )
+                self._append_audit(
+                    ts=now,
+                    actor=normalized_actor,
+                    action=AuditAction.PROMOTE,
+                    entry_id=normalized_entry_id,
+                    detail={"datacron_hash": normalized_hash, "datacron_ref": normalized_ref},
+                )
+                updated_row = self._fetch_entry_row(normalized_entry_id)
+                if updated_row is None:  # pragma: no cover - protected by the transaction
+                    raise RuntimeError("Promoted entry disappeared")
+                return _entry_from_row(updated_row)
+
+    def set_stale(self, entry_id: str, *, stale: bool, actor: str = "cli") -> Entry:
+        """Mark a promoted entry stale or fresh without rewriting Datacron."""
+        normalized_entry_id = _required_text(entry_id, "entry_id")
+        normalized_actor = _required_text(actor, "actor")
+        with self._write_lock:
+            self._ensure_open()
+            now = self._now()
+            with transaction(self._connection):
+                row = self._fetch_entry_row(normalized_entry_id)
+                if row is None:
+                    raise KeyError(f"Entry does not exist: {normalized_entry_id}")
+                entry = _entry_from_row(row)
+                if entry.promotion_state is not PromotionState.PROMOTED:
+                    raise StoreValidationError("Only promoted entries have freshness state")
+                if entry.stale == stale:
+                    return entry
+                self._connection.execute(
+                    "UPDATE entries SET is_stale = ? WHERE id = ?",
+                    (int(stale), normalized_entry_id),
+                )
+                self._append_audit(
+                    ts=now,
+                    actor=normalized_actor,
+                    action=AuditAction.MARK_STALE if stale else AuditAction.MARK_FRESH,
+                    entry_id=normalized_entry_id,
+                    detail={"stale": stale},
+                )
+                updated_row = self._fetch_entry_row(normalized_entry_id)
+                if updated_row is None:  # pragma: no cover - protected by the transaction
+                    raise RuntimeError("Freshness entry disappeared")
+                return _entry_from_row(updated_row)
+
     def search_fts(
         self,
         match_query: str,
@@ -561,6 +642,7 @@ class EngramStore:
                     idempotency_key=idempotency_key,
                     supersedes=(),
                     evidence=normalized_evidence,
+                    stale=False,
                     datacron_ref=None,
                     datacron_hash=None,
                     synced_at=None,
@@ -595,8 +677,8 @@ class EngramStore:
                 id, kind, scope, statement, subject_keys, status, promotion_state,
                 source_type, writer_model, confidence, observed_at, recorded_at,
                 valid_from, valid_until, expires_at, idempotency_key, supersedes,
-                evidence, datacron_ref, datacron_hash, synced_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                evidence, is_stale, datacron_ref, datacron_hash, synced_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 entry.id,
@@ -617,6 +699,7 @@ class EngramStore:
                 entry.idempotency_key,
                 _encode_json(list(entry.supersedes)),
                 _encode_evidence(entry.evidence),
+                int(entry.stale),
                 entry.datacron_ref,
                 entry.datacron_hash,
                 _format_optional_datetime(entry.synced_at),
@@ -848,6 +931,7 @@ def _entry_from_row(row: sqlite3.Row) -> Entry:
         idempotency_key=str(row["idempotency_key"]),
         supersedes=tuple(_decode_string_array(str(row["supersedes"]))),
         evidence=_decode_evidence(str(row["evidence"])),
+        stale=bool(int(row["is_stale"])),
         datacron_ref=None if row["datacron_ref"] is None else str(row["datacron_ref"]),
         datacron_hash=None if row["datacron_hash"] is None else str(row["datacron_hash"]),
         synced_at=_parse_optional_datetime(row["synced_at"]),
@@ -873,7 +957,17 @@ def _entry_detail(entry: Entry) -> dict[str, object]:
         "kind": entry.kind.value,
         "promotion_state": entry.promotion_state.value,
         "scope": entry.scope,
+        "stale": entry.stale,
         "source_type": entry.source_type.value,
         "statement_hash": hashlib.sha256(entry.statement.encode("utf-8")).hexdigest(),
         "status": entry.status.value,
     }
+
+
+def _require_promotable(entry: Entry) -> None:
+    if entry.status is not EntryStatus.ACTIVE:
+        raise StoreValidationError("Only active entries can be promoted")
+    if entry.promotion_state is not PromotionState.APPROVED:
+        raise StoreValidationError("Only approved entries can be promoted")
+    if entry.source_type not in {SourceType.HUMAN, SourceType.TOOL_VERIFIED}:
+        raise StoreValidationError("Only human or tool_verified entries can be promoted")
