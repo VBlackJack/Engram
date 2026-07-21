@@ -9,8 +9,10 @@ import os
 import tomllib
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from .models import EntryKind
 
@@ -90,6 +92,24 @@ class CapsuleConfig:
     max_token_budget: int = 1500
 
 
+class RetrievalMode(StrEnum):
+    """Supported retrieval implementations."""
+
+    FTS = "fts"
+    HYBRID = "hybrid"
+
+
+@dataclass(frozen=True, slots=True)
+class RetrievalConfig:
+    """Lexical and optional remote embedding retrieval settings."""
+
+    mode: RetrievalMode = RetrievalMode.FTS
+    embeddings_endpoint: str = "http://127.0.0.1:1234/v1/embeddings"
+    embeddings_model: str = ""
+    embeddings_timeout_ms: int = 3000
+    rrf_k: int = 60
+
+
 @dataclass(frozen=True, slots=True)
 class AppConfig:
     """Complete Engram application configuration."""
@@ -100,6 +120,7 @@ class AppConfig:
     logging: LoggingConfig
     server: ServerConfig = field(default_factory=ServerConfig)
     capsule: CapsuleConfig = field(default_factory=CapsuleConfig)
+    retrieval: RetrievalConfig = field(default_factory=RetrievalConfig)
 
 
 DEFAULT_DATABASE_CONFIG = DatabaseConfig()
@@ -108,6 +129,7 @@ DEFAULT_LIMITS_CONFIG = LimitsConfig()
 DEFAULT_LOGGING_CONFIG = LoggingConfig()
 DEFAULT_SERVER_CONFIG = ServerConfig()
 DEFAULT_CAPSULE_CONFIG = CapsuleConfig()
+DEFAULT_RETRIEVAL_CONFIG = RetrievalConfig()
 
 
 def load_config(
@@ -138,6 +160,7 @@ def load_config(
     logging_config = _section(raw, "logging")
     server = _section(raw, "server")
     capsule = _section(raw, "capsule")
+    retrieval = _section(raw, "retrieval")
     base_directory = config_path.parent
 
     result = AppConfig(
@@ -230,6 +253,35 @@ def load_config(
                 DEFAULT_CAPSULE_CONFIG.max_token_budget,
             ),
         ),
+        retrieval=RetrievalConfig(
+            mode=_retrieval_mode(
+                _string_value(retrieval, "mode", environment, DEFAULT_RETRIEVAL_CONFIG.mode)
+            ),
+            embeddings_endpoint=_string_value(
+                retrieval,
+                "embeddings_endpoint",
+                environment,
+                DEFAULT_RETRIEVAL_CONFIG.embeddings_endpoint,
+            ),
+            embeddings_model=_optional_string_value(
+                retrieval,
+                "embeddings_model",
+                environment,
+                DEFAULT_RETRIEVAL_CONFIG.embeddings_model,
+            ),
+            embeddings_timeout_ms=_integer_value(
+                retrieval,
+                "embeddings_timeout_ms",
+                environment,
+                DEFAULT_RETRIEVAL_CONFIG.embeddings_timeout_ms,
+            ),
+            rrf_k=_integer_value(
+                retrieval,
+                "rrf_k",
+                environment,
+                DEFAULT_RETRIEVAL_CONFIG.rrf_k,
+            ),
+        ),
     )
     _validate_config(result)
     return result
@@ -299,6 +351,25 @@ def _string_value(
     return value.strip()
 
 
+def _optional_string_value(
+    section: dict[str, Any],
+    key: str,
+    environment: Mapping[str, str],
+    default: str,
+) -> str:
+    value = _raw_value(section, key, environment, default)
+    if not isinstance(value, str):
+        raise ConfigError(f"Configuration value must be a string: {key}")
+    return value.strip()
+
+
+def _retrieval_mode(value: str) -> RetrievalMode:
+    try:
+        return RetrievalMode(value.casefold())
+    except ValueError as exc:
+        raise ConfigError(f"Unsupported retrieval mode: {value}") from exc
+
+
 def _resolve_path(base_directory: Path, configured_path: str) -> Path:
     value = Path(configured_path).expanduser()
     if not value.is_absolute():
@@ -309,6 +380,7 @@ def _resolve_path(base_directory: Path, configured_path: str) -> Path:
 def _validate_config(config: AppConfig) -> None:
     _validate_storage_config(config)
     _validate_server_config(config)
+    _validate_retrieval_config(config)
 
 
 def _validate_storage_config(config: AppConfig) -> None:
@@ -350,3 +422,15 @@ def _validate_server_config(config: AppConfig) -> None:
         <= config.capsule.max_token_budget
     ):
         raise ConfigError("capsule.default_token_budget must be within the configured bounds")
+
+
+def _validate_retrieval_config(config: AppConfig) -> None:
+    endpoint = urlparse(config.retrieval.embeddings_endpoint)
+    if endpoint.scheme not in {"http", "https"} or not endpoint.netloc:
+        raise ConfigError("retrieval.embeddings_endpoint must be an HTTP URL")
+    if config.retrieval.embeddings_timeout_ms <= 0:
+        raise ConfigError("retrieval.embeddings_timeout_ms must be greater than zero")
+    if config.retrieval.rrf_k <= 0:
+        raise ConfigError("retrieval.rrf_k must be greater than zero")
+    if config.retrieval.mode is RetrievalMode.HYBRID and not config.retrieval.embeddings_model:
+        raise ConfigError("retrieval.embeddings_model is required in hybrid mode")

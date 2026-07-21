@@ -14,6 +14,25 @@ from .config import DatabaseConfig
 
 MINIMUM_SQLITE_VERSION = (3, 51, 3)
 SQLITE_VERSION_COMPONENTS = 3
+FTS_TABLE_NAME = "entries_fts"
+CREATE_FTS_TABLE_SQL = """
+CREATE VIRTUAL TABLE entries_fts USING fts5(
+    statement,
+    subject_keys,
+    content='entries',
+    content_rowid='rowid',
+    tokenize='unicode61 remove_diacritics 2'
+)
+"""
+CREATE_VECTOR_TABLE_SQL = """
+CREATE TABLE entry_vectors (
+    entry_id TEXT NOT NULL REFERENCES entries(id) ON DELETE CASCADE,
+    model TEXT NOT NULL,
+    dim INTEGER NOT NULL CHECK (dim > 0),
+    vector BLOB NOT NULL,
+    PRIMARY KEY (entry_id, model)
+)
+"""
 
 
 class SQLiteVersionError(RuntimeError):
@@ -92,6 +111,14 @@ MIGRATIONS = (
             """,
         ),
     ),
+    Migration(
+        version=2,
+        statements=(
+            CREATE_FTS_TABLE_SQL,
+            "INSERT INTO entries_fts(entries_fts) VALUES ('rebuild')",
+            CREATE_VECTOR_TABLE_SQL,
+        ),
+    ),
 )
 
 
@@ -109,6 +136,7 @@ def open_database(config: DatabaseConfig) -> sqlite3.Connection:
         verify_sqlite_version(connection)
         _configure_connection(connection, config.busy_timeout_ms)
         apply_migrations(connection)
+        ensure_derived_indexes(connection)
     except BaseException:
         connection.close()
         raise
@@ -150,6 +178,31 @@ def apply_migrations(connection: sqlite3.Connection) -> None:
                 connection.execute(statement)
             connection.execute("UPDATE schema_version SET version = ?", (migration.version,))
         current_version = migration.version
+
+
+def ensure_derived_indexes(connection: sqlite3.Connection) -> None:
+    """Recreate missing derived index tables from canonical entries."""
+    if not _table_exists(connection, FTS_TABLE_NAME):
+        rebuild_fts_index(connection)
+    if not _table_exists(connection, "entry_vectors"):
+        with transaction(connection):
+            connection.execute(CREATE_VECTOR_TABLE_SQL)
+
+
+def rebuild_fts_index(connection: sqlite3.Connection) -> None:
+    """Drop and rebuild the external-content FTS table transactionally."""
+    with transaction(connection):
+        connection.execute("DROP TABLE IF EXISTS entries_fts")
+        connection.execute(CREATE_FTS_TABLE_SQL)
+        connection.execute("INSERT INTO entries_fts(entries_fts) VALUES ('rebuild')")
+
+
+def _table_exists(connection: sqlite3.Connection, name: str) -> bool:
+    row = connection.execute(
+        "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?",
+        (name,),
+    ).fetchone()
+    return row is not None
 
 
 @contextmanager

@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from engram.config import ConfigError, load_config
+from engram.config import ConfigError, RetrievalMode, load_config
 from engram.logging_setup import FileLogger
 
 
@@ -48,6 +48,13 @@ write_wait_timeout_ms = 2000
 default_token_budget = 600
 min_token_budget = 150
 max_token_budget = 1500
+
+[retrieval]
+mode = "fts"
+embeddings_endpoint = "http://127.0.0.1:1234/v1/embeddings"
+embeddings_model = ""
+embeddings_timeout_ms = 3000
+rrf_k = 60
 """.strip(),
         encoding="utf-8",
     )
@@ -60,6 +67,9 @@ max_token_budget = 1500
         "ENGRAM_SERVER_PORT": "9000",
         "ENGRAM_SERVER_PATH": "/memory",
         "ENGRAM_CAPSULE_DEFAULT_TOKEN_BUDGET": "700",
+        "ENGRAM_RETRIEVAL_MODE": "hybrid",
+        "ENGRAM_RETRIEVAL_EMBEDDINGS_MODEL": "text-embedding-test",
+        "ENGRAM_RETRIEVAL_RRF_K": "80",
     }
 
     config = load_config(config_path, environ=environment)
@@ -75,6 +85,9 @@ max_token_budget = 1500
     assert config.server.path == "/memory"
     assert config.server.write_wait_timeout_ms == 2000
     assert config.capsule.default_token_budget == 700
+    assert config.retrieval.mode is RetrievalMode.HYBRID
+    assert config.retrieval.embeddings_model == "text-embedding-test"
+    assert config.retrieval.rrf_k == 80
 
 
 def test_load_config_rejects_invalid_limits(tmp_path: Path) -> None:
@@ -93,6 +106,14 @@ def test_load_config_rejects_invalid_capsule_bounds(tmp_path: Path) -> None:
     )
 
     with pytest.raises(ConfigError, match="at least the minimum"):
+        load_config(config_path, environ={})
+
+
+def test_load_config_requires_embedding_model_in_hybrid_mode(tmp_path: Path) -> None:
+    config_path = tmp_path / "engram.toml"
+    config_path.write_text("[retrieval]\nmode = 'hybrid'\n", encoding="utf-8")
+
+    with pytest.raises(ConfigError, match="embeddings_model"):
         load_config(config_path, environ={})
 
 

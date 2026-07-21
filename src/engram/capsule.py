@@ -114,7 +114,7 @@ class CapsuleBuilder:
         ]
         conflicts = conflict_groups if include_conflicts else []
         own_pending = [_pending_item(entry) for entry in retrieval.own_pending]
-        reasons = ["naive substring match, newest first"]
+        reasons = ["retrieval rank with recency tie-break"]
         if scope is not None:
             reasons.append(f"scope filter: {scope}")
 
@@ -179,22 +179,27 @@ def _find_conflicts(entries: Sequence[Entry]) -> tuple[list[ConflictItem], set[s
     active = [
         entry for entry in entries if entry.status is EntryStatus.ACTIVE and entry.subject_keys
     ]
-    remaining = active.copy()
     groups: list[list[Entry]] = []
-    while remaining:
-        group = [remaining.pop(0)]
-        group_keys = set(group[0].subject_keys)
-        changed = True
-        while changed:
-            changed = False
-            for entry in remaining.copy():
-                if group_keys.intersection(entry.subject_keys):
-                    group.append(entry)
-                    group_keys.update(entry.subject_keys)
-                    remaining.remove(entry)
-                    changed = True
-        if len(group) > 1 and len({entry.idempotency_key for entry in group}) > 1:
-            groups.append(group)
+    partitions: dict[tuple[EntryKind, str], list[Entry]] = {}
+    for entry in active:
+        partitions.setdefault((entry.kind, entry.scope), []).append(entry)
+
+    for partition in partitions.values():
+        remaining = partition.copy()
+        while remaining:
+            group = [remaining.pop(0)]
+            group_keys = set(group[0].subject_keys)
+            changed = True
+            while changed:
+                changed = False
+                for entry in remaining.copy():
+                    if group_keys.intersection(entry.subject_keys):
+                        group.append(entry)
+                        group_keys.update(entry.subject_keys)
+                        remaining.remove(entry)
+                        changed = True
+            if len(group) > 1 and len({entry.idempotency_key for entry in group}) > 1:
+                groups.append(group)
 
     conflict_items = [
         ConflictItem(

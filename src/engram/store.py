@@ -8,11 +8,13 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import re
 import secrets
 import sqlite3
+import struct
 import unicodedata
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from datetime import UTC, date, datetime, timedelta
 from enum import StrEnum
@@ -21,7 +23,7 @@ from types import TracebackType
 from typing import Any, Literal, Self, cast, overload
 
 from .config import AppConfig
-from .db import open_database, transaction
+from .db import FTS_TABLE_NAME, open_database, rebuild_fts_index, transaction
 from .models import (
     AuditAction,
     AuditRecord,
@@ -259,6 +261,7 @@ class EngramStore:
                     "UPDATE entries SET status = ? WHERE id = ?",
                     (EntryStatus.SUPERSEDED.value, normalized_old_id),
                 )
+                # FTS indexes only immutable text; joined status filtering observes this update.
                 self._connection.execute(
                     "UPDATE entries SET supersedes = ? WHERE id = ?",
                     (_encode_json(supersedes), normalized_new_id),
@@ -293,6 +296,7 @@ class EngramStore:
                         "UPDATE entries SET status = ? WHERE id = ?",
                         (EntryStatus.EXPIRED.value, entry_id),
                     )
+                    # FTS indexes only immutable text; joined status filtering observes this update.
                     self._append_audit(
                         ts=now,
                         actor="cli",
@@ -314,14 +318,16 @@ class EngramStore:
             with transaction(self._connection):
                 rows = self._connection.execute(
                     """
-                    SELECT id FROM entries
+                    SELECT rowid AS entry_rowid, id, statement, subject_keys FROM entries
                     WHERE status = ? AND expires_at IS NOT NULL AND expires_at <= ?
                     ORDER BY id
                     """,
                     (EntryStatus.EXPIRED.value, cutoff_text),
                 ).fetchall()
                 entry_ids = [str(row["id"]) for row in rows]
-                for entry_id in entry_ids:
+                for row in rows:
+                    entry_id = str(row["id"])
+                    self._delete_fts_row(row)
                     self._connection.execute("DELETE FROM entries WHERE id = ?", (entry_id,))
                     self._append_audit(
                         ts=now,
@@ -358,13 +364,127 @@ class EngramStore:
             return tuple(_audit_from_row(row) for row in rows)
 
     def list_entries(self) -> tuple[Entry, ...]:
-        """Return payload rows newest first for the replaceable v0 retriever."""
+        """Return payload rows newest first."""
         with self._write_lock:
             self._ensure_open()
             rows = self._connection.execute(
                 "SELECT * FROM entries ORDER BY recorded_at DESC, id DESC"
             ).fetchall()
             return tuple(_entry_from_row(row) for row in rows)
+
+    def search_fts(
+        self,
+        match_query: str,
+        *,
+        scope: str | None,
+        kinds: frozenset[EntryKind] | None,
+    ) -> tuple[Entry, ...]:
+        """Return active or quarantined FTS matches ordered by BM25 and recency."""
+        normalized_query = _required_text(match_query, "match_query")
+        clauses = [
+            f"{FTS_TABLE_NAME} MATCH ?",
+            "entries.status IN (?, ?)",
+        ]
+        parameters: list[object] = [
+            normalized_query,
+            EntryStatus.ACTIVE.value,
+            EntryStatus.QUARANTINED.value,
+        ]
+        if scope is not None:
+            clauses.append("entries.scope = ?")
+            parameters.append(scope)
+        if kinds:
+            ordered_kinds = sorted(kind.value for kind in kinds)
+            placeholders = ", ".join("?" for _ in ordered_kinds)
+            clauses.append(f"entries.kind IN ({placeholders})")
+            parameters.extend(ordered_kinds)
+        where_clause = " AND ".join(clauses)
+        query = (
+            "SELECT entries.* FROM entries_fts "  # noqa: S608
+            "JOIN entries ON entries.rowid = entries_fts.rowid "
+            f"WHERE {where_clause} "
+            "ORDER BY bm25(entries_fts), entries.recorded_at DESC, entries.id DESC"
+        )
+        with self._write_lock:
+            self._ensure_open()
+            rows = self._connection.execute(query, parameters).fetchall()
+            return tuple(_entry_from_row(row) for row in rows)
+
+    def rebuild_fts(self) -> None:
+        """Reconstruct the derived FTS table from canonical entry rows."""
+        with self._write_lock:
+            self._ensure_open()
+            rebuild_fts_index(self._connection)
+        LOGGER.info("Rebuilt the FTS index")
+
+    def upsert_vector(self, entry_id: str, model: str, vector: Sequence[float]) -> None:
+        """Store one derived vector for an existing entry."""
+        normalized_entry_id = _required_text(entry_id, "entry_id")
+        normalized_model = _required_text(model, "model")
+        encoded, dimension = _encode_vector(vector)
+        with self._write_lock:
+            self._ensure_open()
+            with transaction(self._connection):
+                self._connection.execute(
+                    """
+                    INSERT INTO entry_vectors(entry_id, model, dim, vector)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(entry_id, model) DO UPDATE SET
+                        dim = excluded.dim,
+                        vector = excluded.vector
+                    """,
+                    (normalized_entry_id, normalized_model, dimension, encoded),
+                )
+
+    def replace_vectors(
+        self,
+        model: str,
+        vectors: Mapping[str, Sequence[float]],
+    ) -> None:
+        """Replace all derived vectors atomically for one embedding model."""
+        normalized_model = _required_text(model, "model")
+        encoded = {
+            _required_text(entry_id, "entry_id"): _encode_vector(vector)
+            for entry_id, vector in vectors.items()
+        }
+        with self._write_lock:
+            self._ensure_open()
+            with transaction(self._connection):
+                self._connection.execute(
+                    "DELETE FROM entry_vectors WHERE model = ?",
+                    (normalized_model,),
+                )
+                self._connection.executemany(
+                    """
+                    INSERT INTO entry_vectors(entry_id, model, dim, vector)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (
+                        (entry_id, normalized_model, dimension, vector_blob)
+                        for entry_id, (vector_blob, dimension) in encoded.items()
+                    ),
+                )
+
+    def clear_vectors(self) -> None:
+        """Clear every derived vector before a full configured rebuild."""
+        with self._write_lock:
+            self._ensure_open()
+            with transaction(self._connection):
+                self._connection.execute("DELETE FROM entry_vectors")
+
+    def list_vectors(self, model: str) -> dict[str, tuple[float, ...]]:
+        """Return derived vectors for one model keyed by entry identifier."""
+        normalized_model = _required_text(model, "model")
+        with self._write_lock:
+            self._ensure_open()
+            rows = self._connection.execute(
+                "SELECT entry_id, dim, vector FROM entry_vectors WHERE model = ?",
+                (normalized_model,),
+            ).fetchall()
+            return {
+                str(row["entry_id"]): _decode_vector(bytes(row["vector"]), int(row["dim"]))
+                for row in rows
+            }
 
     def _add_entry(  # noqa: PLR0913
         self,
@@ -468,7 +588,8 @@ class EngramStore:
         return entry, False
 
     def _insert_entry(self, entry: Entry) -> None:
-        self._connection.execute(
+        encoded_subject_keys = _encode_json(list(entry.subject_keys))
+        cursor = self._connection.execute(
             """
             INSERT INTO entries (
                 id, kind, scope, statement, subject_keys, status, promotion_state,
@@ -482,7 +603,7 @@ class EngramStore:
                 entry.kind.value,
                 entry.scope,
                 entry.statement,
-                _encode_json(list(entry.subject_keys)),
+                encoded_subject_keys,
                 entry.status.value,
                 entry.promotion_state.value,
                 entry.source_type.value,
@@ -500,6 +621,23 @@ class EngramStore:
                 entry.datacron_hash,
                 _format_optional_datetime(entry.synced_at),
             ),
+        )
+        rowid = cursor.lastrowid
+        if rowid is None:
+            raise RuntimeError("SQLite did not return an entry rowid")
+        self._connection.execute(
+            "INSERT INTO entries_fts(rowid, statement, subject_keys) VALUES (?, ?, ?)",
+            (rowid, entry.statement, encoded_subject_keys),
+        )
+
+    def _delete_fts_row(self, row: sqlite3.Row) -> None:
+        self._connection.execute(
+            """
+            INSERT INTO entries_fts(
+                entries_fts, rowid, statement, subject_keys
+            ) VALUES ('delete', ?, ?, ?)
+            """,
+            (int(row["entry_rowid"]), str(row["statement"]), str(row["subject_keys"])),
         )
 
     def _append_audit(
@@ -532,6 +670,21 @@ class EngramStore:
 
 def _utc_now() -> datetime:
     return datetime.now(UTC)
+
+
+def _encode_vector(vector: Sequence[float]) -> tuple[bytes, int]:
+    values = tuple(float(value) for value in vector)
+    if not values:
+        raise StoreValidationError("vector must not be empty")
+    if not all(math.isfinite(value) for value in values):
+        raise StoreValidationError("vector values must be finite")
+    return struct.pack(f"<{len(values)}f", *values), len(values)
+
+
+def _decode_vector(vector_blob: bytes, dimension: int) -> tuple[float, ...]:
+    if dimension <= 0 or len(vector_blob) != dimension * 4:
+        raise StoreValidationError("stored vector has an invalid dimension")
+    return tuple(struct.unpack(f"<{dimension}f", vector_blob))
 
 
 def _enum_value[EnumType: StrEnum](

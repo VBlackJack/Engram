@@ -90,6 +90,12 @@ def test_database_uses_wal_and_numbered_migration(
         busy_timeout = connection.execute("PRAGMA busy_timeout").fetchone()
         foreign_keys = connection.execute("PRAGMA foreign_keys").fetchone()
         schema_version = connection.execute("SELECT version FROM schema_version").fetchone()
+        derived_tables = {
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_schema WHERE name IN ('entries_fts', 'entry_vectors')"
+            ).fetchall()
+        }
     finally:
         connection.close()
 
@@ -100,7 +106,8 @@ def test_database_uses_wal_and_numbered_migration(
     assert foreign_keys is not None
     assert foreign_keys[0] == 1
     assert schema_version is not None
-    assert schema_version[0] == 1
+    assert schema_version[0] == 2
+    assert derived_tables == {"entries_fts", "entry_vectors"}
 
 
 def test_concurrent_writes_are_serialized_without_loss(store: EngramStore) -> None:

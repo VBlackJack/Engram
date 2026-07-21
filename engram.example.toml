@@ -28,3 +28,10 @@ write_wait_timeout_ms = 2000
 default_token_budget = 600
 min_token_budget = 150
 max_token_budget = 1500
+
+[retrieval]
+mode = "fts"
+embeddings_endpoint = "http://127.0.0.1:1234/v1/embeddings"
+embeddings_model = ""
+embeddings_timeout_ms = 3000
+rrf_k = 60

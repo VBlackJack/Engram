@@ -7,8 +7,8 @@ Engram est le memory broker de la trilogie :
 - Engram capture et rappelle une mémoire opérationnelle partagée entre assistants.
 
 Ce dépôt contient un spike d'évaluation avec stockage SQLite et serveur MCP Streamable HTTP.
-Le serveur expose uniquement `remember` et `recall`. Le matching de rappel est volontairement
-naif dans ce lot: filtres, sous-chaine insensible a la casse et recence.
+Le serveur expose uniquement `remember` et `recall`. Le rappel utilise FTS5/BM25 par défaut,
+avec départage par récence et filet substring quand FTS5 ne trouve aucun résultat.
 
 ## Configuration
 
@@ -22,6 +22,8 @@ Copier `engram.example.toml` vers `engram.toml`, puis adapter les valeurs. Chaqu
 
 La section `[server]` configure l'adresse, le port, le chemin MCP et le délai maximal
 d'acquisition du verrou d'écriture. La section `[capsule]` borne le budget des rappels.
+La section `[retrieval]` sélectionne `fts` ou le mode expérimental `hybrid`. Ce dernier exige
+un modèle et un endpoint local compatible OpenAI; une panne le dégrade explicitement en FTS.
 
 ## Serveur
 
@@ -32,6 +34,12 @@ uv run engram serve
 Avec la configuration d'exemple, le point d'accès est `http://127.0.0.1:8377/mcp`. Les
 souvenirs déposés par `remember` restent en quarantaine. Ils ne sont visibles que dans
 `own_pending` pour le même client MCP, avec l'étiquette `unconfirmed candidate`.
+
+Les index FTS et vectoriels sont dérivés et reconstructibles :
+
+```powershell
+uv run engram reindex
+```
 
 ## Vérification
 

@@ -28,7 +28,7 @@ from .models import (
     EvidenceType,
     PromotionState,
 )
-from .retrieval import NaiveRetriever, RetrievalRequest, Retriever
+from .retrieval import EntryIndexer, RetrievalRequest, Retriever, build_retriever
 from .store import EngramStore, StoreBusyError
 
 UNKNOWN_CLIENT = "unknown-client"
@@ -89,7 +89,7 @@ def create_mcp_server(
     retriever: Retriever | None = None,
 ) -> FastMCP[object]:
     """Build the stateful streamable HTTP server and its two strict tools."""
-    selected_retriever = retriever or NaiveRetriever(store)
+    selected_retriever = retriever or build_retriever(config, store)
     capsule_builder = CapsuleBuilder(config.capsule)
 
     async def remember(  # noqa: PLR0913
@@ -123,6 +123,8 @@ def create_mcp_server(
             raise ToolError("server busy, retry") from exc
 
         entry = outcome.entry
+        if isinstance(selected_retriever, EntryIndexer):
+            await anyio.to_thread.run_sync(selected_retriever.index_entry, entry)
         structured = RememberResult(
             entry_id=entry.id,
             status=entry.status,
@@ -147,7 +149,7 @@ def create_mcp_server(
         token_budget: int | None,
         ctx: ToolContext,
     ) -> Annotated[CallToolResult, CapsuleResult]:
-        """Return a compact trust-aware capsule using replaceable naive matching."""
+        """Return a compact trust-aware capsule using configured retrieval."""
         try:
             resolved_budget = capsule_builder.resolve_budget(token_budget)
         except ValueError as exc:

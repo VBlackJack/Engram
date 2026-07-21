@@ -235,9 +235,10 @@ wheels = [
 
 [[package]]
 name = "engram-memory-broker"
-version = "2026.721.1"
+version = "2026.721.2"
 source = { editable = "." }
 dependencies = [
+    { name = "httpx" },
     { name = "mcp" },
 ]
 
@@ -249,7 +250,10 @@ dev = [
 ]
 
 [package.metadata]
-requires-dist = [{ name = "mcp", specifier = "==1.28.1" }]
+requires-dist = [
+    { name = "httpx", specifier = "==0.28.1" },
+    { name = "mcp", specifier = "==1.28.1" },
+]
 
 [package.metadata.requires-dev]
 dev = [

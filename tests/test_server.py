@@ -6,9 +6,10 @@
 from __future__ import annotations
 
 import logging
+import math
 import sqlite3
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from statistics import fmean
@@ -21,13 +22,29 @@ from mcp.client.streamable_http import streamable_http_client
 from mcp.types import CallToolResult, Implementation, TextContent
 from starlette.applications import Starlette
 
-from engram.config import AppConfig, CapsuleConfig, ServerConfig
+from engram.config import (
+    AppConfig,
+    CapsuleConfig,
+    RetrievalConfig,
+    RetrievalMode,
+    ServerConfig,
+)
 from engram.db import MINIMUM_SQLITE_VERSION
+from engram.embeddings import EmbeddingError
 from engram.models import EntryStatus, PromotionState, SourceType
+from engram.retrieval import HybridRetriever
 from engram.server import create_mcp_server
 from engram.store import EngramStore
 
 LOGGER = logging.getLogger(__name__)
+
+
+class FailingEmbeddingProvider:
+    """Provider used to prove that derived indexing cannot fail a write."""
+
+    def embed(self, texts: Sequence[str]) -> tuple[tuple[float, ...], ...]:
+        del texts
+        raise EmbeddingError("mock endpoint unavailable")
 
 
 @pytest.fixture
@@ -193,6 +210,40 @@ async def test_remember_backpressure_returns_retry_before_twice_the_timeout(
 
 
 @pytest.mark.anyio
+async def test_embedding_failure_does_not_fail_remember(
+    app_config: AppConfig,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Commit the primary entry even when optional vectorization fails."""
+    config = replace(
+        app_config,
+        retrieval=RetrievalConfig(
+            mode=RetrievalMode.HYBRID,
+            embeddings_model="mock-model",
+        ),
+    )
+    with EngramStore(config) as store:
+        retriever = HybridRetriever(
+            store,
+            config.retrieval,
+            provider=FailingEmbeddingProvider(),
+        )
+        server = create_mcp_server(config, store, retriever=retriever)
+        app = server.streamable_http_app()
+        with caplog.at_level(logging.WARNING, logger="engram.retrieval"):
+            async with app.router.lifespan_context(app), _client(app) as session:
+                result = await session.call_tool(
+                    "remember",
+                    {"statement": "Committed without a vector", "kind": "fact"},
+                )
+
+        assert result.isError is False
+        assert store.count_entries() == 1
+        assert store.list_vectors("mock-model") == {}
+        assert "stored without a vector" in caplog.text
+
+
+@pytest.mark.anyio
 async def test_recall_places_trusted_entries_and_excludes_superseded_versions(
     app_config: AppConfig,
 ) -> None:
@@ -274,14 +325,14 @@ async def test_recall_renders_conflicts_only_when_requested(
     """Keep unresolved versions symmetric and out of the current section."""
     with EngramStore(app_config) as store:
         first = store.add_attested(
-            kind="fact",
+            kind="decision",
             scope="user",
             statement="The editor theme is light.",
             source_type=SourceType.HUMAN,
             subject_keys=("editor/theme",),
         )
         second = store.add_attested(
-            kind="fact",
+            kind="decision",
             scope="user",
             statement="The editor theme is dark.",
             source_type=SourceType.TOOL_VERIFIED,
@@ -308,6 +359,76 @@ async def test_recall_renders_conflicts_only_when_requested(
         conflict = shown_capsule["conflicts"][0]
         assert conflict["status"] == "unresolved"
         assert {item["id"] for item in conflict["versions"]} == {first.id, second.id}
+
+
+@pytest.mark.anyio
+async def test_recall_keeps_complementary_kinds_in_current(
+    app_config: AppConfig,
+) -> None:
+    """Do not turn a shared subject across kinds into a conflict."""
+    with EngramStore(app_config) as store:
+        fact = store.add_attested(
+            kind="fact",
+            scope="project/engram",
+            statement="The storage engine is SQLite.",
+            source_type=SourceType.TOOL_VERIFIED,
+            subject_keys=("storage/engine",),
+        )
+        decision = store.add_attested(
+            kind="decision",
+            scope="project/engram",
+            statement="Keep the storage engine local.",
+            source_type=SourceType.HUMAN,
+            subject_keys=("storage/engine",),
+        )
+        server = create_mcp_server(app_config, store)
+        app = server.streamable_http_app()
+        async with app.router.lifespan_context(app), _client(app) as session:
+            result = await session.call_tool(
+                "recall",
+                {
+                    "query": "storage engine",
+                    "scope": "project/engram",
+                    "include_conflicts": True,
+                },
+            )
+
+        capsule = _structured(result)
+        assert {item["id"] for item in capsule["current"]} == {fact.id, decision.id}
+        assert capsule["conflicts"] == []
+
+
+@pytest.mark.anyio
+async def test_recall_does_not_merge_conflicts_across_scopes(
+    app_config: AppConfig,
+) -> None:
+    """Partition conflict families by scope even without a scope filter."""
+    with EngramStore(app_config) as store:
+        first = store.add_attested(
+            kind="decision",
+            scope="project/engram",
+            statement="Shared theme stays green in Engram.",
+            source_type=SourceType.HUMAN,
+            subject_keys=("shared/theme",),
+        )
+        second = store.add_attested(
+            kind="decision",
+            scope="project/other",
+            statement="Shared theme stays blue elsewhere.",
+            source_type=SourceType.HUMAN,
+            subject_keys=("shared/theme",),
+        )
+        server = create_mcp_server(app_config, store)
+        app = server.streamable_http_app()
+        async with app.router.lifespan_context(app), _client(app) as session:
+            result = await session.call_tool(
+                "recall",
+                {"query": "shared theme", "include_conflicts": True},
+            )
+
+        capsule = _structured(result)
+        assert {item["id"] for item in capsule["current"]} == {first.id, second.id}
+        assert capsule["conflicts"] == []
 
 
 @pytest.mark.anyio
@@ -362,9 +483,10 @@ async def test_recall_budget_omits_whole_entries_and_validates_bounds(
 
 @pytest.mark.anyio
 async def test_mcp_average_latency(app_config: AppConfig) -> None:
-    """Record comparable in-process HTTP averages for the delivery report."""
+    """Record FTS-mode in-process HTTP averages and recall p95."""
     remember_latencies: list[float] = []
     recall_latencies: list[float] = []
+    assert app_config.retrieval.mode is RetrievalMode.FTS
     with EngramStore(app_config) as store:
         server = create_mcp_server(app_config, store)
         app = server.streamable_http_app()
@@ -372,7 +494,7 @@ async def test_mcp_average_latency(app_config: AppConfig) -> None:
             app.router.lifespan_context(app),
             _client(app, name="latency-client") as session,
         ):
-            for index in range(10):
+            for index in range(20):
                 started = time.perf_counter()
                 result = await session.call_tool(
                     "remember",
@@ -385,14 +507,17 @@ async def test_mcp_average_latency(app_config: AppConfig) -> None:
                 remember_latencies.append((time.perf_counter() - started) * 1000)
                 assert result.isError is False
 
-            for _ in range(10):
+            for _ in range(20):
                 started = time.perf_counter()
                 result = await session.call_tool("recall", {"query": "latency"})
                 recall_latencies.append((time.perf_counter() - started) * 1000)
                 assert result.isError is False
 
+    recall_p95_index = math.ceil(len(recall_latencies) * 0.95) - 1
+    recall_p95 = sorted(recall_latencies)[recall_p95_index]
     LOGGER.info(
-        "MCP average latency: remember=%.3f ms, recall=%.3f ms",
+        "FTS MCP latency: remember_avg=%.3f ms, recall_avg=%.3f ms, recall_p95=%.3f ms",
         fmean(remember_latencies),
         fmean(recall_latencies),
+        recall_p95,
     )
