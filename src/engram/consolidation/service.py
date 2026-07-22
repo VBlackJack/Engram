@@ -105,6 +105,13 @@ class ConsolidationService:
         )
         if normalized_reviewed != snapshot.propositions:
             raise StoreValidationError("plan was modified; generate a new plan")
+        if any(
+            proposition.decision is ReviewDecision.PENDING for proposition in reviewed.propositions
+        ):
+            raise StoreValidationError(
+                "consolidation plan has pending decisions; choose approve or reject "
+                "for every proposition"
+            )
         self._store.consume_consolidation_plan(
             reviewed.plan_id,
             expected_hash=stored.snapshot_hash,

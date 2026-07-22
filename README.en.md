@@ -126,8 +126,11 @@ engram consolidate --apply local/consolidation/plan.json
 engram consolidate --check-freshness
 ```
 
-`consolidate --plan` does not mutate data. Edit each JSON `decision` (`approve` or `reject`) before
-`--apply`. A diverged Datacron hash yields `stale` and requires a fresh plan; it is never forced.
+`consolidate --plan` remains read-only for Datacron, but anchors the immutable propositions in the
+Engram database. Edit only each JSON `decision` (`approve` or `reject`) before `--apply`. The plan is
+single-use: changing any other field or replaying it after apply is refused and requires a new plan.
+A diverged Datacron hash yields `stale`, preserves the report, and returns exit code 6; it is never
+forced.
 Stop the daemon before `attest`, `supersede`, `reindex`, or `consolidate`, then restart it before
 recall. These commands acquire the same OS lock as the daemon and fail clearly while it is active;
 `list` remains available through a read-only SQLite connection. Trusted commands use
@@ -135,8 +138,9 @@ recall. These commands acquire the same OS lock as the daemon and fail clearly w
 
 Known CLI failures never print a traceback by default. Exit code `2` means usage or configuration,
 `3` means a local resource is unavailable (port, process lock, database, or SQLite runtime), `4`
-means Datacron could not be reached, and `5` means transient store contention. Use global
-`--debug` before the command, or `ENGRAM_DEBUG=1`, only when a traceback is needed.
+means Datacron could not be reached, `5` means transient store contention, and `6` means an apply
+report contains failed or stale propositions. Use global `--debug` before the command, or
+`ENGRAM_DEBUG=1`, only when a traceback is needed.
 
 ## Current limitations
 

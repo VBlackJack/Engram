@@ -15,8 +15,9 @@ project uses date-derived CalVer releases in the form `YYYY.MMDD.NN`.
 
 ### Fixed
 
-- Reject any reviewed-plan retargeting or content substitution, refuse consumed-plan replay, and
-  return a distinct nonzero exit after persisting apply reports with failed or stale outcomes.
+- Reject any reviewed-plan retargeting, content substitution, or pending decision; refuse
+  consumed-plan replay; and return a distinct nonzero exit after persisting apply reports with
+  failed or stale outcomes.
 - Bind reviewed targets to both the reviewed and current neighbor sets, keep NEW targets immutable,
   reject non-canonical Windows paths and multiline headings, and reconcile freshness after batches.
 - Enforce business validity inside the promotion transaction and tolerate eligibility changes while

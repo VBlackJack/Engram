@@ -84,6 +84,7 @@ actionnable :
 | `3` | Ressource locale indisponible | Liberer port/verrou, reparer la base ou mettre SQLite a jour |
 | `4` | Datacron indisponible | Installer Datacron ou corriger sa commande et ses arguments |
 | `5` | Contention transitoire du store | Reessayer apres la fin de l'ecriture courante |
+| `6` | Rapport apply avec proposition failed ou stale | Lire le rapport et generer un nouveau plan |
 | `130` | Interruption operateur recue par la CLI | Aucune reprise necessaire |
 
 Ces erreurs n'affichent pas de traceback. Pour diagnostiquer, placer le flag global avant la
@@ -144,7 +145,8 @@ Pour chaque proposition :
 - modifier uniquement `decision`, avec `"approve"` ou `"reject"`.
 
 Ne pas recibler une proposition ni modifier un champ genere. Engram compare tous les champs
-immuables a son snapshot SQLite et refuse un plan modifie.
+immuables a son snapshot SQLite et refuse un plan modifie. Apply refuse aussi toute decision restee
+`pending` sans consommer le plan.
 
 ### 3. Appliquer
 

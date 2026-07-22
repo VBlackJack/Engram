@@ -82,10 +82,11 @@ perimees ne peuvent donc pas bloquer la reprise. Le listing par statut utilise u
 migree en mode SQLite read-only ; il reste disponible pendant le fonctionnement du daemon.
 
 Le contrat d'erreur CLI reserve le code `2` a l'usage/configuration, `3` aux ressources locales
-indisponibles, `4` aux pannes de transport Datacron, `5` a la contention transitoire du store et
-`130` a une interruption operateur propagee a la CLI. Les erreurs connues omettent les tracebacks,
-sauf si le flag global `--debug` ou `ENGRAM_DEBUG=1` est actif. La disponibilite du port est
-verifiee avant l'ouverture de SQLite ou du verrou de processus.
+indisponibles, `4` aux pannes de transport Datacron, `5` a la contention transitoire du store, `6` a
+un rapport apply contenant des propositions failed ou stale et `130` a une interruption operateur
+propagee a la CLI. Les erreurs connues omettent les tracebacks, sauf si le flag global `--debug` ou
+`ENGRAM_DEBUG=1` est actif. La disponibilite du port est verifiee avant l'ouverture de SQLite ou du
+verrou de processus.
 
 ## Idempotence
 
@@ -102,8 +103,9 @@ La consolidation conserve le rang de recherche deterministe renvoye par Datacron
 cible de patch. Une proposition `redundant` cible toujours le voisin dont le statement normalise
 correspond exactement au candidat, meme si un resultat plus large arrive avant. La planification
 persiste un snapshot canonique et immuable des propositions sous un `plan_id` genere. L'artefact de
-revue ne peut modifier que la decision de chaque proposition. Apply refuse toute autre divergence,
-consomme le plan avant les ecritures externes et interdit sa relecture. Il regenere les voisins
+revue ne peut modifier que la decision de chaque proposition. Apply refuse toute autre divergence
+ou decision encore `pending` sans consommer le plan. Une fois toutes les decisions approve/reject,
+apply consomme le plan avant les ecritures externes et interdit sa relecture. Il regenere les voisins
 courants avant ecriture et exige que la cible du snapshot reste courante. Le gateway transmet le
 niveau a Datacron et relit la section exacte avant de marquer l'entree `promoted`. Une passe finale
 reconcilie le hash de note complete de chaque promotion sur un chemin potentiellement ecrit avant

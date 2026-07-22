@@ -82,6 +82,7 @@ Expected local failures use stable process exit codes and one actionable stderr 
 | `3` | Local resource unavailable | Free the port/lock, repair the database, or upgrade SQLite |
 | `4` | Datacron unavailable | Install Datacron or fix its command and arguments |
 | `5` | Transient store contention | Retry after the current write finishes |
+| `6` | Apply report contains failed or stale propositions | Inspect the report and generate a new plan |
 | `130` | Operator interruption reached the CLI | No recovery required |
 
 Tracebacks are disabled for these failures. For diagnosis, place the global flag before the
@@ -139,7 +140,8 @@ For each proposition:
 - edit only `decision`, choosing `"approve"` or `"reject"`.
 
 Do not retarget a proposition or edit any generated field. Engram compares every immutable field
-with its SQLite snapshot and refuses a modified plan.
+with its SQLite snapshot and refuses a modified plan. Apply also refuses any decision still marked
+`pending` without consuming the plan.
 
 ### 3. Apply
 

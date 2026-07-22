@@ -145,9 +145,9 @@ utilisent `[attestation].default_actor`, sauf si `--actor` est fourni.
 
 Les erreurs CLI connues n'affichent aucun traceback par defaut. Le code `2` signale l'usage ou la
 configuration, `3` une ressource locale indisponible (port, verrou de processus, base ou runtime
-SQLite), `4` une dependance Datacron injoignable et `5` une contention transitoire du store.
-Utiliser le flag global `--debug` avant la commande, ou `ENGRAM_DEBUG=1`, uniquement pour obtenir
-un traceback.
+SQLite), `4` une dependance Datacron injoignable, `5` une contention transitoire du store et `6` un
+rapport apply contenant des propositions `failed` ou `stale`. Utiliser le flag global `--debug`
+avant la commande, ou `ENGRAM_DEBUG=1`, uniquement pour obtenir un traceback.
 
 ## Limites actuelles
 

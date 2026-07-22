@@ -79,10 +79,10 @@ coordination file is not ownership, so stale PID metadata cannot block recovery.
 an existing migrated database in SQLite read-only mode and remains available while the daemon runs.
 
 The CLI error contract reserves exit code `2` for usage/configuration, `3` for unavailable local
-resources, `4` for Datacron transport failures, `5` for transient store contention, and `130` for
-an operator interruption propagated to the CLI. Known failures omit tracebacks unless the global
-`--debug` flag or `ENGRAM_DEBUG=1` is active. Port availability is checked before SQLite or the
-process lock is opened.
+resources, `4` for Datacron transport failures, `5` for transient store contention, `6` for an
+apply report containing failed or stale propositions, and `130` for an operator interruption
+propagated to the CLI. Known failures omit tracebacks unless the global `--debug` flag or
+`ENGRAM_DEBUG=1` is active. Port availability is checked before SQLite or the process lock is opened.
 
 ## Idempotency
 
@@ -99,9 +99,10 @@ Consolidation preserves the deterministic search rank returned by Datacron when 
 target. A `redundant` proposition always targets the neighbor whose normalized statement exactly
 matches the candidate, even when a broader search hit ranks first. Planning persists a canonical
 immutable proposition snapshot under a generated `plan_id`. The review artifact may change only
-the per-proposition decision. Apply rejects any other divergence, consumes the plan before external
-writes, and refuses replay. It regenerates current neighbors before writing and requires the
-snapshotted target to remain current. The gateway passes the heading level to Datacron and rereads
+the per-proposition decision. Apply rejects any other divergence or remaining `pending` decision
+without consuming the plan. Once every decision is approve/reject, apply consumes the plan before
+external writes and refuses replay. It regenerates current neighbors before writing and requires
+the snapshotted target to remain current. The gateway passes the heading level to Datacron and rereads
 the exact section before marking the entry promoted. A final batch pass reconciles the whole-note
 hash of every promotion on a potentially written path before recall can expose it. Any `failed` or
 `stale` apply outcome produces exit code 6 after the report is written.

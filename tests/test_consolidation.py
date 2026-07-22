@@ -439,6 +439,43 @@ def test_reread_failure_never_marks_candidate_promoted(
     assert AuditAction.PROMOTE not in {record.action for record in store.list_audit()}
 
 
+def test_interruption_after_datacron_write_keeps_plan_consumed_for_at_most_once(
+    store: EngramStore,
+    app_config: AppConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entry = store.add_attested(
+        kind=EntryKind.FACT,
+        scope="project/engram",
+        statement="A crash boundary remains fail closed.",
+        source_type=SourceType.HUMAN,
+        subject_keys=("engram/crash-boundary",),
+    )
+    gateway = FakeDatacronGateway()
+    service = ConsolidationService(store, gateway, app_config.datacron)
+    plan = _approve(service.plan())
+
+    def interrupt_promotion(*_args: object, **_kwargs: object) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(store, "mark_promoted", interrupt_promotion)
+
+    with pytest.raises(KeyboardInterrupt):
+        service.apply(plan)
+
+    note = gateway.get_note(plan.propositions[0].rel_path)
+    assert note is not None
+    assert entry.statement in note.content
+    current = store.get_entry(entry.id)
+    assert current is not None
+    assert current.promotion_state is PromotionState.APPROVED
+    stored_plan = store.get_consolidation_plan(plan.plan_id)
+    assert stored_plan is not None
+    assert stored_plan.consumed_at is not None
+    with pytest.raises(StoreValidationError, match="already consumed"):
+        service.apply(plan)
+
+
 def test_update_uses_cas_patch_and_redundant_links_without_write(
     store: EngramStore,
     app_config: AppConfig,
@@ -950,14 +987,17 @@ def test_pending_and_rejected_decisions_never_write(
     service = ConsolidationService(store, gateway, app_config.datacron)
     pending = service.plan()
     gateway.calls.clear()
-    pending_report = service.apply(pending)
-    rejected_plan = service.plan()
-    rejected = rejected_plan.model_copy(
+
+    with pytest.raises(StoreValidationError, match="pending decisions"):
+        service.apply(pending)
+
+    stored_plan = store.get_consolidation_plan(pending.plan_id)
+    assert stored_plan is not None
+    assert stored_plan.consumed_at is None
+    rejected = pending.model_copy(
         update={
             "propositions": (
-                rejected_plan.propositions[0].model_copy(
-                    update={"decision": ReviewDecision.REJECT}
-                ),
+                pending.propositions[0].model_copy(update={"decision": ReviewDecision.REJECT}),
             )
         }
     )
@@ -965,7 +1005,6 @@ def test_pending_and_rejected_decisions_never_write(
 
     rejected_report = service.apply(rejected)
 
-    assert pending_report.outcomes[0].status is ApplyStatus.SKIPPED
     assert rejected_report.outcomes[0].status is ApplyStatus.SKIPPED
     assert gateway.calls == []
 

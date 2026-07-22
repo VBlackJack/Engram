@@ -9,6 +9,9 @@ import hashlib
 import inspect
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
+from pathlib import Path
+from threading import Barrier
 
 import pytest
 
@@ -146,6 +149,75 @@ def test_database_uses_wal_and_numbered_migration(
     assert schema_tables == {"entries_fts", "entry_vectors", "consolidation_plans"}
 
 
+def test_migration_four_preserves_existing_version_three_entries(
+    app_config: AppConfig,
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "version-three.db"
+    config = replace(
+        app_config,
+        database=replace(app_config.database, path=database_path),
+    )
+    with EngramStore(config) as initial:
+        entry = initial.add_attested(
+            kind=EntryKind.FACT,
+            scope="project/engram",
+            statement="Migration four preserves existing entries.",
+            source_type=SourceType.HUMAN,
+        )
+    connection = sqlite3.connect(database_path)
+    try:
+        connection.execute("DROP INDEX consolidation_plans_consumed_idx")
+        connection.execute("DROP TABLE consolidation_plans")
+        connection.execute("UPDATE schema_version SET version = 3")
+        connection.commit()
+    finally:
+        connection.close()
+
+    with EngramStore(config) as upgraded:
+        preserved = upgraded.get_entry(entry.id)
+        assert preserved is not None
+        assert preserved.statement == entry.statement
+        assert upgraded.get_consolidation_plan("01AAAAAAAAAAAAAAAAAAAAAAAA") is None
+
+    connection = sqlite3.connect(database_path)
+    try:
+        version = connection.execute("SELECT version FROM schema_version").fetchone()
+        plan_count = connection.execute("SELECT count(*) FROM consolidation_plans").fetchone()
+    finally:
+        connection.close()
+    assert version == (4,)
+    assert plan_count == (0,)
+
+
+def test_migration_transaction_rolls_back_schema_and_version(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection = sqlite3.connect(":memory:", isolation_level=None)
+    connection.execute("CREATE TABLE schema_version (version INTEGER NOT NULL)")
+    connection.execute("INSERT INTO schema_version(version) VALUES (3)")
+    migration = db_module.Migration(
+        version=4,
+        statements=(
+            "CREATE TABLE migration_probe (value TEXT NOT NULL)",
+            "INVALID SQL",
+        ),
+    )
+    monkeypatch.setattr(db_module, "MIGRATIONS", (migration,))
+    try:
+        with pytest.raises(sqlite3.OperationalError):
+            db_module.apply_migrations(connection)
+        version = connection.execute("SELECT version FROM schema_version").fetchone()
+        probe = connection.execute(
+            "SELECT count(*) FROM sqlite_schema WHERE name = 'migration_probe'"
+        ).fetchone()
+    finally:
+        connection.close()
+
+    assert version == (3,)
+    assert probe == (0,)
+
+
 def test_concurrent_writes_are_serialized_without_loss(store: EngramStore) -> None:
     entry_count = 48
 
@@ -187,6 +259,37 @@ def test_consolidation_plan_snapshot_is_persisted_and_consumed_once(
             created.plan_id,
             expected_hash=created.snapshot_hash,
         )
+
+
+def test_consolidation_plan_is_consumed_by_exactly_one_independent_store(
+    store: EngramStore,
+    app_config: AppConfig,
+) -> None:
+    created = store.create_consolidation_plan('{"schema_version":1,"propositions":[]}')
+    first = EngramStore(app_config)
+    second = EngramStore(app_config)
+    barrier = Barrier(2)
+
+    def consume(candidate: EngramStore) -> str:
+        barrier.wait()
+        try:
+            candidate.consume_consolidation_plan(
+                created.plan_id,
+                expected_hash=created.snapshot_hash,
+            )
+        except StoreValidationError as exc:
+            return str(exc)
+        return "consumed"
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            outcomes = tuple(executor.map(consume, (first, second)))
+    finally:
+        first.close()
+        second.close()
+
+    assert outcomes.count("consumed") == 1
+    assert sum("already consumed" in outcome for outcome in outcomes) == 1
 
 
 def test_consolidation_plan_consumption_detects_snapshot_corruption(
