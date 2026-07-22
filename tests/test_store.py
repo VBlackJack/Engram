@@ -15,6 +15,7 @@ import engram.db as db_module
 from engram.config import AppConfig
 from engram.db import SQLiteVersionError, open_database, verify_sqlite_version
 from engram.models import (
+    AuditAction,
     Confidence,
     EntryKind,
     EntryStatus,
@@ -59,6 +60,7 @@ def test_add_attested_restricts_trusted_provenance(store: EngramStore) -> None:
     assert entry.status is EntryStatus.ACTIVE
     assert entry.promotion_state is PromotionState.APPROVED
     assert entry.source_type is SourceType.TOOL_VERIFIED
+    assert entry.confidence is Confidence.HIGH
 
     with pytest.raises(StoreValidationError, match="only accepts"):
         store.add_attested(
@@ -67,6 +69,38 @@ def test_add_attested_restricts_trusted_provenance(store: EngramStore) -> None:
             statement="Untrusted input",
             source_type=SourceType.MODEL_INFERRED,
         )
+
+
+def test_add_attested_promotes_matching_candidate_in_place(store: EngramStore) -> None:
+    candidate = store.add_candidate(
+        kind="fact",
+        scope="user",
+        statement="The local endpoint is verified.",
+        writer_model="client-a/1.0",
+        confidence=Confidence.LOW,
+        subject_keys=("endpoint",),
+    )
+
+    attested = store.add_attested(
+        kind="fact",
+        scope="USER",
+        statement=" the local endpoint is VERIFIED. ",
+        source_type=SourceType.HUMAN,
+        confidence=Confidence.HIGH,
+    )
+
+    assert attested.id == candidate.id
+    assert store.count_entries() == 1
+    assert attested.status is EntryStatus.ACTIVE
+    assert attested.promotion_state is PromotionState.APPROVED
+    assert attested.source_type is SourceType.HUMAN
+    assert attested.writer_model is None
+    assert attested.confidence is Confidence.HIGH
+    assert attested.subject_keys == ("endpoint",)
+    assert [record.action for record in store.list_audit()] == [
+        AuditAction.INSERT,
+        AuditAction.ATTEST,
+    ]
 
 
 def test_sqlite_version_guard_rejects_older_runtime(monkeypatch: pytest.MonkeyPatch) -> None:

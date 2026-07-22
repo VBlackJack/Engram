@@ -76,6 +76,13 @@ class LoggingConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class AttestationConfig:
+    """Trusted local attestation defaults."""
+
+    default_actor: str = "local-operator"
+
+
+@dataclass(frozen=True, slots=True)
 class ServerConfig:
     """Streamable HTTP server and write backpressure settings."""
 
@@ -134,6 +141,7 @@ class AppConfig:
     ttl_days: TtlConfig
     limits: LimitsConfig
     logging: LoggingConfig
+    attestation: AttestationConfig = field(default_factory=AttestationConfig)
     server: ServerConfig = field(default_factory=ServerConfig)
     capsule: CapsuleConfig = field(default_factory=CapsuleConfig)
     retrieval: RetrievalConfig = field(default_factory=RetrievalConfig)
@@ -144,6 +152,7 @@ DEFAULT_DATABASE_CONFIG = DatabaseConfig()
 DEFAULT_TTL_CONFIG = TtlConfig()
 DEFAULT_LIMITS_CONFIG = LimitsConfig()
 DEFAULT_LOGGING_CONFIG = LoggingConfig()
+DEFAULT_ATTESTATION_CONFIG = AttestationConfig()
 DEFAULT_SERVER_CONFIG = ServerConfig()
 DEFAULT_CAPSULE_CONFIG = CapsuleConfig()
 DEFAULT_RETRIEVAL_CONFIG = RetrievalConfig()
@@ -176,6 +185,7 @@ def load_config(
     ttl_days = _section(raw, "ttl_days")
     limits = _section(raw, "limits")
     logging_config = _section(raw, "logging")
+    attestation = _section(raw, "attestation")
     server = _section(raw, "server")
     capsule = _section(raw, "capsule")
     retrieval = _section(raw, "retrieval")
@@ -240,6 +250,14 @@ def load_config(
                 environment,
                 DEFAULT_LOGGING_CONFIG.console_level,
             ).upper(),
+        ),
+        attestation=AttestationConfig(
+            default_actor=_string_value(
+                attestation,
+                "default_actor",
+                environment,
+                DEFAULT_ATTESTATION_CONFIG.default_actor,
+            ),
         ),
         server=ServerConfig(
             host=_string_value(server, "host", environment, DEFAULT_SERVER_CONFIG.host),

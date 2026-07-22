@@ -64,6 +64,7 @@ rrf_k = 60
         "ENGRAM_TTL_DAYS_EPISODE": "3",
         "ENGRAM_LIMITS_MAX_SUBJECT_KEYS": "4",
         "ENGRAM_LOGGING_FILE_LEVEL": "debug",
+        "ENGRAM_ATTESTATION_DEFAULT_ACTOR": "reviewer@example",
         "ENGRAM_SERVER_PORT": "9000",
         "ENGRAM_SERVER_PATH": "/memory",
         "ENGRAM_SERVER_TTL_SWEEP_INTERVAL_SECONDS": "0.25",
@@ -82,6 +83,7 @@ rrf_k = 60
     assert config.limits.max_subject_keys == 4
     assert config.logging.file_level == "DEBUG"
     assert config.logging.path == (tmp_path / "logs" / "base.log").resolve()
+    assert config.attestation.default_actor == "reviewer@example"
     assert config.server.port == 9000
     assert config.server.path == "/memory"
     assert config.server.write_wait_timeout_ms == 2000

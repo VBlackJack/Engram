@@ -18,6 +18,9 @@ path = "logs/engram.log"
 file_level = "INFO"
 console_level = "INFO"
 
+[attestation]
+default_actor = "local-operator"
+
 [server]
 host = "127.0.0.1"
 port = 8377

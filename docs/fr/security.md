@@ -8,8 +8,9 @@ Le client MCP est non fiable pour la provenance. `remember` n'accepte ni `source
 `writer_model`, ni un statut privilegie. Le serveur derive l'identite de la session MCP, impose
 `model_inferred`, plafonne la confiance a `medium` et place l'entree en quarantaine.
 
-Les provenances `human` et `tool_verified` ne sont accessibles que par un chemin interne atteste.
-Une reference d'evidence reste opaque ; elle ne transforme pas seule un candidat en fait verifie.
+Les provenances `human` et `tool_verified` ne sont accessibles que par la commande locale
+`engram attest`. L'acteur d'audit vient de la configuration ou d'un flag operateur explicite. Une
+reference d'evidence reste opaque ; elle ne transforme pas seule un candidat en fait verifie.
 
 ## Quarantaine anti-poisoning
 
@@ -29,6 +30,7 @@ Executer une seule instance Engram par fichier de base. Le verrou applicatif ser
 mutations, SQLite utilise WAL et `BEGIN IMMEDIATE`, et un timeout court demande au client de retry.
 Le guard refuse SQLite < 3.51.3. Ne pas placer le fichier sur un partage reseau dont les verrous
 SQLite ne sont pas garantis.
+Arreter le daemon avant `attest` ou `supersede`, puis le redemarrer apres la mutation de confiance.
 
 ## Reseau
 

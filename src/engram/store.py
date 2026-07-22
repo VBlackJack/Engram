@@ -149,10 +149,10 @@ class EngramStore:
         """Store an untrusted model inference with server-owned provenance fields."""
         actor = _required_text(writer_model, "writer_model")
         requested_confidence = _enum_value(Confidence, confidence, "confidence")
-        effective_confidence = requested_confidence
-        confidence_was_capped = requested_confidence is Confidence.HIGH
-        if confidence_was_capped:
-            effective_confidence = Confidence.MEDIUM
+        effective_confidence, confidence_was_capped = _cap_confidence(
+            SourceType.MODEL_INFERRED,
+            requested_confidence,
+        )
 
         entry, idempotent = self._add_entry(
             kind=kind,
@@ -183,7 +183,7 @@ class EngramStore:
         scope: str,
         statement: str,
         source_type: SourceType | str,
-        actor: str = "cli",
+        actor: str | None = None,
         confidence: Confidence | str = Confidence.HIGH,
         subject_keys: Sequence[str] = (),
         observed_at: datetime | None = None,
@@ -191,12 +191,16 @@ class EngramStore:
         valid_until: date | None = None,
         evidence: Sequence[Evidence] = (),
     ) -> Entry:
-        """Store a human or tool attestation through the future trusted CLI path."""
+        """Store a human or tool attestation through the trusted local path."""
         normalized_source = _enum_value(SourceType, source_type, "source_type")
         if normalized_source not in {SourceType.HUMAN, SourceType.TOOL_VERIFIED}:
             raise StoreValidationError(
                 "add_attested only accepts human or tool_verified provenance"
             )
+        effective_confidence, confidence_was_capped = _cap_confidence(
+            normalized_source,
+            _enum_value(Confidence, confidence, "confidence"),
+        )
         entry, _ = self._add_entry(
             kind=kind,
             scope=scope,
@@ -206,14 +210,18 @@ class EngramStore:
             promotion_state=PromotionState.APPROVED,
             source_type=normalized_source,
             writer_model=None,
-            confidence=_enum_value(Confidence, confidence, "confidence"),
+            confidence=effective_confidence,
             observed_at=observed_at,
             valid_from=valid_from,
             valid_until=valid_until,
             evidence=evidence,
-            actor=_required_text(actor, "actor"),
+            actor=_required_text(
+                self._config.attestation.default_actor if actor is None else actor,
+                "actor",
+            ),
             action=AuditAction.ATTEST,
-            confidence_was_capped=False,
+            confidence_was_capped=confidence_was_capped,
+            attest_existing_candidate=True,
         )
         return entry
 
@@ -235,13 +243,16 @@ class EngramStore:
         finally:
             self._write_lock.release()
 
-    def supersede(self, old_id: str, new_id: str, *, actor: str = "cli") -> None:
+    def supersede(self, old_id: str, new_id: str, *, actor: str | None = None) -> None:
         """Mark the old entry superseded and link it from the replacement."""
         normalized_old_id = _required_text(old_id, "old_id")
         normalized_new_id = _required_text(new_id, "new_id")
         if normalized_old_id == normalized_new_id:
             raise StoreValidationError("An entry cannot supersede itself")
-        normalized_actor = _required_text(actor, "actor")
+        normalized_actor = _required_text(
+            self._config.attestation.default_actor if actor is None else actor,
+            "actor",
+        )
 
         with self._write_lock:
             self._ensure_open()
@@ -594,6 +605,7 @@ class EngramStore:
         actor: str,
         action: AuditAction,
         confidence_was_capped: bool,
+        attest_existing_candidate: bool = False,
     ) -> tuple[Entry, bool]:
         normalized_kind = _enum_value(EntryKind, kind, "kind")
         normalized_scope = _normalize_scope(scope)
@@ -615,11 +627,37 @@ class EngramStore:
             now = self._now()
             with transaction(self._connection):
                 existing_row = self._connection.execute(
-                    "SELECT * FROM entries WHERE idempotency_key = ?",
+                    "SELECT rowid AS entry_rowid, * FROM entries WHERE idempotency_key = ?",
                     (idempotency_key,),
                 ).fetchone()
                 if existing_row is not None:
                     existing = _entry_from_row(existing_row)
+                    if attest_existing_candidate and _is_attestable_candidate(existing):
+                        if existing.expires_at is not None and existing.expires_at <= now:
+                            raise StoreValidationError("An expired candidate cannot be attested")
+                        updated = self._attest_existing_candidate(
+                            row=existing_row,
+                            existing=existing,
+                            subject_keys=normalized_subject_keys,
+                            source_type=source_type,
+                            confidence=confidence,
+                            observed_at=normalized_observed_at,
+                            valid_from=valid_from,
+                            valid_until=valid_until,
+                            evidence=normalized_evidence,
+                        )
+                        self._append_audit(
+                            ts=now,
+                            actor=actor,
+                            action=AuditAction.ATTEST,
+                            entry_id=updated.id,
+                            detail=_entry_detail(updated),
+                        )
+                        return updated, False
+                    if attest_existing_candidate and not _is_trusted_active(existing):
+                        raise StoreValidationError(
+                            "Canonical content already exists in a non-attestable lifecycle state"
+                        )
                     self._append_audit(
                         ts=now,
                         actor=actor,
@@ -676,6 +714,58 @@ class EngramStore:
                     )
         LOGGER.info("Stored %s entry %s", entry.kind.value, entry.id)
         return entry, False
+
+    def _attest_existing_candidate(  # noqa: PLR0913
+        self,
+        *,
+        row: sqlite3.Row,
+        existing: Entry,
+        subject_keys: tuple[str, ...],
+        source_type: SourceType,
+        confidence: Confidence,
+        observed_at: datetime | None,
+        valid_from: date | None,
+        valid_until: date | None,
+        evidence: tuple[Evidence, ...],
+    ) -> Entry:
+        """Promote matching canonical candidate content without duplicating its identity."""
+        updated_subject_keys = subject_keys or existing.subject_keys
+        updated_evidence = evidence or existing.evidence
+        updated_observed_at = observed_at or existing.observed_at
+        updated_valid_from = valid_from or existing.valid_from
+        updated_valid_until = valid_until or existing.valid_until
+        _validate_date_range(updated_valid_from, updated_valid_until)
+        encoded_subject_keys = _encode_json(list(updated_subject_keys))
+        self._delete_fts_row(row)
+        self._connection.execute(
+            """
+            UPDATE entries
+            SET subject_keys = ?, status = ?, promotion_state = ?, source_type = ?,
+                writer_model = NULL, confidence = ?, observed_at = ?, valid_from = ?,
+                valid_until = ?, evidence = ?
+            WHERE id = ?
+            """,
+            (
+                encoded_subject_keys,
+                EntryStatus.ACTIVE.value,
+                PromotionState.APPROVED.value,
+                source_type.value,
+                confidence.value,
+                _format_optional_datetime(updated_observed_at),
+                None if updated_valid_from is None else updated_valid_from.isoformat(),
+                None if updated_valid_until is None else updated_valid_until.isoformat(),
+                _encode_evidence(updated_evidence),
+                existing.id,
+            ),
+        )
+        self._connection.execute(
+            "INSERT INTO entries_fts(rowid, statement, subject_keys) VALUES (?, ?, ?)",
+            (int(row["entry_rowid"]), existing.statement, encoded_subject_keys),
+        )
+        updated_row = self._fetch_entry_row(existing.id)
+        if updated_row is None:  # pragma: no cover - protected by the transaction
+            raise RuntimeError("Attested candidate disappeared")
+        return _entry_from_row(updated_row)
 
     def _insert_entry(self, entry: Entry) -> None:
         encoded_subject_keys = _encode_json(list(entry.subject_keys))
@@ -970,6 +1060,34 @@ def _entry_detail(entry: Entry) -> dict[str, object]:
         "statement_hash": hashlib.sha256(entry.statement.encode("utf-8")).hexdigest(),
         "status": entry.status.value,
     }
+
+
+def _cap_confidence(
+    source_type: SourceType,
+    requested: Confidence,
+) -> tuple[Confidence, bool]:
+    if (
+        source_type in {SourceType.MODEL_INFERRED, SourceType.SESSION_SUMMARY}
+        and requested is Confidence.HIGH
+    ):
+        return Confidence.MEDIUM, True
+    return requested, False
+
+
+def _is_attestable_candidate(entry: Entry) -> bool:
+    return (
+        entry.status is EntryStatus.QUARANTINED
+        and entry.promotion_state is PromotionState.CANDIDATE
+        and entry.source_type is SourceType.MODEL_INFERRED
+    )
+
+
+def _is_trusted_active(entry: Entry) -> bool:
+    return (
+        entry.status is EntryStatus.ACTIVE
+        and entry.promotion_state in {PromotionState.APPROVED, PromotionState.PROMOTED}
+        and entry.source_type in {SourceType.HUMAN, SourceType.TOOL_VERIFIED}
+    )
 
 
 def _require_promotable(entry: Entry) -> None:

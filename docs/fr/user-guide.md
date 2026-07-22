@@ -37,6 +37,40 @@ Utiliser des `subject_keys` stables et peu nombreux, par exemple `engram:storage
 
 Traiter `own_pending` comme non confirme. Un candidat ne doit pas guider une action irreversible.
 
+## Attester la memoire de confiance
+
+Definir l'identite d'audit par defaut dans `engram.toml` :
+
+```toml
+[attestation]
+default_actor = "local-operator"
+```
+
+Arreter `engram serve` avant une mutation de confiance afin qu'un seul processus ecrive dans la
+base. Inspecter les candidats, puis attester le contenu relu :
+
+```powershell
+engram list --status quarantined
+engram attest "Le service ecoute sur le port 8377." fact user `
+  --subject-key "engram/server-port" `
+  --evidence "review=change-42"
+```
+
+Si le kind, le scope et le statement canonique correspondent a un candidat, l'attestation promeut
+ce meme identifiant en `active`/`approved`. Pour une correction, fournir explicitement
+l'identifiant remplace :
+
+```powershell
+engram attest "Le service ecoute sur le port 9000." fact user `
+  --subject-key "engram/server-port" `
+  --supersedes 01AAAAAAAAAAAAAAAAAAAAAAAA
+```
+
+Pour relier deux entrees existantes, utiliser `engram supersede --old OLD_ID --new NEW_ID`. Les
+commandes de confiance emettent du JSON exploitable. Redemarrer le daemon avant de rappeler la
+nouvelle memoire active. `engram attest --help` documente provenance, confiance, validite,
+observation, evidence et acteur.
+
 ## Reindexer
 
 FTS5 et les vecteurs sont derives :

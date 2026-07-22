@@ -8,8 +8,9 @@ The MCP client is untrusted for provenance. `remember` accepts neither `source_t
 `writer_model`, nor a privileged status. The server derives identity from the MCP session, enforces
 `model_inferred`, caps confidence at `medium`, and quarantines the entry.
 
-`human` and `tool_verified` provenance is available only through an internal attested path. An
-opaque evidence reference does not by itself turn a candidate into a verified fact.
+`human` and `tool_verified` provenance is available only through the local `engram attest` command.
+The audit actor comes from configuration or an explicit operator flag. An opaque evidence reference
+does not by itself turn a candidate into a verified fact.
 
 ## Anti-poisoning quarantine
 
@@ -28,6 +29,7 @@ and attestation remain explicit.
 Run one Engram instance per database file. The application lock serializes mutations, SQLite uses
 WAL and `BEGIN IMMEDIATE`, and a short timeout asks the client to retry. The guard rejects SQLite
 < 3.51.3. Do not put the database on a network share whose SQLite locking semantics are uncertain.
+Stop the daemon before `attest` or `supersede`, then restart it after the trusted mutation.
 
 ## Network
 

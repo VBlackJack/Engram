@@ -51,13 +51,14 @@ or past `expires_at` immediately, while the daemon periodically changes their st
 comes from MCP initialization, not from an argument. A requested `high` confidence is stored as
 `medium`, and the cap event is audited.
 
-Only the internal attested path accepts `human` or `tool_verified`. An entry is eligible for
+Only the trusted local CLI path accepts `human` or `tool_verified`. An entry is eligible for
 consolidation only when it is `active`, `approved`, not stale, and attested by one of those sources.
 
 ## Lifecycle
 
 1. A `remember` call creates or idempotently finds a `quarantined` candidate.
-2. Explicit attestation produces an `active`, `approved` entry.
+2. Explicit attestation produces an `active`, `approved` entry. Canonically identical candidate
+   content is promoted in place and retains its identifier.
 3. A new version can mark previous versions `superseded` without erasing history.
 4. TTL marks an entry `expired`; physical purge is separate and audited.
 5. Reviewed consolidation changes the state to `promoted` only after a CAS write and reread.

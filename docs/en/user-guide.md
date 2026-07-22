@@ -37,6 +37,39 @@ store secrets, transcripts, hypotheses, duplicates, or ephemeral detail.
 
 Treat `own_pending` as unconfirmed. A candidate must not guide irreversible action.
 
+## Attest trusted memory
+
+Set the default audit identity in `engram.toml`:
+
+```toml
+[attestation]
+default_actor = "local-operator"
+```
+
+Stop `engram serve` before running a trusted mutation so only one process writes the database.
+Inspect pending candidates, then attest reviewed content:
+
+```powershell
+engram list --status quarantined
+engram attest "The service listens on port 8377." fact user `
+  --subject-key "engram/server-port" `
+  --evidence "review=change-42"
+```
+
+If the canonical kind, scope, and statement match a candidate, attestation promotes that same
+entry ID to `active`/`approved`. For a corrected statement, pass the replaced ID explicitly:
+
+```powershell
+engram attest "The service listens on port 9000." fact user `
+  --subject-key "engram/server-port" `
+  --supersedes 01AAAAAAAAAAAAAAAAAAAAAAAA
+```
+
+To link two entries that already exist, use `engram supersede --old OLD_ID --new NEW_ID`. Trusted
+commands emit machine-readable JSON. Restart the daemon before recalling the newly active memory.
+Use `engram attest --help` for provenance, confidence, validity, observation, evidence, and actor
+options.
+
 ## Reindex
 
 FTS5 and vectors are derived:

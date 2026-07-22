@@ -52,14 +52,15 @@ a `expired`.
 writer vient de l'initialisation MCP et non d'un argument. Une confiance `high` demandee a ce
 niveau est stockee `medium` et l'evenement de plafonnement est audite.
 
-Seul le chemin interne atteste accepte `human` ou `tool_verified`. Une entree ne devient eligible
+Seul le chemin CLI local atteste accepte `human` ou `tool_verified`. Une entree ne devient eligible
 a la consolidation que si elle est `active`, `approved`, non stale et attestee par une de ces deux
 provenances.
 
 ## Cycle de vie
 
 1. Un appel `remember` cree ou retrouve idempotemment un candidat `quarantined`.
-2. Une attestation explicite produit une entree `active` et `approved`.
+2. Une attestation explicite produit une entree `active` et `approved`. Le contenu canonique
+   identique d'un candidat est promu sur place et conserve son identifiant.
 3. Une nouvelle version peut rendre les anciennes `superseded` sans effacer l'historique.
 4. Le TTL rend une entree `expired`; la purge physique est une operation distincte et auditee.
 5. Une consolidation revue passe l'etat a `promoted` seulement apres ecriture CAS et relecture.

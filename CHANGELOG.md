@@ -7,9 +7,15 @@ project uses date-derived CalVer releases in the form `YYYY.MMDD.NN`.
 
 ## [Unreleased]
 
+### Added
+
+- Add trusted local `attest`, `supersede`, and status-filtered `list` commands with configurable
+  audit identity and stable JSON output.
+
 ### Fixed
 
 - Enforce TTL at recall time and run a configurable logical-expiry sweep for the HTTP daemon.
+- Promote canonically identical quarantined content in place when it receives trusted attestation.
 
 ### Backlog
 

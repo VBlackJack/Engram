@@ -81,6 +81,7 @@ dossier du fichier TOML.
 | `[ttl_days]` | `ENGRAM_TTL_DAYS_PREFERENCE`, `_DECISION`, `_FACT`, `_PROJECT_STATE`, `_EPISODE` | Duree par kind ; `0` desactive l'expiration |
 | `[limits]` | `ENGRAM_LIMITS_MAX_STATEMENT_CHARS`, `ENGRAM_LIMITS_MAX_SUBJECT_KEYS` | Bornes d'entree |
 | `[logging]` | `ENGRAM_LOGGING_PATH`, `_FILE_LEVEL`, `_CONSOLE_LEVEL` | Fichier et niveaux de log |
+| `[attestation]` | `ENGRAM_ATTESTATION_DEFAULT_ACTOR` | Acteur par defaut des mutations locales de confiance |
 | `[server]` | `ENGRAM_SERVER_HOST`, `_PORT`, `_PATH`, `_WRITE_WAIT_TIMEOUT_MS`, `_TTL_SWEEP_INTERVAL_SECONDS` | Endpoint HTTP, backpressure et balayage d'expiration logique |
 | `[capsule]` | `ENGRAM_CAPSULE_DEFAULT_TOKEN_BUDGET`, `_MIN_TOKEN_BUDGET`, `_MAX_TOKEN_BUDGET` | Budget du rappel |
 | `[retrieval]` | `ENGRAM_RETRIEVAL_MODE`, `_EMBEDDINGS_ENDPOINT`, `_EMBEDDINGS_MODEL`, `_EMBEDDINGS_TIMEOUT_MS`, `_RRF_K` | FTS ou hybride local |
@@ -121,6 +122,9 @@ Voir le [modele de securite complet](docs/fr/security.md).
 engram --version
 engram serve
 engram reindex
+engram list --status quarantined
+engram attest "Statement relu" fact user --subject-key "topic/key"
+engram supersede --old OLD_ID --new NEW_ID
 engram eval --mode both --out local/eval
 engram consolidate --plan --out local/consolidation/plan.json
 engram consolidate --apply local/consolidation/plan.json
@@ -130,6 +134,9 @@ engram consolidate --check-freshness
 `consolidate --plan` ne modifie rien. Editez chaque `decision` du JSON (`approve` ou `reject`) avant
 `--apply`. Un hash Datacron divergent produit `stale` et exige un nouveau plan ; il n'est jamais
 force.
+Arreter le daemon avant `attest` ou `supersede` pour conserver la frontiere single-writer, puis le
+redemarrer avant recall. Les commandes de confiance utilisent `[attestation].default_actor`, sauf
+si `--actor` est fourni.
 
 ## Limites actuelles
 
