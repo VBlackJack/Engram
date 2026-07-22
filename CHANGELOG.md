@@ -14,6 +14,9 @@ project uses date-derived CalVer releases in the form `YYYY.MMDD.NN`.
 
 ### Fixed
 
+- Enforce inclusive business-validity windows at recall, plan, and apply time.
+- Revalidate reviewed consolidation targets against current Datacron neighbors, pass heading levels
+  through the live gateway, and verify the exact patched section before promotion.
 - Enforce TTL at recall time and run a configurable logical-expiry sweep for the HTTP daemon.
 - Promote canonically identical quarantined content in place when it receives trusted attestation.
 - Enforce one cross-process database writer with an OS lock, stale-owner recovery, and a truly

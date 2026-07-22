@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import re
+from datetime import timedelta
 from pathlib import Path
 
 import pytest
@@ -19,6 +21,7 @@ from engram.consolidation.models import (
     ApplyStatus,
     ConsolidationPlan,
     NeighborSection,
+    NoteView,
     ReviewDecision,
 )
 from engram.consolidation.report import model_json, render_plan_markdown
@@ -32,6 +35,7 @@ from engram.models import (
 )
 from engram.retrieval import FtsRetriever, RetrievalRequest
 from engram.store import EngramStore
+from tests.conftest import MutableClock
 
 
 def _hash(content: str) -> str:
@@ -49,6 +53,17 @@ def _approve(plan: ConsolidationPlan) -> ConsolidationPlan:
     )
 
 
+class _WrappedReadGateway(FakeDatacronGateway):
+    """Model Datacron's sandbox wrapper around content returned by get_note."""
+
+    def get_note(self, rel_path: str) -> NoteView | None:
+        note = super().get_note(rel_path)
+        if note is None:
+            return None
+        wrapped = f'<vault_content path="{rel_path}">\n{note.content.rstrip()}\n</vault_content>'
+        return note.model_copy(update={"content": wrapped})
+
+
 def _neighbor(  # noqa: PLR0913
     *,
     rel_path: str,
@@ -57,13 +72,23 @@ def _neighbor(  # noqa: PLR0913
     subject_key: str,
     content: str,
     search_rank: int = 0,
+    heading_level: int | None = None,
 ) -> NeighborSection:
+    selected_level = heading_level
+    if selected_level is None:
+        match = re.search(
+            rf"^(?P<marks>#{{1,6}})\s+{re.escape(heading)}\s*$",
+            content,
+            flags=re.MULTILINE,
+        )
+        selected_level = len(match.group("marks")) if match is not None else 2
     return NeighborSection(
         rel_path=rel_path,
         heading=heading,
         statement=statement,
         subject_keys=(subject_key,),
         content_hash=_hash(content),
+        heading_level=selected_level,
         search_rank=search_rank,
         excerpt=statement,
     )
@@ -93,6 +118,57 @@ def test_plan_selects_only_active_approved_attestations(
 
     assert [item.candidate_id for item in plan.propositions] == [eligible.id]
     assert plan.propositions[0].decision is ReviewDecision.PENDING
+
+
+def test_business_validity_filters_plan_and_is_rechecked_before_apply(
+    store: EngramStore,
+    app_config: AppConfig,
+    clock: MutableClock,
+) -> None:
+    current = clock.current
+    today = current.date()
+    store.add_attested(
+        kind=EntryKind.FACT,
+        scope="global",
+        statement="The future business value is enabled.",
+        source_type=SourceType.HUMAN,
+        subject_keys=("business/future",),
+        valid_from=today + timedelta(days=1),
+    )
+    store.add_attested(
+        kind=EntryKind.FACT,
+        scope="global",
+        statement="The elapsed business value is enabled.",
+        source_type=SourceType.HUMAN,
+        subject_keys=("business/elapsed",),
+        valid_until=today - timedelta(days=1),
+    )
+    boundary = store.add_attested(
+        kind=EntryKind.FACT,
+        scope="global",
+        statement="The boundary business value is enabled.",
+        source_type=SourceType.HUMAN,
+        subject_keys=("business/boundary",),
+        valid_from=today,
+        valid_until=today,
+    )
+    gateway = FakeDatacronGateway()
+    service = ConsolidationService(store, gateway, app_config.datacron)
+
+    plan = service.plan()
+
+    assert [item.candidate_id for item in plan.propositions] == [boundary.id]
+
+    clock.current = current + timedelta(days=1)
+    gateway.calls.clear()
+    report = service.apply(_approve(plan))
+
+    assert report.outcomes[0].status is ApplyStatus.FAILED
+    assert report.outcomes[0].detail == "candidate is outside its business validity window"
+    assert gateway.calls == []
+    stored = store.get_entry(boundary.id)
+    assert stored is not None
+    assert stored.promotion_state is PromotionState.APPROVED
 
 
 def test_plan_maps_all_four_classifications_and_is_deterministic(
@@ -262,6 +338,44 @@ def test_datacron_gateway_wraps_missing_command_without_transport_traceback() ->
         pytest.fail("Missing Datacron command opened a gateway")
 
 
+def test_datacron_gateway_sends_and_verifies_heading_level(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gateway = McpDatacronGateway(DatacronConfig())
+    captured: dict[str, object] = {}
+
+    def fake_call(tool_name: str, arguments: dict[str, object]) -> dict[str, object]:
+        captured["tool_name"] = tool_name
+        captured["arguments"] = arguments
+        return {
+            "indexed": True,
+            "content_hash": "a" * 64,
+            "patched": {"heading": "Runtime", "level": 2},
+        }
+
+    monkeypatch.setattr(gateway, "_call", fake_call)
+
+    result = gateway.patch_section(
+        "_memory/runtime.md",
+        "Runtime",
+        2,
+        "The nested runtime is Python 3.13.",
+        "b" * 64,
+    )
+
+    assert result == "a" * 64
+    assert captured == {
+        "tool_name": "patch_note_section",
+        "arguments": {
+            "rel_path": "_memory/runtime.md",
+            "heading": "Runtime",
+            "heading_level": 2,
+            "new_content": "The nested runtime is Python 3.13.",
+            "expected_hash": "b" * 64,
+        },
+    }
+
+
 def test_apply_continues_after_cas_conflict_and_records_verified_promotion(
     store: EngramStore,
     app_config: AppConfig,
@@ -381,6 +495,158 @@ def test_update_uses_cas_patch_and_redundant_links_without_write(
     updated_note = gateway.get_note("_memory/runtime.md")
     assert updated_note is not None
     assert "Python 3.13" in updated_note.content
+
+
+def test_apply_rejects_reviewed_plan_retargeted_to_another_section(
+    store: EngramStore,
+    app_config: AppConfig,
+) -> None:
+    entry = store.add_attested(
+        kind=EntryKind.FACT,
+        scope="global",
+        statement="The supported runtime is Python 3.13.",
+        source_type=SourceType.HUMAN,
+        subject_keys=("runtime/python",),
+    )
+    content = (
+        "# Runtime\n\nThe supported runtime is Python 3.12.\n\n"
+        "# Unrelated\n\nThis section must remain unchanged.\n"
+    )
+    gateway = FakeDatacronGateway(
+        {"_memory/runtime.md": content},
+        neighbors=(
+            _neighbor(
+                rel_path="_memory/runtime.md",
+                heading="Runtime",
+                statement="The supported runtime is Python 3.12.",
+                subject_key="runtime/python",
+                content=content,
+            ),
+        ),
+    )
+    service = ConsolidationService(store, gateway, app_config.datacron)
+    proposition = (
+        service.plan()
+        .propositions[0]
+        .model_copy(
+            update={
+                "decision": ReviewDecision.APPROVE,
+                "heading": "Unrelated",
+            }
+        )
+    )
+    gateway.calls.clear()
+
+    report = service.apply(ConsolidationPlan(propositions=(proposition,)))
+
+    assert report.outcomes[0].status is ApplyStatus.FAILED
+    assert report.outcomes[0].detail == "reviewed target is not a current deterministic neighbor"
+    assert ("patch_section", "_memory/runtime.md") not in gateway.calls
+    note = gateway.get_note("_memory/runtime.md")
+    assert note is not None
+    assert note.content == content
+    stored = store.get_entry(entry.id)
+    assert stored is not None
+    assert stored.promotion_state is PromotionState.APPROVED
+
+
+def test_apply_accepts_reviewed_target_matching_a_current_neighbor(
+    store: EngramStore,
+    app_config: AppConfig,
+) -> None:
+    store.add_attested(
+        kind=EntryKind.FACT,
+        scope="global",
+        statement="The supported runtime is Python 3.13.",
+        source_type=SourceType.HUMAN,
+        subject_keys=("runtime/python",),
+    )
+    first_content = "# Runtime A\n\nThe supported runtime is Python 3.11.\n"
+    second_content = "# Runtime B\n\nThe supported runtime is Python 3.12.\n"
+    second = _neighbor(
+        rel_path="_memory/runtime-b.md",
+        heading="Runtime B",
+        statement="The supported runtime is Python 3.12.",
+        subject_key="runtime/python",
+        content=second_content,
+        search_rank=1,
+    )
+    gateway = FakeDatacronGateway(
+        {
+            "_memory/runtime-a.md": first_content,
+            "_memory/runtime-b.md": second_content,
+        },
+        neighbors=(
+            _neighbor(
+                rel_path="_memory/runtime-a.md",
+                heading="Runtime A",
+                statement="The supported runtime is Python 3.11.",
+                subject_key="runtime/python",
+                content=first_content,
+            ),
+            second,
+        ),
+    )
+    service = ConsolidationService(store, gateway, app_config.datacron)
+    original = service.plan().propositions[0]
+    corrected = original.model_copy(
+        update={
+            "decision": ReviewDecision.APPROVE,
+            "rel_path": second.rel_path,
+            "heading": second.heading,
+            "heading_level": second.heading_level,
+            "expected_hash": second.content_hash,
+        }
+    )
+    gateway.calls.clear()
+
+    report = service.apply(ConsolidationPlan(propositions=(corrected,)))
+
+    assert report.outcomes[0].status is ApplyStatus.APPLIED
+    assert ("patch_section", "_memory/runtime-b.md") in gateway.calls
+    assert ("patch_section", "_memory/runtime-a.md") not in gateway.calls
+
+
+def test_patch_uses_heading_level_and_verifies_the_exact_wrapped_section(
+    store: EngramStore,
+    app_config: AppConfig,
+) -> None:
+    store.add_attested(
+        kind=EntryKind.FACT,
+        scope="global",
+        statement="The nested runtime is Python 3.13.",
+        source_type=SourceType.HUMAN,
+        subject_keys=("runtime/nested",),
+    )
+    content = (
+        "# Runtime\n\nThe top-level runtime remains unchanged.\n\n"
+        "## Runtime\n\nThe nested runtime is Python 3.12.\n\n"
+        "# Other\n\nOther content.\n"
+    )
+    gateway = _WrappedReadGateway(
+        {"_memory/runtime.md": content},
+        neighbors=(
+            _neighbor(
+                rel_path="_memory/runtime.md",
+                heading="Runtime",
+                statement="The nested runtime is Python 3.12.",
+                subject_key="runtime/nested",
+                content=content,
+                heading_level=2,
+            ),
+        ),
+    )
+    service = ConsolidationService(store, gateway, app_config.datacron)
+
+    plan = service.plan()
+    assert plan.propositions[0].heading_level == 2
+    report = service.apply(_approve(plan))
+
+    assert report.outcomes[0].status is ApplyStatus.APPLIED
+    note = gateway.get_note("_memory/runtime.md")
+    assert note is not None
+    assert "The top-level runtime remains unchanged." in note.content
+    assert "## Runtime\n\nThe nested runtime is Python 3.13." in note.content
 
 
 def test_pending_and_rejected_decisions_never_write(

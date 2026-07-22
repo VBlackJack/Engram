@@ -134,8 +134,12 @@ JSON. Every proposition is `pending` by default.
 For each proposition:
 
 - choose `decision: "approve"` or `"reject"`;
-- verify `classification`, `proposed_action`, `rel_path`, `heading`, and `new_content`;
+- verify `classification`, `proposed_action`, `rel_path`, `heading`, `heading_level`, and
+  `new_content`;
 - preserve `expected_hash`: it carries the CAS protection.
+
+You may select another patch target only when its path, heading, heading level, and hash already
+appear together in `neighbors`. Apply regenerates those neighbors and rejects any other retargeting.
 
 ### 3. Apply
 

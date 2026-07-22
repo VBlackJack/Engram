@@ -370,6 +370,15 @@ class EngramStore:
             self._ensure_open()
             return entry.expires_at is not None and entry.expires_at <= self._now()
 
+    def is_business_valid(self, entry: Entry) -> bool:
+        """Return whether an entry is inside its inclusive business-validity window."""
+        with self._write_lock:
+            self._ensure_open()
+            today = self._now().date()
+            return (entry.valid_from is None or entry.valid_from <= today) and (
+                entry.valid_until is None or today <= entry.valid_until
+            )
+
     def purge_expired(self, older_than: datetime) -> int:
         """Physically remove expired payloads older than a required cutoff."""
         cutoff = _aware_datetime(older_than, "older_than")
@@ -524,16 +533,22 @@ class EngramStore:
     ) -> tuple[Entry, ...]:
         """Return active or quarantined FTS matches ordered by BM25 and recency."""
         normalized_query = _required_text(match_query, "match_query")
+        now = self._now()
+        today = now.date().isoformat()
         clauses = [
             f"{FTS_TABLE_NAME} MATCH ?",
             "entries.status IN (?, ?)",
             "(entries.expires_at IS NULL OR entries.expires_at > ?)",
+            "(entries.valid_from IS NULL OR entries.valid_from <= ?)",
+            "(entries.valid_until IS NULL OR entries.valid_until >= ?)",
         ]
         parameters: list[object] = [
             normalized_query,
             EntryStatus.ACTIVE.value,
             EntryStatus.QUARANTINED.value,
-            _format_datetime(self._now()),
+            _format_datetime(now),
+            today,
+            today,
         ]
         if scope is not None:
             clauses.append("entries.scope = ?")

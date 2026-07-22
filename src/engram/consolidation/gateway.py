@@ -52,6 +52,7 @@ class DatacronGateway(Protocol):
         self,
         rel_path: str,
         heading: str,
+        heading_level: int,
         new_content: str,
         expected_hash: str,
     ) -> str:
@@ -126,6 +127,7 @@ class FakeDatacronGateway:
         self,
         rel_path: str,
         heading: str,
+        heading_level: int,
         new_content: str,
         expected_hash: str,
     ) -> str:
@@ -136,7 +138,12 @@ class FakeDatacronGateway:
             raise DatacronConflictError(f"Datacron note is missing: {rel_path}")
         if _content_hash(current) != expected_hash:
             raise DatacronConflictError(f"Datacron hash changed: {rel_path}")
-        self._notes[rel_path] = _replace_section(current, heading, new_content)
+        self._notes[rel_path] = _replace_section(
+            current,
+            heading,
+            heading_level,
+            new_content,
+        )
         written_hash = _content_hash(self._notes[rel_path])
         self._inject_drift(rel_path)
         return written_hash
@@ -160,14 +167,23 @@ class FakeDatacronGateway:
             self._notes[rel_path] += "\nOut-of-band drift.\n"
 
 
-def _replace_section(content: str, heading: str, new_content: str) -> str:
+def _replace_section(
+    content: str,
+    heading: str,
+    heading_level: int,
+    new_content: str,
+) -> str:
     matches = list(HEADING_PATTERN.finditer(content))
-    target_index = next(
-        (index for index, match in enumerate(matches) if match.group(2).strip() == heading.strip()),
-        None,
-    )
-    if target_index is None:
+    target_indexes = [
+        index
+        for index, match in enumerate(matches)
+        if match.group(2).strip() == heading.strip() and len(match.group(1)) == heading_level
+    ]
+    if not target_indexes:
         raise DatacronConflictError(f"Datacron heading is missing: {heading}")
+    if len(target_indexes) > 1:
+        raise DatacronConflictError(f"Datacron heading is ambiguous: {heading}")
+    target_index = target_indexes[0]
     target = matches[target_index]
     level = len(target.group(1))
     end = len(content)

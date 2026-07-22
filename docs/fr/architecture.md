@@ -73,10 +73,14 @@ Le gateway parle au serveur Datacron en MCP stdio et applique les allowlists con
 est volontairement en deux temps :
 
 1. `--plan` recherche les sections voisines, classe create/patch/skip et produit JSON + Markdown ;
-2. un humain choisit approve/reject et peut corriger la cible ;
+2. un humain choisit approve/reject et peut selectionner une autre cible parmi les voisins du plan ;
 3. `--apply` relit la note, compare le hash CAS, ecrit via MCP, puis relit ;
 4. Engram marque `promoted` seulement si la relecture confirme la mutation ;
 5. `--check-freshness` compare ensuite les hashes sans reecrire le vault.
 
 Une erreur sur une proposition n'autorise pas le forcement d'une autre. Les propositions `stale`
 doivent etre replannifiees depuis l'etat Datacron courant.
+
+Apply regenere les voisins et lie une cible de patch revue par son chemin, son heading, son niveau
+et son hash de contenu. Apres relecture, la section exacte doit correspondre au corps canonique du
+candidat ; trouver ce corps ailleurs dans la note ne suffit pas a verifier l'ecriture.

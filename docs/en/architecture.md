@@ -71,10 +71,14 @@ The gateway talks to the Datacron server over stdio MCP and enforces configured 
 flow is deliberately split:
 
 1. `--plan` searches neighboring sections, classifies create/patch/skip, and writes JSON + Markdown;
-2. a human chooses approve/reject and may correct the target;
+2. a human chooses approve/reject and may select another target from the planned neighbors;
 3. `--apply` rereads the note, compares the CAS hash, writes through MCP, then rereads;
 4. Engram marks `promoted` only when the reread confirms the mutation;
 5. `--check-freshness` later compares hashes without rewriting the vault.
 
 A failure on one proposition does not authorize forcing another. `stale` propositions must be
 replanned from current Datacron state.
+
+Apply regenerates the neighbor set and binds a reviewed patch target by path, heading, heading
+level, and content hash. The exact patched section must match the canonical candidate body after
+reread; finding that body elsewhere in the note is not sufficient verification.

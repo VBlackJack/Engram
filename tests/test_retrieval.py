@@ -225,6 +225,54 @@ def test_read_time_guards_hide_due_entries_before_sweep(
     assert stored.status is EntryStatus.QUARANTINED
 
 
+def test_business_validity_window_is_inclusive_across_read_paths(
+    store: EngramStore,
+    clock: MutableClock,
+) -> None:
+    today = clock.current.date()
+    store.add_attested(
+        kind="fact",
+        scope="user",
+        statement="Business window future.",
+        source_type=SourceType.HUMAN,
+        valid_from=today + timedelta(days=2),
+    )
+    store.add_attested(
+        kind="fact",
+        scope="user",
+        statement="Business window elapsed.",
+        source_type=SourceType.HUMAN,
+        valid_until=today - timedelta(days=1),
+    )
+    boundary = store.add_attested(
+        kind="fact",
+        scope="user",
+        statement="Business window boundary.",
+        source_type=SourceType.HUMAN,
+        valid_from=today,
+        valid_until=today,
+    )
+    retriever = FtsRetriever(store)
+    request = _request("business window")
+
+    assert [
+        entry.id
+        for entry in store.search_fts(
+            '"business" AND "window"',
+            scope=None,
+            kinds=None,
+        )
+    ] == [boundary.id]
+    assert [entry.id for entry in retriever.eligible_entries(request)] == [boundary.id]
+    assert [entry.id for entry in retriever.retrieve(request).matches] == [boundary.id]
+
+    clock.current += timedelta(days=1)
+
+    assert store.search_fts('"business" AND "window"', scope=None, kinds=None) == ()
+    assert retriever.eligible_entries(request) == ()
+    assert retriever.retrieve(request).matches == ()
+
+
 def test_reciprocal_rank_fusion_is_deterministic() -> None:
     rankings = (("a", "b", "c"), ("b", "a", "d"))
 

@@ -17,6 +17,8 @@ decisions, not free-form client claims.
 
 TTLs are configurable in `[ttl_days]`. A value of `0` disables expiry. Recall excludes entries at
 or past `expires_at` immediately, while the daemon periodically changes their status to `expired`.
+Business validity is inclusive: an entry is recallable and consolidatable only when the server's
+current date satisfies `valid_from <= today <= valid_until`; either missing bound is open-ended.
 
 ## Entry schema
 
@@ -52,7 +54,9 @@ comes from MCP initialization, not from an argument. A requested `high` confiden
 `medium`, and the cap event is audited.
 
 Only the trusted local CLI path accepts `human` or `tool_verified`. An entry is eligible for
-consolidation only when it is `active`, `approved`, not stale, and attested by one of those sources.
+consolidation only when it is `active`, `approved`, not stale, inside its business-validity window,
+and attested by one of those sources. Apply rechecks the window so a plan cannot promote an entry
+that became invalid after review.
 
 ## Lifecycle
 
@@ -92,4 +96,7 @@ until review. History is retained and this check never rewrites Datacron.
 
 Consolidation preserves the deterministic search rank returned by Datacron when selecting a patch
 target. A `redundant` proposition always targets the neighbor whose normalized statement exactly
-matches the candidate, even when a broader search hit ranks first.
+matches the candidate, even when a broader search hit ranks first. Apply regenerates current
+neighbors before writing. A human-corrected patch target is accepted only when its path, heading,
+heading level, and expected hash identify one of those current neighbors. The gateway passes the
+heading level to Datacron and rereads the exact section before marking the entry promoted.

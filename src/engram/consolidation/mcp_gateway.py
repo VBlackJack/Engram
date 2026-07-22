@@ -126,7 +126,7 @@ class McpDatacronGateway:
         if not isinstance(raw_results, list):
             raise DatacronGatewayError("Datacron search_text returned no results array")
         neighbors: list[NeighborSection] = []
-        seen: set[tuple[str, str]] = set()
+        seen: set[tuple[str, str, int]] = set()
         for search_rank, raw in enumerate(raw_results):
             if not isinstance(raw, dict):
                 continue
@@ -137,14 +137,20 @@ class McpDatacronGateway:
             if note is None:
                 continue
             heading_value = raw.get("section_title")
-            heading = heading_value if isinstance(heading_value, str) else note.title
-            key = (rel_path, heading)
+            fallback_heading = heading_value if isinstance(heading_value, str) else note.title
+            header_path_value = raw.get("header_path")
+            header_path = header_path_value if isinstance(header_path_value, str) else ""
+            selector = _heading_selector(note.content, header_path, fallback_heading)
+            if selector is None:
+                continue
+            heading, heading_level = selector
+            key = (rel_path, heading, heading_level)
             if key in seen:
                 continue
             seen.add(key)
             snippet_value = raw.get("snippet")
             snippet = snippet_value if isinstance(snippet_value, str) else ""
-            statement = _section_content(note.content, heading) or snippet
+            statement = _section_content(note.content, heading, heading_level) or snippet
             neighbors.append(
                 NeighborSection(
                     rel_path=rel_path,
@@ -152,7 +158,7 @@ class McpDatacronGateway:
                     statement=statement,
                     subject_keys=tuple(subject_keys),
                     content_hash=note.content_hash,
-                    heading_level=_heading_level(note.content, heading),
+                    heading_level=heading_level,
                     search_rank=search_rank,
                     excerpt=snippet,
                 )
@@ -178,6 +184,7 @@ class McpDatacronGateway:
         self,
         rel_path: str,
         heading: str,
+        heading_level: int,
         new_content: str,
         expected_hash: str,
     ) -> str:
@@ -187,11 +194,19 @@ class McpDatacronGateway:
             {
                 "rel_path": rel_path,
                 "heading": heading,
+                "heading_level": heading_level,
                 "new_content": new_content,
                 "expected_hash": expected_hash,
             },
         )
         _require_indexed(payload, "patch_note_section")
+        patched = payload.get("patched")
+        if not isinstance(patched, dict):
+            raise DatacronGatewayError("Datacron patch_note_section returned no patched selector")
+        if patched.get("heading") != heading or patched.get("level") != heading_level:
+            raise DatacronGatewayError(
+                "Datacron patch_note_section confirmed a different heading selector"
+            )
         return _required_payload_string(payload, "content_hash")
 
     def create_note(self, rel_path: str, content: str) -> str:
@@ -316,16 +331,16 @@ def _split_title(content: str, rel_path: str) -> tuple[str, str]:
     return rel_path.rsplit("/", 1)[-1].removesuffix(".md"), content
 
 
-def _section_content(content: str, heading: str) -> str:
+def _section_content(content: str, heading: str, heading_level: int) -> str:
     heading_pattern = re.compile(
-        rf"^(?P<marks>#{{1,6}})\s+{re.escape(heading)}\s*$",
+        rf"^(?P<marks>#{{{heading_level}}})\s+{re.escape(heading)}\s*$",
         flags=re.MULTILINE,
     )
-    match = heading_pattern.search(content)
-    if match is None:
+    matches = list(heading_pattern.finditer(content))
+    if len(matches) != 1:
         return ""
-    level = len(match.group("marks"))
-    following = re.compile(rf"^#{{1,{level}}}\s+", flags=re.MULTILINE).search(
+    match = matches[0]
+    following = re.compile(rf"^#{{1,{heading_level}}}\s+", flags=re.MULTILINE).search(
         content,
         match.end(),
     )
@@ -339,10 +354,28 @@ def _section_content(content: str, heading: str) -> str:
     return "\n".join(lines).strip()
 
 
-def _heading_level(content: str, heading: str) -> int:
-    match = re.search(
-        rf"^(?P<marks>#{{1,6}})\s+{re.escape(heading)}\s*$",
-        content,
-        flags=re.MULTILINE,
+def _heading_selector(
+    content: str,
+    header_path: str,
+    fallback_heading: str,
+) -> tuple[str, int] | None:
+    stack: list[str] = []
+    selectors: list[tuple[str, int, str]] = []
+    pattern = re.compile(r"^(?P<marks>#{1,6})\s+(?P<heading>.+?)\s*$", flags=re.MULTILINE)
+    for match in pattern.finditer(content):
+        heading = match.group("heading").strip()
+        level = len(match.group("marks"))
+        stack = stack[: level - 1]
+        stack.append(heading)
+        selectors.append((heading, level, " / ".join(stack)))
+    candidates = (
+        [item for item in selectors if item[2] == header_path]
+        if header_path
+        else [item for item in selectors if item[0] == fallback_heading]
     )
-    return len(match.group("marks")) if match is not None else 2
+    if len(candidates) != 1:
+        candidates = [item for item in selectors if item[0] == fallback_heading]
+    if len(candidates) != 1:
+        return None
+    heading, level, _path = candidates[0]
+    return heading, level

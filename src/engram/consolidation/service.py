@@ -51,7 +51,11 @@ class ConsolidationService:
     def plan(self) -> ConsolidationPlan:
         """Build a stable review artifact without mutating either data source."""
         entries = sorted(
-            (entry for entry in self._store.list_entries() if _is_promotable(entry)),
+            (
+                entry
+                for entry in self._store.list_entries()
+                if _is_promotable(entry) and self._store.is_business_valid(entry)
+            ),
             key=lambda entry: entry.id,
         )
         signal = self._gateway.contradiction_scan() if entries else None
@@ -147,6 +151,7 @@ class ConsolidationService:
         classification = propose_consolidation((candidate,), durable)[0].classification
         action = _action_for(classification)
         heading = _candidate_heading(entry)
+        heading_level: int | None = None
         expected_hash: str | None = None
         if classification is ConsolidationClass.NEW:
             rel_path = self._available_new_path(entry)
@@ -159,6 +164,7 @@ class ConsolidationService:
             )
             rel_path = target.rel_path
             heading = target.heading
+            heading_level = target.heading_level
             expected_hash = target.content_hash
             content = _render_section(entry)
         return Proposition(
@@ -167,6 +173,7 @@ class ConsolidationService:
             proposed_action=action,
             rel_path=rel_path,
             heading=heading,
+            heading_level=heading_level,
             new_content=content,
             expected_hash=expected_hash,
             neighbors=neighbors,
@@ -195,6 +202,14 @@ class ConsolidationService:
                     ApplyStatus.FAILED,
                     "candidate is no longer promotable",
                 )
+            if not self._store.is_business_valid(entry):
+                return _outcome(
+                    proposition,
+                    ApplyStatus.FAILED,
+                    "candidate is outside its business validity window",
+                )
+            current = self._plan_entry(entry, self._gateway.contradiction_scan())
+            _validate_current_plan(proposition, current)
             _validate_candidate_semantics(proposition, entry)
             proposition = proposition.model_copy(
                 update={"new_content": _canonical_content(proposition, entry)}
@@ -264,20 +279,38 @@ class ConsolidationService:
             before = self._gateway.get_note(proposition.rel_path)
             if proposition.expected_hash is None:
                 return _outcome(proposition, ApplyStatus.FAILED, "patch target has no CAS hash")
+            if proposition.heading_level is None:
+                return _outcome(
+                    proposition,
+                    ApplyStatus.FAILED,
+                    "patch target has no heading level",
+                )
             if before is None or before.content_hash != proposition.expected_hash:
                 raise DatacronConflictError("patch target changed; generate a new plan")
             written_hash = self._gateway.patch_section(
                 proposition.rel_path,
                 proposition.heading,
+                proposition.heading_level,
                 proposition.new_content,
                 proposition.expected_hash,
             )
         after = self._gateway.get_note(proposition.rel_path)
-        if (
-            after is None
-            or after.content_hash != written_hash
-            or proposition.new_content.strip() not in after.content
-        ):
+        exact_write = (
+            proposition.new_content.strip() in after.content if after is not None else False
+        )
+        if after is not None and proposition.proposed_action is ConsolidationAction.PATCH_SECTION:
+            if proposition.heading_level is None:  # narrowed before the write
+                exact_write = False
+            else:
+                exact_write = (
+                    _section_content(
+                        after.content,
+                        proposition.heading,
+                        proposition.heading_level,
+                    )
+                    == proposition.new_content.strip()
+                )
+        if after is None or after.content_hash != written_hash or not exact_write:
             return _outcome(
                 proposition,
                 ApplyStatus.FAILED,
@@ -378,6 +411,54 @@ def _validate_reviewed_proposition(proposition: Proposition) -> None:
         raise ValueError("rel_path must remain inside Datacron _memory")
     if not proposition.heading.strip():
         raise ValueError("heading must not be empty")
+    if (
+        proposition.proposed_action is ConsolidationAction.PATCH_SECTION
+        and proposition.heading_level is None
+    ):
+        raise ValueError("patch target must include heading_level")
+
+
+def _validate_current_plan(reviewed: Proposition, current: Proposition) -> None:
+    immutable_fields = (
+        "candidate_id",
+        "classification",
+        "proposed_action",
+    )
+    if any(getattr(reviewed, field) != getattr(current, field) for field in immutable_fields):
+        raise ValueError("reviewed proposition no longer matches the current deterministic plan")
+    if reviewed.classification is ConsolidationClass.NEW:
+        if reviewed.expected_hash is not None or reviewed.heading_level is not None:
+            raise ValueError("new-note target must not include an existing section selector")
+        return
+    if reviewed.classification is ConsolidationClass.REDUNDANT:
+        allowed = tuple(
+            item
+            for item in current.neighbors
+            if (
+                item.rel_path,
+                item.heading,
+                item.heading_level,
+                item.content_hash,
+            )
+            == (
+                current.rel_path,
+                current.heading,
+                current.heading_level,
+                current.expected_hash,
+            )
+        )
+    else:
+        allowed = current.neighbors
+    target = (
+        reviewed.rel_path,
+        reviewed.heading,
+        reviewed.heading_level,
+        reviewed.expected_hash,
+    )
+    if target not in {
+        (item.rel_path, item.heading, item.heading_level, item.content_hash) for item in allowed
+    }:
+        raise ValueError("reviewed target is not a current deterministic neighbor")
 
 
 def _validate_candidate_semantics(proposition: Proposition, entry: Entry) -> None:
@@ -405,6 +486,25 @@ def _validate_candidate_semantics(proposition: Proposition, entry: Entry) -> Non
         preview_body = proposition.new_content.strip()
     if preview_body != expected_body:
         raise ValueError("new_content is not the generated candidate preview")
+
+
+def _section_content(content: str, heading: str, heading_level: int) -> str:
+    heading_pattern = re.compile(
+        rf"^#{{{heading_level}}}\s+{re.escape(heading)}\s*$",
+        flags=re.MULTILINE,
+    )
+    matches = list(heading_pattern.finditer(content))
+    if len(matches) != 1:
+        return ""
+    match = matches[0]
+    following = re.compile(rf"^#{{1,{heading_level}}}\s+", flags=re.MULTILINE).search(
+        content,
+        match.end(),
+    )
+    end = len(content) if following is None else following.start()
+    body = content[match.end() : end].strip()
+    lines = [line for line in body.splitlines() if line.strip() != "</vault_content>"]
+    return "\n".join(lines).strip()
 
 
 def _outcome(

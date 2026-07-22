@@ -139,8 +139,13 @@ editer le JSON. Chaque proposition reste `pending` par defaut.
 Pour chaque proposition :
 
 - choisir `decision: "approve"` ou `"reject"` ;
-- verifier `classification`, `proposed_action`, `rel_path`, `heading`, `new_content` ;
+- verifier `classification`, `proposed_action`, `rel_path`, `heading`, `heading_level` et
+  `new_content` ;
 - conserver `expected_hash` : il porte la protection CAS.
+
+Une autre cible de patch peut etre selectionnee uniquement si son chemin, son heading, son niveau
+et son hash apparaissent ensemble dans `neighbors`. Apply regenere ces voisins et refuse tout autre
+retargeting.
 
 ### 3. Appliquer
 

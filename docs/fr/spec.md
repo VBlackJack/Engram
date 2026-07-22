@@ -17,7 +17,9 @@ des decisions du serveur, pas des affirmations libres du client.
 
 Les TTL sont configurables dans `[ttl_days]`. La valeur `0` desactive l'expiration. Recall exclut
 immediatement les entrees a ou apres `expires_at`, puis le daemon passe periodiquement leur status
-a `expired`.
+a `expired`. La validite metier est inclusive : une entree ne peut etre rappelee ou consolidee que
+si la date courante du serveur respecte `valid_from <= aujourd'hui <= valid_until` ; une borne
+absente reste ouverte.
 
 ## Schema d'une entree
 
@@ -53,8 +55,9 @@ writer vient de l'initialisation MCP et non d'un argument. Une confiance `high` 
 niveau est stockee `medium` et l'evenement de plafonnement est audite.
 
 Seul le chemin CLI local atteste accepte `human` ou `tool_verified`. Une entree ne devient eligible
-a la consolidation que si elle est `active`, `approved`, non stale et attestee par une de ces deux
-provenances.
+a la consolidation que si elle est `active`, `approved`, non stale, dans sa fenetre de validite
+metier et attestee par une de ces deux provenances. Apply reverifie la fenetre pour qu'un plan ne
+puisse pas promouvoir une entree devenue invalide apres la revue.
 
 ## Cycle de vie
 
@@ -96,4 +99,7 @@ jusqu'a revue. L'historique n'est pas supprime et Datacron n'est pas reecrit par
 
 La consolidation conserve le rang de recherche deterministe renvoye par Datacron pour choisir une
 cible de patch. Une proposition `redundant` cible toujours le voisin dont le statement normalise
-correspond exactement au candidat, meme si un resultat plus large arrive avant.
+correspond exactement au candidat, meme si un resultat plus large arrive avant. Apply regenere les
+voisins courants avant ecriture. Une cible corrigee par l'humain n'est acceptee que si son chemin,
+son heading, son niveau et son hash attendu identifient exactement un de ces voisins. Le gateway
+transmet le niveau a Datacron et relit la section exacte avant de marquer l'entree `promoted`.

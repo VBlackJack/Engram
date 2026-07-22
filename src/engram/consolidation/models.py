@@ -81,6 +81,7 @@ class Proposition(StrictModel):
     proposed_action: ConsolidationAction
     rel_path: str
     heading: str
+    heading_level: int | None = Field(default=None, ge=1, le=6)
     new_content: str
     expected_hash: str | None
     neighbors: tuple[NeighborSection, ...]
