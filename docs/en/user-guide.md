@@ -139,7 +139,9 @@ For each proposition:
 - preserve `expected_hash`: it carries the CAS protection.
 
 You may select another patch target only when its path, heading, heading level, and hash already
-appear together in `neighbors`. Apply regenerates those neighbors and rejects any other retargeting.
+appear together in the reviewed `neighbors` and still appear in the regenerated current neighbors.
+Do not edit a NEW proposition's path or heading. Paths must be normalized with forward slashes and
+headings must remain on one line.
 
 ### 3. Apply
 

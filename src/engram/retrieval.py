@@ -182,7 +182,9 @@ class HybridRetriever:
             self._config.rrf_k,
         )
         entries_by_id = {entry.id: entry for entry in eligible}
-        fused = tuple(entries_by_id[entry_id] for entry_id in fused_ids)
+        fused = tuple(
+            entries_by_id[entry_id] for entry_id in fused_ids if entry_id in entries_by_id
+        )
         return self._fts.assemble(request, fused)
 
     def index_entry(self, entry: Entry) -> None:

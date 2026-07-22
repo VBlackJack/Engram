@@ -65,6 +65,7 @@ class ConsolidationService:
     def apply(self, plan: ConsolidationPlan) -> ApplyReport:
         """Apply approved propositions with preread CAS and post-write verification."""
         outcomes: list[ApplyOutcome] = []
+        potential_write_paths: set[str] = set()
         for proposition in plan.propositions:
             if proposition.decision is not ReviewDecision.APPROVE:
                 reason = (
@@ -74,8 +75,9 @@ class ConsolidationService:
                 )
                 outcomes.append(_outcome(proposition, ApplyStatus.SKIPPED, reason))
                 continue
-            outcomes.append(self._apply_approved(proposition))
-        return ApplyReport(outcomes=tuple(outcomes))
+            outcomes.append(self._apply_approved(proposition, potential_write_paths))
+        reconciled = self._reconcile_batch_freshness(outcomes, potential_write_paths)
+        return ApplyReport(outcomes=reconciled)
 
     def check_freshness(self) -> FreshnessReport:
         """Compare every promoted content address and update only Engram freshness state."""
@@ -181,14 +183,22 @@ class ConsolidationService:
         )
 
     def _available_new_path(self, entry: Entry) -> str:
+        primary, fallback = self._new_paths(entry)
+        if self._gateway.get_note(primary) is None:
+            return primary
+        return fallback
+
+    def _new_paths(self, entry: Entry) -> tuple[str, str]:
         directory = self._config.new_note_directory.rstrip("/")
         slug = _slug(entry.subject_keys[0] if entry.subject_keys else entry.id)
         primary = f"{directory}/{slug}.md"
-        if self._gateway.get_note(primary) is None:
-            return primary
-        return f"{directory}/{slug}-{entry.id.casefold()}.md"
+        return primary, f"{directory}/{slug}-{entry.id.casefold()}.md"
 
-    def _apply_approved(self, proposition: Proposition) -> ApplyOutcome:  # noqa: PLR0911
+    def _apply_approved(  # noqa: PLR0911
+        self,
+        proposition: Proposition,
+        potential_write_paths: set[str],
+    ) -> ApplyOutcome:
         try:
             _validate_reviewed_proposition(proposition)
             entry = self._store.get_entry(proposition.candidate_id)
@@ -209,7 +219,11 @@ class ConsolidationService:
                     "candidate is outside its business validity window",
                 )
             current = self._plan_entry(entry, self._gateway.contradiction_scan())
-            _validate_current_plan(proposition, current)
+            _validate_current_plan(
+                proposition,
+                current,
+                allowed_new_paths=self._new_paths(entry),
+            )
             _validate_candidate_semantics(proposition, entry)
             proposition = proposition.model_copy(
                 update={"new_content": _canonical_content(proposition, entry)}
@@ -222,7 +236,7 @@ class ConsolidationService:
                 )
             if proposition.classification is ConsolidationClass.REDUNDANT:
                 return self._promote_redundant(proposition, entry)
-            return self._write_and_promote(proposition, entry)
+            return self._write_and_promote(proposition, entry, potential_write_paths)
         except DatacronConflictError as exc:
             return _outcome(proposition, ApplyStatus.STALE, str(exc))
         except (DatacronGatewayError, StoreValidationError, ValueError) as exc:
@@ -267,10 +281,22 @@ class ConsolidationService:
             promoted.datacron_hash,
         )
 
-    def _write_and_promote(self, proposition: Proposition, entry: Entry) -> ApplyOutcome:
+    def _write_and_promote(  # noqa: C901
+        self,
+        proposition: Proposition,
+        entry: Entry,
+        potential_write_paths: set[str],
+    ) -> ApplyOutcome:
         if proposition.proposed_action is ConsolidationAction.CREATE_NOTE:
             if self._gateway.get_note(proposition.rel_path) is not None:
                 raise DatacronConflictError("create target appeared; generate a new plan")
+            if not self._store.is_business_valid(entry):
+                return _outcome(
+                    proposition,
+                    ApplyStatus.FAILED,
+                    "candidate is outside its business validity window",
+                )
+            potential_write_paths.add(proposition.rel_path)
             written_hash = self._gateway.create_note(
                 proposition.rel_path,
                 proposition.new_content,
@@ -287,6 +313,13 @@ class ConsolidationService:
                 )
             if before is None or before.content_hash != proposition.expected_hash:
                 raise DatacronConflictError("patch target changed; generate a new plan")
+            if not self._store.is_business_valid(entry):
+                return _outcome(
+                    proposition,
+                    ApplyStatus.FAILED,
+                    "candidate is outside its business validity window",
+                )
+            potential_write_paths.add(proposition.rel_path)
             written_hash = self._gateway.patch_section(
                 proposition.rel_path,
                 proposition.heading,
@@ -327,6 +360,45 @@ class ConsolidationService:
             ApplyStatus.APPLIED,
             "Datacron write verified and Engram promotion recorded",
             promoted.datacron_hash,
+        )
+
+    def _reconcile_batch_freshness(
+        self,
+        outcomes: Sequence[ApplyOutcome],
+        potential_write_paths: set[str],
+    ) -> tuple[ApplyOutcome, ...]:
+        if not potential_write_paths:
+            return tuple(outcomes)
+        current_hashes: dict[str, str | None] = {}
+        for rel_path in sorted(potential_write_paths):
+            try:
+                note = self._gateway.get_note(rel_path)
+            except DatacronGatewayError:
+                note = None
+            current_hashes[rel_path] = None if note is None else note.content_hash
+        stale_ids: set[str] = set()
+        for entry in self._store.list_entries():
+            if (
+                entry.promotion_state is not PromotionState.PROMOTED
+                or entry.datacron_ref not in current_hashes
+                or entry.datacron_hash is None
+            ):
+                continue
+            stale = current_hashes[entry.datacron_ref] != entry.datacron_hash
+            self._store.set_stale(entry.id, stale=stale, actor="consolidate:batch-freshness")
+            if stale:
+                stale_ids.add(entry.id)
+        return tuple(
+            outcome.model_copy(
+                update={
+                    "status": ApplyStatus.STALE,
+                    "detail": "promotion hash diverged after a later write in the same batch",
+                }
+            )
+            if outcome.candidate_id in stale_ids
+            and outcome.status in {ApplyStatus.APPLIED, ApplyStatus.SKIPPED}
+            else outcome
+            for outcome in outcomes
         )
 
 
@@ -404,11 +476,17 @@ def _validate_reviewed_proposition(proposition: Proposition) -> None:
     expected_action = _action_for(proposition.classification)
     if proposition.proposed_action is not expected_action:
         raise ValueError("proposed_action does not match the classified operation")
+    if "\\" in proposition.rel_path:
+        raise ValueError("rel_path must use normalized forward slashes")
     path = PurePosixPath(proposition.rel_path)
     if path.is_absolute() or ".." in path.parts or path.suffix.casefold() != ".md":
         raise ValueError("rel_path must be a confined Markdown path")
+    if path.as_posix() != proposition.rel_path:
+        raise ValueError("rel_path must use normalized forward slashes")
     if not path.parts or path.parts[0] != "_memory":
         raise ValueError("rel_path must remain inside Datacron _memory")
+    if "\r" in proposition.heading or "\n" in proposition.heading:
+        raise ValueError("heading must be a single line")
     if not proposition.heading.strip():
         raise ValueError("heading must not be empty")
     if (
@@ -418,7 +496,12 @@ def _validate_reviewed_proposition(proposition: Proposition) -> None:
         raise ValueError("patch target must include heading_level")
 
 
-def _validate_current_plan(reviewed: Proposition, current: Proposition) -> None:
+def _validate_current_plan(
+    reviewed: Proposition,
+    current: Proposition,
+    *,
+    allowed_new_paths: tuple[str, str],
+) -> None:
     immutable_fields = (
         "candidate_id",
         "classification",
@@ -429,6 +512,10 @@ def _validate_current_plan(reviewed: Proposition, current: Proposition) -> None:
     if reviewed.classification is ConsolidationClass.NEW:
         if reviewed.expected_hash is not None or reviewed.heading_level is not None:
             raise ValueError("new-note target must not include an existing section selector")
+        if reviewed.heading != current.heading or reviewed.rel_path not in allowed_new_paths:
+            raise ValueError("reviewed new-note target does not match the current plan")
+        if reviewed.rel_path != current.rel_path:
+            raise DatacronConflictError("create target changed; generate a new plan")
         return
     if reviewed.classification is ConsolidationClass.REDUNDANT:
         allowed = tuple(
@@ -455,6 +542,12 @@ def _validate_current_plan(reviewed: Proposition, current: Proposition) -> None:
         reviewed.heading_level,
         reviewed.expected_hash,
     )
+    reviewed_targets = {
+        (item.rel_path, item.heading, item.heading_level, item.content_hash)
+        for item in reviewed.neighbors
+    }
+    if target not in reviewed_targets:
+        raise ValueError("reviewed target was not present in the reviewed neighbors")
     if target not in {
         (item.rel_path, item.heading, item.heading_level, item.content_hash) for item in allowed
     }:

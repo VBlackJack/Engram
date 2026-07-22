@@ -17,8 +17,8 @@ decisions, not free-form client claims.
 
 TTLs are configurable in `[ttl_days]`. A value of `0` disables expiry. Recall excludes entries at
 or past `expires_at` immediately, while the daemon periodically changes their status to `expired`.
-Business validity is inclusive: an entry is recallable and consolidatable only when the server's
-current date satisfies `valid_from <= today <= valid_until`; either missing bound is open-ended.
+Business validity is inclusive: an entry is recallable and consolidatable only when the store's UTC
+date satisfies `valid_from <= today <= valid_until`; either missing bound is open-ended.
 
 ## Entry schema
 
@@ -55,8 +55,9 @@ comes from MCP initialization, not from an argument. A requested `high` confiden
 
 Only the trusted local CLI path accepts `human` or `tool_verified`. An entry is eligible for
 consolidation only when it is `active`, `approved`, not stale, inside its business-validity window,
-and attested by one of those sources. Apply rechecks the window so a plan cannot promote an entry
-that became invalid after review.
+and attested by one of those sources. Apply checks the window before a Datacron write, and the store
+checks it again inside the promotion transaction, so an entry that became invalid cannot be marked
+promoted.
 
 ## Lifecycle
 
@@ -98,5 +99,7 @@ Consolidation preserves the deterministic search rank returned by Datacron when 
 target. A `redundant` proposition always targets the neighbor whose normalized statement exactly
 matches the candidate, even when a broader search hit ranks first. Apply regenerates current
 neighbors before writing. A human-corrected patch target is accepted only when its path, heading,
-heading level, and expected hash identify one of those current neighbors. The gateway passes the
-heading level to Datacron and rereads the exact section before marking the entry promoted.
+heading level, and expected hash identify a neighbor in both the reviewed plan and the current
+search. NEW paths and headings cannot be edited. The gateway passes the heading level to Datacron
+and rereads the exact section before marking the entry promoted. A final batch pass reconciles the
+whole-note hash of every promotion on a potentially written path before recall can expose it.

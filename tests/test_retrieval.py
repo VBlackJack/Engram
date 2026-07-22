@@ -40,6 +40,19 @@ class KeywordEmbeddingProvider:
         return tuple(_keyword_vector(text) for text in texts)
 
 
+class DateAdvancingEmbeddingProvider(KeywordEmbeddingProvider):
+    """Advance the injected store clock while a hybrid query is in flight."""
+
+    def __init__(self, clock: MutableClock) -> None:
+        """Bind the clock that advances during the embedding request."""
+        super().__init__()
+        self._clock = clock
+
+    def embed(self, texts: Sequence[str]) -> tuple[tuple[float, ...], ...]:
+        self._clock.current += timedelta(days=1)
+        return super().embed(texts)
+
+
 def _keyword_vector(text: str) -> tuple[float, ...]:
     normalized = text.casefold()
     return (
@@ -337,3 +350,28 @@ def test_hybrid_endpoint_failure_degrades_to_fts_with_warning(
 
     assert result.matches[0].id == entry.id
     assert "degrading to FTS" in caplog.text
+
+
+def test_hybrid_recall_excludes_entry_that_becomes_invalid_during_embedding(
+    store: EngramStore,
+    clock: MutableClock,
+) -> None:
+    store.add_attested(
+        kind=EntryKind.FACT,
+        scope="user",
+        statement="Hybrid midnight boundary remains safe.",
+        source_type=SourceType.HUMAN,
+        valid_until=clock.current.date(),
+    )
+    retriever = HybridRetriever(
+        store,
+        RetrievalConfig(
+            mode=RetrievalMode.HYBRID,
+            embeddings_model="mock-model",
+        ),
+        provider=DateAdvancingEmbeddingProvider(clock),
+    )
+
+    result = retriever.retrieve(_request("hybrid midnight boundary"))
+
+    assert result.matches == ()

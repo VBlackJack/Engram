@@ -540,7 +540,7 @@ def test_apply_rejects_reviewed_plan_retargeted_to_another_section(
     report = service.apply(ConsolidationPlan(propositions=(proposition,)))
 
     assert report.outcomes[0].status is ApplyStatus.FAILED
-    assert report.outcomes[0].detail == "reviewed target is not a current deterministic neighbor"
+    assert report.outcomes[0].detail == "reviewed target was not present in the reviewed neighbors"
     assert ("patch_section", "_memory/runtime.md") not in gateway.calls
     note = gateway.get_note("_memory/runtime.md")
     assert note is not None
@@ -605,6 +605,232 @@ def test_apply_accepts_reviewed_target_matching_a_current_neighbor(
     assert report.outcomes[0].status is ApplyStatus.APPLIED
     assert ("patch_section", "_memory/runtime-b.md") in gateway.calls
     assert ("patch_section", "_memory/runtime-a.md") not in gateway.calls
+
+
+def test_apply_rejects_target_that_was_not_in_reviewed_neighbors(
+    store: EngramStore,
+    app_config: AppConfig,
+) -> None:
+    store.add_attested(
+        kind=EntryKind.FACT,
+        scope="global",
+        statement="The supported runtime is Python 3.13.",
+        source_type=SourceType.HUMAN,
+        subject_keys=("runtime/python",),
+    )
+    first_content = "# Runtime A\n\nThe supported runtime is Python 3.11.\n"
+    second_content = "# Runtime B\n\nThe supported runtime is Python 3.12.\n"
+    first = _neighbor(
+        rel_path="_memory/runtime-a.md",
+        heading="Runtime A",
+        statement="The supported runtime is Python 3.11.",
+        subject_key="runtime/python",
+        content=first_content,
+    )
+    second = _neighbor(
+        rel_path="_memory/runtime-b.md",
+        heading="Runtime B",
+        statement="The supported runtime is Python 3.12.",
+        subject_key="runtime/python",
+        content=second_content,
+        search_rank=1,
+    )
+    reviewed_gateway = FakeDatacronGateway(
+        {"_memory/runtime-a.md": first_content},
+        neighbors=(first,),
+    )
+    reviewed = ConsolidationService(store, reviewed_gateway, app_config.datacron).plan()
+    proposition = reviewed.propositions[0].model_copy(
+        update={
+            "decision": ReviewDecision.APPROVE,
+            "rel_path": second.rel_path,
+            "heading": second.heading,
+            "heading_level": second.heading_level,
+            "expected_hash": second.content_hash,
+        }
+    )
+    current_gateway = FakeDatacronGateway(
+        {
+            "_memory/runtime-a.md": first_content,
+            "_memory/runtime-b.md": second_content,
+        },
+        neighbors=(first, second),
+    )
+
+    report = ConsolidationService(store, current_gateway, app_config.datacron).apply(
+        ConsolidationPlan(propositions=(proposition,))
+    )
+
+    assert report.outcomes[0].status is ApplyStatus.FAILED
+    assert report.outcomes[0].detail == "reviewed target was not present in the reviewed neighbors"
+    assert ("patch_section", "_memory/runtime-b.md") not in current_gateway.calls
+
+
+def test_apply_binds_new_target_and_rejects_windows_path_escape(
+    store: EngramStore,
+    app_config: AppConfig,
+) -> None:
+    store.add_attested(
+        kind=EntryKind.FACT,
+        scope="global",
+        statement="A new durable fact is reviewed.",
+        source_type=SourceType.HUMAN,
+        subject_keys=("durable/new",),
+    )
+    gateway = FakeDatacronGateway()
+    service = ConsolidationService(store, gateway, app_config.datacron)
+    original = service.plan().propositions[0]
+    tampered = (
+        original.model_copy(
+            update={
+                "decision": ReviewDecision.APPROVE,
+                "rel_path": "_memory/engram/tampered.md",
+                "heading": "Tampered Heading",
+            }
+        ),
+        original.model_copy(
+            update={
+                "decision": ReviewDecision.APPROVE,
+                "heading": f"{original.heading}\n\nInjected plan content",
+            }
+        ),
+        original.model_copy(
+            update={
+                "decision": ReviewDecision.APPROVE,
+                "rel_path": "_memory/..\\outside.md",
+            }
+        ),
+    )
+
+    reports = tuple(
+        service.apply(ConsolidationPlan(propositions=(proposition,))) for proposition in tampered
+    )
+
+    assert all(report.outcomes[0].status is ApplyStatus.FAILED for report in reports)
+    assert all(call[0] != "create_note" for call in gateway.calls)
+    assert "reviewed new-note target" in reports[0].outcomes[0].detail
+    assert "single line" in reports[1].outcomes[0].detail
+    assert "forward slashes" in reports[2].outcomes[0].detail
+
+
+def test_apply_reconciles_earlier_promotion_changed_by_later_batch_write(
+    store: EngramStore,
+    app_config: AppConfig,
+    clock: MutableClock,
+) -> None:
+    redundant = store.add_attested(
+        kind=EntryKind.FACT,
+        scope="global",
+        statement="Stable mode remains blue.",
+        source_type=SourceType.HUMAN,
+        subject_keys=("stable/mode",),
+    )
+    clock.current += timedelta(seconds=1)
+    update = store.add_attested(
+        kind=EntryKind.FACT,
+        scope="global",
+        statement="Runtime mode uses green.",
+        source_type=SourceType.HUMAN,
+        subject_keys=("runtime/mode",),
+    )
+    content = (
+        "# Stable Mode\n\nStable mode remains blue.\n\n# Runtime Mode\n\nRuntime mode uses blue.\n"
+    )
+    rel_path = "_memory/modes.md"
+    gateway = FakeDatacronGateway(
+        {rel_path: content},
+        neighbors=(
+            _neighbor(
+                rel_path=rel_path,
+                heading="Stable Mode",
+                statement="Stable mode remains blue.",
+                subject_key="stable/mode",
+                content=content,
+            ),
+            _neighbor(
+                rel_path=rel_path,
+                heading="Runtime Mode",
+                statement="Runtime mode uses blue.",
+                subject_key="runtime/mode",
+                content=content,
+                search_rank=1,
+            ),
+        ),
+    )
+    service = ConsolidationService(store, gateway, app_config.datacron)
+
+    report = service.apply(_approve(service.plan()))
+
+    outcomes = {item.candidate_id: item for item in report.outcomes}
+    assert outcomes[redundant.id].status is ApplyStatus.STALE
+    assert outcomes[update.id].status is ApplyStatus.APPLIED
+    stored_redundant = store.get_entry(redundant.id)
+    assert stored_redundant is not None
+    assert stored_redundant.stale is True
+    retrieval = FtsRetriever(store).retrieve(
+        RetrievalRequest(
+            query="stable mode",
+            scope="global",
+            kinds=None,
+            writer_model="test-client/1.0",
+        )
+    )
+    assert redundant.id not in {item.id for item in retrieval.matches}
+
+
+def test_apply_rechecks_business_validity_atomically_after_datacron_write(
+    store: EngramStore,
+    app_config: AppConfig,
+    clock: MutableClock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entry = store.add_attested(
+        kind=EntryKind.FACT,
+        scope="global",
+        statement="The runtime boundary is current.",
+        source_type=SourceType.HUMAN,
+        subject_keys=("runtime/boundary",),
+        valid_until=clock.current.date(),
+    )
+    content = "# Runtime Boundary\n\nThe runtime boundary is old.\n"
+    rel_path = "_memory/runtime-boundary.md"
+    gateway = FakeDatacronGateway(
+        {rel_path: content},
+        neighbors=(
+            _neighbor(
+                rel_path=rel_path,
+                heading="Runtime Boundary",
+                statement="The runtime boundary is old.",
+                subject_key="runtime/boundary",
+                content=content,
+            ),
+        ),
+    )
+    service = ConsolidationService(store, gateway, app_config.datacron)
+    plan = _approve(service.plan())
+    original_get_note = gateway.get_note
+    read_count = 0
+
+    def advancing_get_note(path: str) -> NoteView | None:
+        nonlocal read_count
+        read_count += 1
+        note = original_get_note(path)
+        if read_count == 2:
+            clock.current += timedelta(days=1)
+        return note
+
+    monkeypatch.setattr(gateway, "get_note", advancing_get_note)
+
+    report = service.apply(plan)
+
+    assert report.outcomes[0].status is ApplyStatus.FAILED
+    assert report.outcomes[0].detail == "candidate is outside its business validity window"
+    stored = store.get_entry(entry.id)
+    assert stored is not None
+    assert stored.promotion_state is PromotionState.APPROVED
+    note = gateway.get_note(rel_path)
+    assert note is not None
+    assert "The runtime boundary is current." in note.content
 
 
 def test_patch_uses_heading_level_and_verifies_the_exact_wrapped_section(

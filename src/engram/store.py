@@ -374,10 +374,7 @@ class EngramStore:
         """Return whether an entry is inside its inclusive business-validity window."""
         with self._write_lock:
             self._ensure_open()
-            today = self._now().date()
-            return (entry.valid_from is None or entry.valid_from <= today) and (
-                entry.valid_until is None or today <= entry.valid_until
-            )
+            return _is_business_valid_on(entry, self._now().date())
 
     def purge_expired(self, older_than: datetime) -> int:
         """Physically remove expired payloads older than a required cutoff."""
@@ -465,6 +462,8 @@ class EngramStore:
                     raise KeyError(f"Entry does not exist: {normalized_entry_id}")
                 entry = _entry_from_row(row)
                 _require_promotable(entry)
+                if not _is_business_valid_on(entry, now.date()):
+                    raise StoreValidationError("candidate is outside its business validity window")
                 self._connection.execute(
                     """
                     UPDATE entries
@@ -1157,3 +1156,9 @@ def _require_promotable(entry: Entry) -> None:
         raise StoreValidationError("Only approved entries can be promoted")
     if entry.source_type not in {SourceType.HUMAN, SourceType.TOOL_VERIFIED}:
         raise StoreValidationError("Only human or tool_verified entries can be promoted")
+
+
+def _is_business_valid_on(entry: Entry, today: date) -> bool:
+    return (entry.valid_from is None or entry.valid_from <= today) and (
+        entry.valid_until is None or today <= entry.valid_until
+    )

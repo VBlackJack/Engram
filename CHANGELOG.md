@@ -14,6 +14,10 @@ project uses date-derived CalVer releases in the form `YYYY.MMDD.NN`.
 
 ### Fixed
 
+- Bind reviewed targets to both the reviewed and current neighbor sets, keep NEW targets immutable,
+  reject non-canonical Windows paths and multiline headings, and reconcile freshness after batches.
+- Enforce business validity inside the promotion transaction and tolerate eligibility changes while
+  hybrid retrieval waits for embeddings.
 - Enforce inclusive business-validity windows at recall, plan, and apply time.
 - Revalidate reviewed consolidation targets against current Datacron neighbors, pass heading levels
   through the live gateway, and verify the exact patched section before promotion.

@@ -144,8 +144,9 @@ Pour chaque proposition :
 - conserver `expected_hash` : il porte la protection CAS.
 
 Une autre cible de patch peut etre selectionnee uniquement si son chemin, son heading, son niveau
-et son hash apparaissent ensemble dans `neighbors`. Apply regenere ces voisins et refuse tout autre
-retargeting.
+et son hash apparaissent ensemble dans les `neighbors` revus et restent presents dans les voisins
+courants regeneres. Ne pas modifier le chemin ou le heading d'une proposition NEW. Les chemins
+doivent utiliser des slashs normalises et les headings rester sur une ligne.
 
 ### 3. Appliquer
 
