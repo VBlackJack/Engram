@@ -100,10 +100,12 @@ jusqu'a revue. L'historique n'est pas supprime et Datacron n'est pas reecrit par
 
 La consolidation conserve le rang de recherche deterministe renvoye par Datacron pour choisir une
 cible de patch. Une proposition `redundant` cible toujours le voisin dont le statement normalise
-correspond exactement au candidat, meme si un resultat plus large arrive avant. Apply regenere les
-voisins courants avant ecriture. Une cible de patch corrigee par l'humain n'est acceptee que si son
-chemin, son heading, son niveau et son hash attendu identifient exactement un voisin du plan revu et
-de la recherche courante. Les chemins et headings NEW ne sont pas editables. Le gateway transmet le
+correspond exactement au candidat, meme si un resultat plus large arrive avant. La planification
+persiste un snapshot canonique et immuable des propositions sous un `plan_id` genere. L'artefact de
+revue ne peut modifier que la decision de chaque proposition. Apply refuse toute autre divergence,
+consomme le plan avant les ecritures externes et interdit sa relecture. Il regenere les voisins
+courants avant ecriture et exige que la cible du snapshot reste courante. Le gateway transmet le
 niveau a Datacron et relit la section exacte avant de marquer l'entree `promoted`. Une passe finale
 reconcilie le hash de note complete de chaque promotion sur un chemin potentiellement ecrit avant
-qu'elle puisse etre rappelee.
+qu'elle puisse etre rappelee. Tout resultat apply `failed` ou `stale` produit le code de sortie 6
+apres ecriture du rapport.

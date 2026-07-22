@@ -131,22 +131,20 @@ smoke ne contient cette etape.
 uv run --python 3.14.3 engram consolidate --plan --out local/consolidation/plan.json
 ```
 
-Cette commande est read-only pour Datacron et Engram. Lire le fichier Markdown compagnon, puis
-editer le JSON. Chaque proposition reste `pending` par defaut.
+Cette commande est read-only pour Datacron. Elle conserve un snapshot de plan immuable dans la base
+SQLite Engram, puis produit les artefacts de revue. Lire le fichier Markdown compagnon, puis editer
+le JSON. Chaque proposition reste `pending` par defaut.
 
 ### 2. Valider humainement
 
 Pour chaque proposition :
 
-- choisir `decision: "approve"` ou `"reject"` ;
-- verifier `classification`, `proposed_action`, `rel_path`, `heading`, `heading_level` et
-  `new_content` ;
-- conserver `expected_hash` : il porte la protection CAS.
+- verifier `classification`, `proposed_action`, `rel_path`, `heading`, `heading_level`, `new_content`,
+  `expected_hash` et les voisins ;
+- modifier uniquement `decision`, avec `"approve"` ou `"reject"`.
 
-Une autre cible de patch peut etre selectionnee uniquement si son chemin, son heading, son niveau
-et son hash apparaissent ensemble dans les `neighbors` revus et restent presents dans les voisins
-courants regeneres. Ne pas modifier le chemin ou le heading d'une proposition NEW. Les chemins
-doivent utiliser des slashs normalises et les headings rester sur une ligne.
+Ne pas recibler une proposition ni modifier un champ genere. Engram compare tous les champs
+immuables a son snapshot SQLite et refuse un plan modifie.
 
 ### 3. Appliquer
 
@@ -154,8 +152,9 @@ doivent utiliser des slashs normalises et les headings rester sur une ligne.
 uv run --python 3.14.3 engram consolidate --apply local/consolidation/plan.json
 ```
 
-Un resultat peut etre `applied`, `skipped`, `stale` ou `failed`. Ne pas editer un hash pour
-contourner `stale` : regenerer le plan depuis la note courante.
+Un resultat peut etre `applied`, `skipped`, `stale` ou `failed`. Le plan est consomme avant toute
+tentative d'ecriture externe et ne peut pas etre rejoue. Si un resultat vaut `stale` ou `failed`, le
+rapport est conserve et la commande sort avec le code 6. Regenerer un plan depuis la note courante.
 
 ### 4. Controler la fraicheur
 

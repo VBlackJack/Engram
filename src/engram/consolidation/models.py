@@ -90,7 +90,15 @@ class Proposition(StrictModel):
 
 
 class ConsolidationPlan(StrictModel):
-    """Deterministic JSON artifact produced without durable mutation."""
+    """Human-readable review artifact bound to a trusted SQLite snapshot."""
+
+    schema_version: Literal[2] = 2
+    plan_id: str = Field(min_length=26, max_length=26, pattern=r"^[0-9A-HJKMNP-TV-Z]{26}$")
+    propositions: tuple[Proposition, ...]
+
+
+class ConsolidationPlanSnapshot(StrictModel):
+    """Immutable propositions stored outside the editable review artifact."""
 
     schema_version: Literal[1] = 1
     propositions: tuple[Proposition, ...]

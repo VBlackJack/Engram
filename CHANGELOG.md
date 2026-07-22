@@ -11,9 +11,12 @@ project uses date-derived CalVer releases in the form `YYYY.MMDD.NN`.
 
 - Add trusted local `attest`, `supersede`, and status-filtered `list` commands with configurable
   audit identity and stable JSON output.
+- Anchor consolidation plans as immutable SQLite snapshots with generated single-use identifiers.
 
 ### Fixed
 
+- Reject any reviewed-plan retargeting or content substitution, refuse consumed-plan replay, and
+  return a distinct nonzero exit after persisting apply reports with failed or stale outcomes.
 - Bind reviewed targets to both the reviewed and current neighbor sets, keep NEW targets immutable,
   reject non-canonical Windows paths and multiline headings, and reconcile freshness after batches.
 - Enforce business validity inside the promotion transaction and tolerate eligibility changes while

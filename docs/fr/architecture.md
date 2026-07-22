@@ -31,7 +31,8 @@ d'inode. Les lectures pures de `list` utilisent SQLite `mode=ro` sans ce verrou 
 
 SQLite est ouvert en WAL, avec foreign keys, busy timeout et migrations transactionnelles. Le
 plancher 3.51.3 evite le bug WAL-reset. La table `entries` est canonique ; les tables FTS et
-vectorielles sont derivees et reconstructibles par `engram reindex`.
+vectorielles sont derivees et reconstructibles par `engram reindex`. `consolidation_plans` ancre les
+snapshots immuables des plans et leur etat d'usage unique hors de l'artefact de revue editable.
 
 `audit_log` est append-only. Il conserve l'acteur, l'action, l'identifiant d'entree et une empreinte
 de detail, jamais le statement ni un payload de conversation.
@@ -72,19 +73,22 @@ peut pas se glisser dans `current`.
 Le gateway parle au serveur Datacron en MCP stdio et applique les allowlists configurees. Le flux
 est volontairement en deux temps :
 
-1. `--plan` recherche les sections voisines, classe create/patch/skip et produit JSON + Markdown ;
-2. un humain choisit approve/reject et peut selectionner une autre cible de patch parmi les voisins
-   du plan ;
-3. `--apply` relit la note, compare le hash CAS, ecrit via MCP, puis relit ;
+1. `--plan` recherche les sections voisines, classe create/patch/skip, ancre un snapshot SQLite
+   immuable et produit JSON + Markdown ;
+2. un humain modifie uniquement chaque decision approve/reject ;
+3. `--apply` verifie l'artefact contre le snapshot, consomme le plan, relit la note, compare le hash
+   CAS, ecrit via MCP, puis relit ;
 4. Engram marque `promoted` seulement si la relecture confirme la mutation ;
 5. `--check-freshness` compare ensuite les hashes sans reecrire le vault.
 
-Une erreur sur une proposition n'autorise pas le forcement d'une autre. Les propositions `stale`
-doivent etre replannifiees depuis l'etat Datacron courant.
+Une erreur sur une proposition n'autorise pas le forcement d'une autre. Un rapport apply contenant
+`failed` ou `stale` sort avec le code 6. Le plan consomme ne peut pas etre rejoue ; les propositions
+non resolues doivent etre replannifiees depuis l'etat Datacron courant.
 
-Apply regenere les voisins et lie une cible de patch revue par son chemin, son heading, son niveau
-et son hash de contenu. La cible doit exister dans les voisins revus et dans les voisins courants.
-Pour NEW, chemin et heading sont immuables ; les chemins emploient des slashs canoniques et les
+Seuls `plan_id` et les decisions franchissent la frontiere de revue comme entrees. Chemin, heading,
+niveau, contenu, hashes, voisins, classification et action doivent correspondre exactement au
+snapshot de confiance ; le reciblage manuel est refuse. Apply regenere toujours les voisins courants
+et recontrole la cible live avant ecriture. Les chemins emploient des slashs canoniques et les
 headings tiennent sur une ligne. Apres relecture, la section exacte doit correspondre au corps
 canonique du candidat ; trouver ce corps ailleurs dans la note ne suffit pas a verifier l'ecriture.
 En fin de lot, apply relit chaque chemin potentiellement ecrit et marque stale toute promotion dont

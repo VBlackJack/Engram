@@ -19,7 +19,7 @@ from . import __version__
 from .config import AppConfig, ConfigError, load_config
 from .consolidation.gateway import DatacronGatewayError
 from .consolidation.mcp_gateway import McpDatacronGateway
-from .consolidation.models import ConsolidationPlan
+from .consolidation.models import ApplyStatus, ConsolidationPlan
 from .consolidation.report import (
     model_json,
     render_apply_markdown,
@@ -45,6 +45,7 @@ EXIT_USAGE_OR_CONFIG = 2
 EXIT_LOCAL_RESOURCE = 3
 EXIT_EXTERNAL_DEPENDENCY = 4
 EXIT_TRANSIENT_BUSY = 5
+EXIT_PARTIAL_RESULT = 6
 EXIT_INTERRUPTED = 130
 DEBUG_ENVIRONMENT_KEY = "ENGRAM_DEBUG"
 DEBUG_TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
@@ -53,6 +54,10 @@ WINDOWS_ADDRESS_IN_USE = getattr(errno, "WSAEADDRINUSE", 10048)
 
 class ServerBindError(OSError):
     """Raised when the configured HTTP endpoint cannot be reserved."""
+
+
+class ConsolidationApplyError(RuntimeError):
+    """Raised after an apply report records failed or stale propositions."""
 
 
 def main() -> None:
@@ -74,6 +79,7 @@ def main() -> None:
         DatabaseError,
         DatabaseLockError,
         DatacronGatewayError,
+        ConsolidationApplyError,
         OSError,
         SQLiteVersionError,
         StoreBusyError,
@@ -341,6 +347,8 @@ def _error_exit_code(error: BaseException) -> int:
         return EXIT_EXTERNAL_DEPENDENCY
     if isinstance(error, StoreBusyError):
         return EXIT_TRANSIENT_BUSY
+    if isinstance(error, ConsolidationApplyError):
+        return EXIT_PARTIAL_RESULT
     return EXIT_LOCAL_RESOURCE
 
 
@@ -527,6 +535,16 @@ def _consolidate(  # noqa: PLR0913
             target = output_path or apply_path.with_name("apply-report.json")
             _write_artifacts(target, model_json(report), render_apply_markdown(report))
             logger.info("Consolidation apply report written: %s", target)
+            unresolved = tuple(
+                outcome
+                for outcome in report.outcomes
+                if outcome.status in {ApplyStatus.FAILED, ApplyStatus.STALE}
+            )
+            if unresolved:
+                raise ConsolidationApplyError(
+                    f"consolidation apply completed with {len(unresolved)} failed or stale "
+                    f"proposition(s); inspect {target} and generate a new plan"
+                )
             return
         if check_freshness:
             freshness_report = service.check_freshness()

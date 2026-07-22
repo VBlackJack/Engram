@@ -30,7 +30,8 @@ to avoid inode replacement races. Pure `list` reads use SQLite `mode=ro` without
 
 SQLite opens in WAL mode with foreign keys, a busy timeout, and transactional migrations. The
 3.51.3 floor avoids the WAL-reset bug. The `entries` table is canonical; FTS and vector tables are
-derived and reconstructible with `engram reindex`.
+derived and reconstructible with `engram reindex`. `consolidation_plans` anchors immutable plan
+snapshots and their single-use state outside the editable review artifact.
 
 `audit_log` is append-only. It stores actor, action, entry identifier, and a detail fingerprint,
 never the statement or conversation payload.
@@ -70,18 +71,22 @@ a stale, superseded, expired, or other-client quarantined entry cannot enter `cu
 The gateway talks to the Datacron server over stdio MCP and enforces configured allowlists. The
 flow is deliberately split:
 
-1. `--plan` searches neighboring sections, classifies create/patch/skip, and writes JSON + Markdown;
-2. a human chooses approve/reject and may select another patch target from the planned neighbors;
-3. `--apply` rereads the note, compares the CAS hash, writes through MCP, then rereads;
+1. `--plan` searches neighboring sections, classifies create/patch/skip, anchors an immutable SQLite
+   snapshot, and writes JSON + Markdown;
+2. a human changes only each approve/reject decision;
+3. `--apply` verifies the artifact against the snapshot, consumes the plan, rereads the note,
+   compares the CAS hash, writes through MCP, then rereads;
 4. Engram marks `promoted` only when the reread confirms the mutation;
 5. `--check-freshness` later compares hashes without rewriting the vault.
 
-A failure on one proposition does not authorize forcing another. `stale` propositions must be
-replanned from current Datacron state.
+A failure on one proposition does not authorize forcing another. An apply report containing
+`failed` or `stale` exits with code 6. The consumed plan cannot be replayed, so unresolved
+propositions must be replanned from current Datacron state.
 
-Apply regenerates the neighbor set and binds a reviewed patch target by path, heading, heading
-level, and content hash. The target must exist in both the reviewed and current neighbor sets. NEW
-paths and headings are immutable, paths use canonical forward-slash syntax, and headings are one
-line. The exact patched section must match the canonical candidate body after reread; finding that
-body elsewhere in the note is not sufficient verification. After all propositions, apply rereads
-every potentially written path and marks any promotion whose whole-note hash diverged as stale.
+Only `plan_id` and decisions cross the review boundary as inputs. Path, heading, heading level,
+content, hashes, neighbors, classification, and action must exactly match the trusted snapshot;
+manual retargeting is rejected. Apply still regenerates the current neighbor set and rechecks the
+live target before writing. Paths use canonical forward-slash syntax and headings are one line. The
+exact patched section must match the canonical candidate body after reread; finding that body
+elsewhere in the note is not sufficient verification. After all propositions, apply rereads every
+potentially written path and marks any promotion whose whole-note hash diverged as stale.

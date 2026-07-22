@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import inspect
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
@@ -124,10 +125,11 @@ def test_database_uses_wal_and_numbered_migration(
         busy_timeout = connection.execute("PRAGMA busy_timeout").fetchone()
         foreign_keys = connection.execute("PRAGMA foreign_keys").fetchone()
         schema_version = connection.execute("SELECT version FROM schema_version").fetchone()
-        derived_tables = {
+        schema_tables = {
             str(row[0])
             for row in connection.execute(
-                "SELECT name FROM sqlite_schema WHERE name IN ('entries_fts', 'entry_vectors')"
+                "SELECT name FROM sqlite_schema "
+                "WHERE name IN ('entries_fts', 'entry_vectors', 'consolidation_plans')"
             ).fetchall()
         }
     finally:
@@ -140,8 +142,8 @@ def test_database_uses_wal_and_numbered_migration(
     assert foreign_keys is not None
     assert foreign_keys[0] == 1
     assert schema_version is not None
-    assert schema_version[0] == 3
-    assert derived_tables == {"entries_fts", "entry_vectors"}
+    assert schema_version[0] == 4
+    assert schema_tables == {"entries_fts", "entry_vectors", "consolidation_plans"}
 
 
 def test_concurrent_writes_are_serialized_without_loss(store: EngramStore) -> None:
@@ -160,3 +162,50 @@ def test_concurrent_writes_are_serialized_without_loss(store: EngramStore) -> No
 
     assert len(set(identifiers)) == entry_count
     assert store.count_entries() == entry_count
+
+
+def test_consolidation_plan_snapshot_is_persisted_and_consumed_once(
+    store: EngramStore,
+) -> None:
+    snapshot_json = '{"schema_version":1,"propositions":[]}'
+
+    created = store.create_consolidation_plan(snapshot_json)
+    loaded = store.get_consolidation_plan(created.plan_id)
+
+    assert loaded is not None
+    assert loaded.snapshot_json == snapshot_json
+    assert loaded.snapshot_hash == hashlib.sha256(snapshot_json.encode("utf-8")).hexdigest()
+    assert loaded.consumed_at is None
+
+    consumed = store.consume_consolidation_plan(
+        created.plan_id,
+        expected_hash=created.snapshot_hash,
+    )
+    assert consumed.consumed_at is not None
+    with pytest.raises(StoreValidationError, match="already consumed"):
+        store.consume_consolidation_plan(
+            created.plan_id,
+            expected_hash=created.snapshot_hash,
+        )
+
+
+def test_consolidation_plan_consumption_detects_snapshot_corruption(
+    store: EngramStore,
+    app_config: AppConfig,
+) -> None:
+    created = store.create_consolidation_plan('{"schema_version":1,"propositions":[]}')
+    connection = sqlite3.connect(app_config.database.path)
+    try:
+        connection.execute(
+            "UPDATE consolidation_plans SET snapshot_json = ? WHERE plan_id = ?",
+            ('{"schema_version":1,"propositions":["changed"]}', created.plan_id),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(StoreValidationError, match="snapshot changed"):
+        store.consume_consolidation_plan(
+            created.plan_id,
+            expected_hash=created.snapshot_hash,
+        )

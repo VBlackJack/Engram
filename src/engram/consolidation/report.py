@@ -20,7 +20,7 @@ def model_json(model: BaseModel) -> str:
 
 def render_plan_markdown(plan: ConsolidationPlan) -> str:
     """Render one compact review block per proposition."""
-    lines = ["# Plan de consolidation Engram", ""]
+    lines = ["# Plan de consolidation Engram", "", f"Plan ID : `{plan.plan_id}`", ""]
     if not plan.propositions:
         lines.extend(["Aucune memoire eligible a promouvoir.", ""])
     for proposition in plan.propositions:

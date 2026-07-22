@@ -23,6 +23,7 @@ from .models import (
     ApplyStatus,
     ConsolidationAction,
     ConsolidationPlan,
+    ConsolidationPlanSnapshot,
     ContradictionSignal,
     FreshnessOutcome,
     FreshnessReport,
@@ -49,7 +50,7 @@ class ConsolidationService:
         self._config = config
 
     def plan(self) -> ConsolidationPlan:
-        """Build a stable review artifact without mutating either data source."""
+        """Build a review artifact and anchor its immutable snapshot in SQLite."""
         entries = sorted(
             (
                 entry
@@ -60,13 +61,16 @@ class ConsolidationService:
         )
         signal = self._gateway.contradiction_scan() if entries else None
         propositions = tuple(self._plan_entry(entry, signal) for entry in entries)
-        return ConsolidationPlan(propositions=propositions)
+        snapshot = ConsolidationPlanSnapshot(propositions=propositions)
+        stored = self._store.create_consolidation_plan(snapshot.model_dump_json())
+        return ConsolidationPlan(plan_id=stored.plan_id, propositions=propositions)
 
     def apply(self, plan: ConsolidationPlan) -> ApplyReport:
         """Apply approved propositions with preread CAS and post-write verification."""
+        anchored = self._load_and_consume_plan(plan)
         outcomes: list[ApplyOutcome] = []
         potential_write_paths: set[str] = set()
-        for proposition in plan.propositions:
+        for proposition in anchored.propositions:
             if proposition.decision is not ReviewDecision.APPROVE:
                 reason = (
                     "rejected by reviewer"
@@ -78,6 +82,42 @@ class ConsolidationService:
             outcomes.append(self._apply_approved(proposition, potential_write_paths))
         reconciled = self._reconcile_batch_freshness(outcomes, potential_write_paths)
         return ApplyReport(outcomes=reconciled)
+
+    def _load_and_consume_plan(self, reviewed: ConsolidationPlan) -> ConsolidationPlan:
+        stored = self._store.get_consolidation_plan(reviewed.plan_id)
+        if stored is None:
+            raise StoreValidationError(
+                f"consolidation plan is unknown: {reviewed.plan_id}; generate a new plan"
+            )
+        if stored.consumed_at is not None:
+            raise StoreValidationError(
+                f"consolidation plan was already consumed: {reviewed.plan_id}; generate a new plan"
+            )
+        try:
+            snapshot = ConsolidationPlanSnapshot.model_validate_json(stored.snapshot_json)
+        except ValueError as exc:
+            raise StoreValidationError(
+                "consolidation plan snapshot is invalid; generate a new plan"
+            ) from exc
+        normalized_reviewed = tuple(
+            proposition.model_copy(update={"decision": ReviewDecision.PENDING})
+            for proposition in reviewed.propositions
+        )
+        if normalized_reviewed != snapshot.propositions:
+            raise StoreValidationError("plan was modified; generate a new plan")
+        self._store.consume_consolidation_plan(
+            reviewed.plan_id,
+            expected_hash=stored.snapshot_hash,
+        )
+        anchored = tuple(
+            proposition.model_copy(update={"decision": reviewed_proposition.decision})
+            for proposition, reviewed_proposition in zip(
+                snapshot.propositions,
+                reviewed.propositions,
+                strict=True,
+            )
+        )
+        return reviewed.model_copy(update={"propositions": anchored})
 
     def check_freshness(self) -> FreshnessReport:
         """Compare every promoted content address and update only Engram freshness state."""

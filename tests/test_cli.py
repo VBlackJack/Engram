@@ -21,8 +21,10 @@ from engram.cli import (
     EXIT_EXTERNAL_DEPENDENCY,
     EXIT_INTERRUPTED,
     EXIT_LOCAL_RESOURCE,
+    EXIT_PARTIAL_RESULT,
     EXIT_TRANSIENT_BUSY,
     EXIT_USAGE_OR_CONFIG,
+    ConsolidationApplyError,
     ServerBindError,
     _attest,
     _consolidate,
@@ -93,6 +95,10 @@ def test_main_formats_configuration_error_without_traceback(
         (SQLiteVersionError("SQLite runtime is too old"), EXIT_LOCAL_RESOURCE),
         (DatacronGatewayError("Datacron is unavailable"), EXIT_EXTERNAL_DEPENDENCY),
         (StoreBusyError("server busy, retry"), EXIT_TRANSIENT_BUSY),
+        (
+            ConsolidationApplyError("apply completed with stale propositions"),
+            EXIT_PARTIAL_RESULT,
+        ),
     ],
 )
 def test_main_maps_known_failures_without_tracebacks(

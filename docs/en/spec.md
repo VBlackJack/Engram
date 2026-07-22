@@ -97,9 +97,11 @@ until review. History is retained and this check never rewrites Datacron.
 
 Consolidation preserves the deterministic search rank returned by Datacron when selecting a patch
 target. A `redundant` proposition always targets the neighbor whose normalized statement exactly
-matches the candidate, even when a broader search hit ranks first. Apply regenerates current
-neighbors before writing. A human-corrected patch target is accepted only when its path, heading,
-heading level, and expected hash identify a neighbor in both the reviewed plan and the current
-search. NEW paths and headings cannot be edited. The gateway passes the heading level to Datacron
-and rereads the exact section before marking the entry promoted. A final batch pass reconciles the
-whole-note hash of every promotion on a potentially written path before recall can expose it.
+matches the candidate, even when a broader search hit ranks first. Planning persists a canonical
+immutable proposition snapshot under a generated `plan_id`. The review artifact may change only
+the per-proposition decision. Apply rejects any other divergence, consumes the plan before external
+writes, and refuses replay. It regenerates current neighbors before writing and requires the
+snapshotted target to remain current. The gateway passes the heading level to Datacron and rereads
+the exact section before marking the entry promoted. A final batch pass reconciles the whole-note
+hash of every promotion on a potentially written path before recall can expose it. Any `failed` or
+`stale` apply outcome produces exit code 6 after the report is written.

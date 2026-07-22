@@ -16,6 +16,7 @@ import struct
 import unicodedata
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from enum import StrEnum
 from threading import RLock
@@ -62,6 +63,17 @@ class StoreValidationError(ValueError):
 
 class StoreBusyError(RuntimeError):
     """Raised when the bounded writer wait expires."""
+
+
+@dataclass(frozen=True, slots=True)
+class StoredConsolidationPlan:
+    """Trusted immutable plan snapshot anchored outside the review artifact."""
+
+    plan_id: str
+    created_at: datetime
+    snapshot_json: str
+    snapshot_hash: str
+    consumed_at: datetime | None
 
 
 class EngramReader:
@@ -439,6 +451,99 @@ class EngramStore:
                 "SELECT * FROM entries ORDER BY recorded_at DESC, id DESC"
             ).fetchall()
             return tuple(_entry_from_row(row) for row in rows)
+
+    def create_consolidation_plan(self, snapshot_json: str) -> StoredConsolidationPlan:
+        """Persist one immutable consolidation snapshot and return its trusted identity."""
+        normalized_snapshot = _required_text(snapshot_json, "snapshot_json")
+        with self._write_lock:
+            self._ensure_open()
+            now = self._now()
+            plan_id = _new_ulid(now)
+            snapshot_hash = hashlib.sha256(normalized_snapshot.encode("utf-8")).hexdigest()
+            with transaction(self._connection):
+                self._connection.execute(
+                    """
+                    INSERT INTO consolidation_plans(
+                        plan_id, created_at, snapshot_json, snapshot_hash, consumed_at
+                    ) VALUES (?, ?, ?, ?, NULL)
+                    """,
+                    (
+                        plan_id,
+                        _format_datetime(now),
+                        normalized_snapshot,
+                        snapshot_hash,
+                    ),
+                )
+            return StoredConsolidationPlan(
+                plan_id=plan_id,
+                created_at=now,
+                snapshot_json=normalized_snapshot,
+                snapshot_hash=snapshot_hash,
+                consumed_at=None,
+            )
+
+    def get_consolidation_plan(self, plan_id: str) -> StoredConsolidationPlan | None:
+        """Return one trusted plan snapshot without consuming it."""
+        normalized_plan_id = _required_text(plan_id, "plan_id")
+        with self._write_lock:
+            self._ensure_open()
+            row = self._connection.execute(
+                "SELECT * FROM consolidation_plans WHERE plan_id = ?",
+                (normalized_plan_id,),
+            ).fetchone()
+            return None if row is None else _consolidation_plan_from_row(row)
+
+    def consume_consolidation_plan(
+        self,
+        plan_id: str,
+        *,
+        expected_hash: str,
+    ) -> StoredConsolidationPlan:
+        """Atomically consume one matching plan before any external write attempt."""
+        normalized_plan_id = _required_text(plan_id, "plan_id")
+        normalized_hash = _required_text(expected_hash, "expected_hash")
+        with self._write_lock:
+            self._ensure_open()
+            now = self._now()
+            with transaction(self._connection):
+                row = self._connection.execute(
+                    "SELECT * FROM consolidation_plans WHERE plan_id = ?",
+                    (normalized_plan_id,),
+                ).fetchone()
+                if row is None:
+                    raise StoreValidationError(
+                        f"consolidation plan is unknown: {normalized_plan_id}; generate a new plan"
+                    )
+                stored = _consolidation_plan_from_row(row)
+                actual_hash = hashlib.sha256(stored.snapshot_json.encode("utf-8")).hexdigest()
+                if stored.snapshot_hash != normalized_hash or actual_hash != stored.snapshot_hash:
+                    raise StoreValidationError(
+                        "consolidation plan snapshot changed; generate a new plan"
+                    )
+                if stored.consumed_at is not None:
+                    raise StoreValidationError(
+                        f"consolidation plan was already consumed: {normalized_plan_id}; "
+                        "generate a new plan"
+                    )
+                updated = self._connection.execute(
+                    """
+                    UPDATE consolidation_plans
+                    SET consumed_at = ?
+                    WHERE plan_id = ? AND consumed_at IS NULL
+                    """,
+                    (_format_datetime(now), normalized_plan_id),
+                )
+                if updated.rowcount != 1:
+                    raise StoreValidationError(
+                        f"consolidation plan could not be consumed: {normalized_plan_id}"
+                    )
+            return StoredConsolidationPlan(
+                plan_id=stored.plan_id,
+                created_at=stored.created_at,
+                snapshot_json=stored.snapshot_json,
+                snapshot_hash=stored.snapshot_hash,
+                consumed_at=now,
+            )
 
     def mark_promoted(
         self,
@@ -1103,6 +1208,16 @@ def _audit_from_row(row: sqlite3.Row) -> AuditRecord:
         action=AuditAction(str(row["action"])),
         entry_id=None if row["entry_id"] is None else str(row["entry_id"]),
         detail_hash=None if row["detail_hash"] is None else str(row["detail_hash"]),
+    )
+
+
+def _consolidation_plan_from_row(row: sqlite3.Row) -> StoredConsolidationPlan:
+    return StoredConsolidationPlan(
+        plan_id=str(row["plan_id"]),
+        created_at=_parse_datetime(str(row["created_at"])),
+        snapshot_json=str(row["snapshot_json"]),
+        snapshot_hash=str(row["snapshot_hash"]),
+        consumed_at=_parse_optional_datetime(row["consumed_at"]),
     )
 
 

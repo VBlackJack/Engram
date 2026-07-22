@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 
 import engram.cli as cli_module
-from engram.cli import _consolidate
+from engram.cli import ConsolidationApplyError, _consolidate
 from engram.config import AppConfig, DatacronConfig
 from engram.consolidation.gateway import DatacronGatewayError, FakeDatacronGateway
 from engram.consolidation.mcp_gateway import McpDatacronGateway, _server_parameters
@@ -34,7 +34,7 @@ from engram.models import (
     SourceType,
 )
 from engram.retrieval import FtsRetriever, RetrievalRequest
-from engram.store import EngramStore
+from engram.store import EngramStore, StoreValidationError
 from tests.conftest import MutableClock
 
 
@@ -234,7 +234,8 @@ def test_plan_maps_all_four_classifications_and_is_deterministic(
         ConsolidationClass.UPDATE,
         ConsolidationClass.CONTRADICTORY,
     }
-    assert model_json(first) == model_json(second)
+    assert first.plan_id != second.plan_id
+    assert first.propositions == second.propositions
     assert render_plan_markdown(first).count("- Decision: `pending`") == 4
 
 
@@ -525,22 +526,18 @@ def test_apply_rejects_reviewed_plan_retargeted_to_another_section(
         ),
     )
     service = ConsolidationService(store, gateway, app_config.datacron)
-    proposition = (
-        service.plan()
-        .propositions[0]
-        .model_copy(
-            update={
-                "decision": ReviewDecision.APPROVE,
-                "heading": "Unrelated",
-            }
-        )
+    plan = service.plan()
+    proposition = plan.propositions[0].model_copy(
+        update={
+            "decision": ReviewDecision.APPROVE,
+            "heading": "Unrelated",
+        }
     )
     gateway.calls.clear()
 
-    report = service.apply(ConsolidationPlan(propositions=(proposition,)))
+    with pytest.raises(StoreValidationError, match="plan was modified; generate a new plan"):
+        service.apply(plan.model_copy(update={"propositions": (proposition,)}))
 
-    assert report.outcomes[0].status is ApplyStatus.FAILED
-    assert report.outcomes[0].detail == "reviewed target was not present in the reviewed neighbors"
     assert ("patch_section", "_memory/runtime.md") not in gateway.calls
     note = gateway.get_note("_memory/runtime.md")
     assert note is not None
@@ -550,7 +547,7 @@ def test_apply_rejects_reviewed_plan_retargeted_to_another_section(
     assert stored.promotion_state is PromotionState.APPROVED
 
 
-def test_apply_accepts_reviewed_target_matching_a_current_neighbor(
+def test_apply_rejects_manual_retargeting_even_to_a_current_neighbor(
     store: EngramStore,
     app_config: AppConfig,
 ) -> None:
@@ -588,7 +585,8 @@ def test_apply_accepts_reviewed_target_matching_a_current_neighbor(
         ),
     )
     service = ConsolidationService(store, gateway, app_config.datacron)
-    original = service.plan().propositions[0]
+    plan = service.plan()
+    original = plan.propositions[0]
     corrected = original.model_copy(
         update={
             "decision": ReviewDecision.APPROVE,
@@ -600,10 +598,10 @@ def test_apply_accepts_reviewed_target_matching_a_current_neighbor(
     )
     gateway.calls.clear()
 
-    report = service.apply(ConsolidationPlan(propositions=(corrected,)))
+    with pytest.raises(StoreValidationError, match="plan was modified; generate a new plan"):
+        service.apply(plan.model_copy(update={"propositions": (corrected,)}))
 
-    assert report.outcomes[0].status is ApplyStatus.APPLIED
-    assert ("patch_section", "_memory/runtime-b.md") in gateway.calls
+    assert ("patch_section", "_memory/runtime-b.md") not in gateway.calls
     assert ("patch_section", "_memory/runtime-a.md") not in gateway.calls
 
 
@@ -657,13 +655,67 @@ def test_apply_rejects_target_that_was_not_in_reviewed_neighbors(
         neighbors=(first, second),
     )
 
-    report = ConsolidationService(store, current_gateway, app_config.datacron).apply(
-        ConsolidationPlan(propositions=(proposition,))
+    with pytest.raises(StoreValidationError, match="plan was modified; generate a new plan"):
+        ConsolidationService(store, current_gateway, app_config.datacron).apply(
+            reviewed.model_copy(update={"propositions": (proposition,)})
+        )
+
+    assert ("patch_section", "_memory/runtime-b.md") not in current_gateway.calls
+
+
+def test_apply_rejects_target_and_neighbors_substituted_together(
+    store: EngramStore,
+    app_config: AppConfig,
+) -> None:
+    store.add_attested(
+        kind=EntryKind.FACT,
+        scope="global",
+        statement="The supported runtime is Python 3.13.",
+        source_type=SourceType.HUMAN,
+        subject_keys=("runtime/python",),
+    )
+    first_content = "# Runtime A\n\nThe supported runtime is Python 3.11.\n"
+    second_content = "# Runtime B\n\nThe supported runtime is Python 3.12.\n"
+    first = _neighbor(
+        rel_path="_memory/runtime-a.md",
+        heading="Runtime A",
+        statement="The supported runtime is Python 3.11.",
+        subject_key="runtime/python",
+        content=first_content,
+    )
+    second = _neighbor(
+        rel_path="_memory/runtime-b.md",
+        heading="Runtime B",
+        statement="The supported runtime is Python 3.12.",
+        subject_key="runtime/python",
+        content=second_content,
+    )
+    reviewed_gateway = FakeDatacronGateway(
+        {first.rel_path: first_content},
+        neighbors=(first,),
+    )
+    reviewed = ConsolidationService(store, reviewed_gateway, app_config.datacron).plan()
+    substituted = reviewed.propositions[0].model_copy(
+        update={
+            "decision": ReviewDecision.APPROVE,
+            "rel_path": second.rel_path,
+            "heading": second.heading,
+            "heading_level": second.heading_level,
+            "expected_hash": second.content_hash,
+            "neighbors": (second,),
+        }
+    )
+    current_gateway = FakeDatacronGateway(
+        {second.rel_path: second_content},
+        neighbors=(second,),
     )
 
-    assert report.outcomes[0].status is ApplyStatus.FAILED
-    assert report.outcomes[0].detail == "reviewed target was not present in the reviewed neighbors"
-    assert ("patch_section", "_memory/runtime-b.md") not in current_gateway.calls
+    with pytest.raises(StoreValidationError, match="plan was modified; generate a new plan"):
+        ConsolidationService(store, current_gateway, app_config.datacron).apply(
+            reviewed.model_copy(update={"propositions": (substituted,)})
+        )
+
+    assert ("patch_section", second.rel_path) not in current_gateway.calls
 
 
 def test_apply_binds_new_target_and_rejects_windows_path_escape(
@@ -679,7 +731,8 @@ def test_apply_binds_new_target_and_rejects_windows_path_escape(
     )
     gateway = FakeDatacronGateway()
     service = ConsolidationService(store, gateway, app_config.datacron)
-    original = service.plan().propositions[0]
+    plan = service.plan()
+    original = plan.propositions[0]
     tampered = (
         original.model_copy(
             update={
@@ -700,17 +753,24 @@ def test_apply_binds_new_target_and_rejects_windows_path_escape(
                 "rel_path": "_memory/..\\outside.md",
             }
         ),
+        original.model_copy(
+            update={
+                "decision": ReviewDecision.APPROVE,
+                "new_content": "Injected durable content.",
+            }
+        ),
     )
 
-    reports = tuple(
-        service.apply(ConsolidationPlan(propositions=(proposition,))) for proposition in tampered
-    )
-
-    assert all(report.outcomes[0].status is ApplyStatus.FAILED for report in reports)
+    for proposition in tampered:
+        with pytest.raises(StoreValidationError, match="plan was modified; generate a new plan"):
+            service.apply(plan.model_copy(update={"propositions": (proposition,)}))
     assert all(call[0] != "create_note" for call in gateway.calls)
-    assert "reviewed new-note target" in reports[0].outcomes[0].detail
-    assert "single line" in reports[1].outcomes[0].detail
-    assert "forward slashes" in reports[2].outcomes[0].detail
+    stored_plan = store.get_consolidation_plan(plan.plan_id)
+    assert stored_plan is not None
+    assert stored_plan.consumed_at is None
+
+    report = service.apply(_approve(plan))
+    assert report.outcomes[0].status is ApplyStatus.APPLIED
 
 
 def test_apply_reconciles_earlier_promotion_changed_by_later_batch_write(
@@ -889,16 +949,20 @@ def test_pending_and_rejected_decisions_never_write(
     gateway = FakeDatacronGateway()
     service = ConsolidationService(store, gateway, app_config.datacron)
     pending = service.plan()
-    rejected = pending.model_copy(
+    gateway.calls.clear()
+    pending_report = service.apply(pending)
+    rejected_plan = service.plan()
+    rejected = rejected_plan.model_copy(
         update={
             "propositions": (
-                pending.propositions[0].model_copy(update={"decision": ReviewDecision.REJECT}),
+                rejected_plan.propositions[0].model_copy(
+                    update={"decision": ReviewDecision.REJECT}
+                ),
             )
         }
     )
     gateway.calls.clear()
 
-    pending_report = service.apply(pending)
     rejected_report = service.apply(rejected)
 
     assert pending_report.outcomes[0].status is ApplyStatus.SKIPPED
@@ -996,3 +1060,58 @@ def test_cli_plan_then_apply_uses_gateway_and_writes_review_artifacts(
     current = store.get_entry(entry.id)
     assert current is not None
     assert current.promotion_state is PromotionState.PROMOTED
+
+
+def test_cli_apply_writes_partial_report_and_refuses_plan_replay(
+    store: EngramStore,
+    app_config: AppConfig,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store.add_attested(
+        kind=EntryKind.DECISION,
+        scope="project/engram",
+        statement="The reviewed CLI plan is single use.",
+        source_type=SourceType.HUMAN,
+        subject_keys=("engram/plan-replay",),
+    )
+    gateway = FakeDatacronGateway()
+    monkeypatch.setattr(cli_module, "McpDatacronGateway", lambda _config: gateway)
+    plan_path = tmp_path / "consolidation" / "plan.json"
+    report_path = tmp_path / "consolidation" / "apply.json"
+    logger = logging.getLogger("engram.test.consolidation-cli-partial")
+
+    _consolidate(
+        config=app_config,
+        logger=logger,
+        generate_plan=True,
+        apply_path=None,
+        check_freshness=False,
+        output_path=plan_path,
+    )
+    plan = ConsolidationPlan.model_validate_json(plan_path.read_text(encoding="utf-8"))
+    reviewed = _approve(plan)
+    plan_path.write_text(model_json(reviewed), encoding="utf-8")
+    gateway.replace_note(plan.propositions[0].rel_path, "# Concurrent\n\nCreated elsewhere.\n")
+
+    with pytest.raises(ConsolidationApplyError, match=r"inspect .*apply\.json"):
+        _consolidate(
+            config=app_config,
+            logger=logger,
+            generate_plan=False,
+            apply_path=plan_path,
+            check_freshness=False,
+            output_path=report_path,
+        )
+
+    report = ApplyReport.model_validate_json(report_path.read_text(encoding="utf-8"))
+    assert report.outcomes[0].status is ApplyStatus.STALE
+    with pytest.raises(StoreValidationError, match="already consumed"):
+        _consolidate(
+            config=app_config,
+            logger=logger,
+            generate_plan=False,
+            apply_path=plan_path,
+            check_freshness=False,
+            output_path=tmp_path / "consolidation" / "replay.json",
+        )

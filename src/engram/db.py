@@ -153,6 +153,24 @@ MIGRATIONS = (
             "DROP TABLE audit_log_v2",
         ),
     ),
+    Migration(
+        version=4,
+        statements=(
+            """
+            CREATE TABLE consolidation_plans (
+                plan_id TEXT PRIMARY KEY,
+                created_at TEXT NOT NULL,
+                snapshot_json TEXT NOT NULL,
+                snapshot_hash TEXT NOT NULL,
+                consumed_at TEXT
+            )
+            """,
+            """
+            CREATE INDEX consolidation_plans_consumed_idx
+            ON consolidation_plans(consumed_at, created_at)
+            """,
+        ),
+    ),
 )
 
 
@@ -328,7 +346,13 @@ def _validate_read_only_schema(connection: sqlite3.Connection) -> None:
         )
     missing_tables = [
         name
-        for name in ("entries", "audit_log", FTS_TABLE_NAME, "entry_vectors")
+        for name in (
+            "entries",
+            "audit_log",
+            FTS_TABLE_NAME,
+            "entry_vectors",
+            "consolidation_plans",
+        )
         if not _table_exists(connection, name)
     ]
     if missing_tables:

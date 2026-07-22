@@ -126,22 +126,20 @@ vault remains an explicit manual operator action; no smoke command includes that
 uv run --python 3.14.3 engram consolidate --plan --out local/consolidation/plan.json
 ```
 
-This command is read-only for Datacron and Engram. Read the companion Markdown file, then edit the
-JSON. Every proposition is `pending` by default.
+This command is read-only for Datacron. It stores an immutable plan snapshot in Engram SQLite, then
+writes the review artifacts. Read the companion Markdown file, then edit the JSON. Every proposition
+is `pending` by default.
 
 ### 2. Review manually
 
 For each proposition:
 
-- choose `decision: "approve"` or `"reject"`;
-- verify `classification`, `proposed_action`, `rel_path`, `heading`, `heading_level`, and
-  `new_content`;
-- preserve `expected_hash`: it carries the CAS protection.
+- verify `classification`, `proposed_action`, `rel_path`, `heading`, `heading_level`, `new_content`,
+  `expected_hash`, and the neighbors;
+- edit only `decision`, choosing `"approve"` or `"reject"`.
 
-You may select another patch target only when its path, heading, heading level, and hash already
-appear together in the reviewed `neighbors` and still appear in the regenerated current neighbors.
-Do not edit a NEW proposition's path or heading. Paths must be normalized with forward slashes and
-headings must remain on one line.
+Do not retarget a proposition or edit any generated field. Engram compares every immutable field
+with its SQLite snapshot and refuses a modified plan.
 
 ### 3. Apply
 
@@ -149,8 +147,9 @@ headings must remain on one line.
 uv run --python 3.14.3 engram consolidate --apply local/consolidation/plan.json
 ```
 
-An outcome may be `applied`, `skipped`, `stale`, or `failed`. Do not edit a hash to bypass
-`stale`; regenerate the plan from the current note.
+An outcome may be `applied`, `skipped`, `stale`, or `failed`. A plan is consumed before any external
+write attempt and cannot be replayed. If any outcome is `stale` or `failed`, the report is preserved
+and the command exits with code 6. Regenerate a plan from the current note.
 
 ### 4. Check freshness
 
