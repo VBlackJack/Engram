@@ -22,6 +22,10 @@ project uses date-derived CalVer releases in the form `YYYY.MMDD.NN`.
   propositions to their exact normalized neighbor.
 - Launch the installed Datacron CLI shape by default and prevent an empty write allowlist from
   inheriting parent-process write permissions.
+- Map expected CLI failures to stable exit codes and actionable stderr without tracebacks, with an
+  explicit debug opt-in.
+- Check HTTP port availability before opening storage, close startup resources on every path, and
+  wrap Datacron stdio startup failures at the gateway boundary.
 
 ### Backlog
 

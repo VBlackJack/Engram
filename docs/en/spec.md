@@ -73,6 +73,12 @@ lock before opening the store. Contention fails immediately with owner diagnosti
 coordination file is not ownership, so stale PID metadata cannot block recovery. Status listing uses
 an existing migrated database in SQLite read-only mode and remains available while the daemon runs.
 
+The CLI error contract reserves exit code `2` for usage/configuration, `3` for unavailable local
+resources, `4` for Datacron transport failures, `5` for transient store contention, and `130` for
+an operator interruption propagated to the CLI. Known failures omit tracebacks unless the global
+`--debug` flag or `ENGRAM_DEBUG=1` is active. Port availability is checked before SQLite or the
+process lock is opened.
+
 ## Idempotency
 
 The key is computed from the relevant canonical content. An identical retry returns the same entry

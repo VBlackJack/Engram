@@ -107,7 +107,7 @@ def test_sqlite_version_guard_rejects_older_runtime(monkeypatch: pytest.MonkeyPa
     connection = sqlite3.connect(":memory:")
     monkeypatch.setattr(db_module, "_read_sqlite_version", lambda connection: "3.51.2")
     try:
-        with pytest.raises(SQLiteVersionError, match="WAL-reset bug fix"):
+        with pytest.raises(SQLiteVersionError, match=r"installation-windows\.md"):
             verify_sqlite_version(connection)
     finally:
         connection.close()

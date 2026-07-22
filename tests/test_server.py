@@ -23,6 +23,7 @@ from mcp.client.streamable_http import streamable_http_client
 from mcp.types import CallToolResult, Implementation, TextContent
 from starlette.applications import Starlette
 
+import engram.server as server_module
 from engram.config import (
     AppConfig,
     CapsuleConfig,
@@ -559,3 +560,28 @@ async def test_daemon_lifespan_sweeps_due_entries(
         refreshed = store.get_entry(entry.id)
         assert refreshed is not None
         assert refreshed.status is EntryStatus.EXPIRED
+
+
+@pytest.mark.anyio
+async def test_daemon_lifespan_cancels_ttl_task_on_shutdown(
+    app_config: AppConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started = anyio.Event()
+    stopped = anyio.Event()
+
+    async def wait_until_cancelled(_config: AppConfig, _store: EngramStore) -> None:
+        started.set()
+        try:
+            await anyio.sleep_forever()
+        finally:
+            stopped.set()
+
+    monkeypatch.setattr(server_module, "_run_ttl_sweeper", wait_until_cancelled)
+    with EngramStore(app_config) as store:
+        server = create_mcp_server(app_config, store)
+        app = server.streamable_http_app()
+        async with app.router.lifespan_context(app):
+            await started.wait()
+
+        assert stopped.is_set()

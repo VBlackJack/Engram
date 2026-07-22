@@ -12,8 +12,8 @@ import pytest
 import engram.cli as cli_module
 from engram.cli import _consolidate
 from engram.config import AppConfig, DatacronConfig
-from engram.consolidation.gateway import FakeDatacronGateway
-from engram.consolidation.mcp_gateway import _server_parameters
+from engram.consolidation.gateway import DatacronGatewayError, FakeDatacronGateway
+from engram.consolidation.mcp_gateway import McpDatacronGateway, _server_parameters
 from engram.consolidation.models import (
     ApplyReport,
     ApplyStatus,
@@ -244,6 +244,22 @@ def test_datacron_gateway_clears_inherited_write_allowlist(
     assert parameters.args == ["mcp", "serve"]
     assert parameters.env is not None
     assert parameters.env["DATACRON_WRITE_PATHS"] == ""
+
+
+def test_datacron_gateway_wraps_missing_command_without_transport_traceback() -> None:
+    config = DatacronConfig(
+        command="engram-om-l5-command-that-does-not-exist",
+        args=("mcp", "serve"),
+    )
+
+    with (
+        pytest.raises(
+            DatacronGatewayError,
+            match=r"Could not start Datacron MCP command.*install Datacron",
+        ),
+        McpDatacronGateway(config),
+    ):
+        pytest.fail("Missing Datacron command opened a gateway")
 
 
 def test_apply_continues_after_cas_conflict_and_records_verified_promotion(

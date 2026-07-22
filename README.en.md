@@ -114,6 +114,7 @@ See the complete [security model](docs/en/security.md).
 
 ```text
 engram --version
+engram --debug serve
 engram serve
 engram reindex
 engram list --status quarantined
@@ -131,6 +132,11 @@ Stop the daemon before `attest`, `supersede`, `reindex`, or `consolidate`, then 
 recall. These commands acquire the same OS lock as the daemon and fail clearly while it is active;
 `list` remains available through a read-only SQLite connection. Trusted commands use
 `[attestation].default_actor` unless `--actor` is provided.
+
+Known CLI failures never print a traceback by default. Exit code `2` means usage or configuration,
+`3` means a local resource is unavailable (port, process lock, database, or SQLite runtime), `4`
+means Datacron could not be reached, and `5` means transient store contention. Use global
+`--debug` before the command, or `ENGRAM_DEBUG=1`, only when a traceback is needed.
 
 ## Current limitations
 

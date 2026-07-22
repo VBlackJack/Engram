@@ -6,14 +6,18 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import json
 import logging
+import os
+import socket
 import sys
 from datetime import date, datetime
 from pathlib import Path
 
 from . import __version__
-from .config import AppConfig, load_config
+from .config import AppConfig, ConfigError, load_config
+from .consolidation.gateway import DatacronGatewayError
 from .consolidation.mcp_gateway import McpDatacronGateway
 from .consolidation.models import ConsolidationPlan
 from .consolidation.report import (
@@ -23,6 +27,7 @@ from .consolidation.report import (
     render_plan_markdown,
 )
 from .consolidation.service import ConsolidationService
+from .db import DatabaseError, SQLiteVersionError
 from .eval.models import EvalMode
 from .eval.runner import run_evaluation
 from .logging_setup import FileLogger
@@ -34,26 +39,63 @@ from .process_lock import (
 )
 from .retrieval import HybridRetriever, build_retriever
 from .server import create_mcp_server
-from .store import EngramReader, EngramStore
+from .store import EngramReader, EngramStore, StoreBusyError, StoreValidationError
+
+EXIT_USAGE_OR_CONFIG = 2
+EXIT_LOCAL_RESOURCE = 3
+EXIT_EXTERNAL_DEPENDENCY = 4
+EXIT_TRANSIENT_BUSY = 5
+EXIT_INTERRUPTED = 130
+DEBUG_ENVIRONMENT_KEY = "ENGRAM_DEBUG"
+DEBUG_TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
+WINDOWS_ADDRESS_IN_USE = getattr(errno, "WSAEADDRINUSE", 10048)
+
+
+class ServerBindError(OSError):
+    """Raised when the configured HTTP endpoint cannot be reserved."""
 
 
 def main() -> None:
     """Parse one supported command and execute its isolated workflow."""
     parser = _build_parser()
     arguments = parser.parse_args()
-    config = load_config()
-    logger = FileLogger(config.logging).configure()
+    debug = bool(arguments.debug) or _environment_debug_enabled()
+    logger: logging.Logger | None = None
     try:
+        config = load_config()
+        logger = FileLogger(config.logging).configure()
         _dispatch(parser, arguments, config=config, logger=logger)
-    except DatabaseLockError as exc:
-        logger.log(logging.ERROR, "%s", exc)
-        parser.exit(status=2, message=f"engram: error: {exc}\n")
+    except KeyboardInterrupt:
+        if logger is not None:
+            logger.info("Engram interrupted by operator")
+        parser.exit(status=EXIT_INTERRUPTED, message="engram: interrupted\n")
+    except (
+        ConfigError,
+        DatabaseError,
+        DatabaseLockError,
+        DatacronGatewayError,
+        OSError,
+        SQLiteVersionError,
+        StoreBusyError,
+        StoreValidationError,
+    ) as exc:
+        if debug:
+            raise
+        exit_code = _error_exit_code(exc)
+        if logger is not None:
+            _log_known_error(logger, exc)
+        parser.exit(status=exit_code, message=f"engram: error: {_ascii_message(exc)}\n")
 
 
 def _build_parser() -> argparse.ArgumentParser:
     """Build the complete command parser without opening application resources."""
     parser = argparse.ArgumentParser(prog="engram")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help=f"Show tracebacks for known failures (or set {DEBUG_ENVIRONMENT_KEY}=1)",
+    )
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("serve", help="Run the streamable HTTP MCP server")
     commands.add_parser("reindex", help="Rebuild derived FTS and vector indexes")
@@ -232,12 +274,15 @@ def _dispatch(
 
 
 def _serve(*, config: AppConfig, logger: logging.Logger) -> None:
-    with DatabaseProcessLock(
-        config.database.path,
-        role=DatabaseLockRole.DAEMON,
-        command="serve",
+    _ensure_server_bind_available(config.server.host, config.server.port)
+    with (
+        DatabaseProcessLock(
+            config.database.path,
+            role=DatabaseLockRole.DAEMON,
+            command="serve",
+        ),
+        EngramStore(config) as store,
     ):
-        store = EngramStore(config)
         server = create_mcp_server(config, store)
         logger.info(
             "Starting Engram MCP server on http://%s:%d%s",
@@ -247,10 +292,77 @@ def _serve(*, config: AppConfig, logger: logging.Logger) -> None:
         )
         try:
             server.run(transport="streamable-http")
-        except KeyboardInterrupt:
-            logger.info("Engram MCP server stopped")
-        finally:
-            store.close()
+        except SystemExit as exc:
+            if exc.code in {None, 0}:
+                return
+            raise ServerBindError(
+                f"Engram server could not start on {config.server.host}:{config.server.port}; "
+                "verify server.host and choose an available server.port"
+            ) from exc
+        logger.info("Engram MCP server stopped")
+
+
+def _ensure_server_bind_available(host: str, port: int) -> None:
+    """Fail before opening SQLite when the configured HTTP endpoint is unavailable."""
+    address_family = socket.AF_INET6 if ":" in host else socket.AF_INET
+    address: tuple[str, int] | tuple[str, int, int, int]
+    address = (host, port, 0, 0) if address_family == socket.AF_INET6 else (host, port)
+    with socket.socket(address_family, socket.SOCK_STREAM) as listener:
+        if os.name == "nt":
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        else:
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            listener.bind(address)
+        except OSError as exc:
+            if (
+                exc.errno in {errno.EADDRINUSE, WINDOWS_ADDRESS_IN_USE}
+                or getattr(exc, "winerror", None) == WINDOWS_ADDRESS_IN_USE
+            ):
+                raise ServerBindError(
+                    f"Port {port} is already in use on {host}; stop the other service "
+                    "or configure server.port"
+                ) from exc
+            reason = exc.strerror or str(exc)
+            raise ServerBindError(
+                f"Cannot bind Engram to {host}:{port}: {reason}; verify server.host and server.port"
+            ) from exc
+
+
+def _environment_debug_enabled() -> bool:
+    value = os.environ.get(DEBUG_ENVIRONMENT_KEY, "")
+    return value.strip().casefold() in DEBUG_TRUE_VALUES
+
+
+def _error_exit_code(error: BaseException) -> int:
+    if isinstance(error, ConfigError | StoreValidationError):
+        return EXIT_USAGE_OR_CONFIG
+    if isinstance(error, DatacronGatewayError):
+        return EXIT_EXTERNAL_DEPENDENCY
+    if isinstance(error, StoreBusyError):
+        return EXIT_TRANSIENT_BUSY
+    return EXIT_LOCAL_RESOURCE
+
+
+def _log_known_error(logger: logging.Logger, error: BaseException) -> None:
+    """Record one expected failure to file without duplicating the stderr message."""
+    record = logger.makeRecord(
+        logger.name,
+        logging.ERROR,
+        __file__,
+        0,
+        "%s",
+        (error,),
+        None,
+    )
+    for handler in logger.handlers:
+        if isinstance(handler, logging.FileHandler) and record.levelno >= handler.level:
+            handler.handle(record)
+
+
+def _ascii_message(error: BaseException) -> str:
+    """Return a locale-independent stderr representation for one known failure."""
+    return str(error).encode("ascii", errors="backslashreplace").decode("ascii")
 
 
 def _attest(  # noqa: PLR0913

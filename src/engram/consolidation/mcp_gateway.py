@@ -59,10 +59,14 @@ class McpDatacronGateway:
         self._worker.start()
         try:
             self._ready.result()
-        except BaseException:
+        except BaseException as exc:
             self._worker.join()
             self._worker = None
-            raise
+            command = " ".join((self._config.command, *self._config.args))
+            raise DatacronGatewayError(
+                f"Could not start Datacron MCP command '{command}'; install Datacron "
+                "or configure datacron.command and datacron.args"
+            ) from exc
         return self
 
     def __exit__(

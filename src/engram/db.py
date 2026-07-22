@@ -212,7 +212,8 @@ def verify_sqlite_version(
         raise SQLiteVersionError(
             "SQLite "
             f"{minimum_text} or newer is required; found {actual_text}. "
-            "Older runtimes are rejected because they do not contain the WAL-reset bug fix."
+            "Older runtimes are rejected because they do not contain the WAL-reset bug fix. "
+            "See docs/en/installation-windows.md for supported Windows installation steps."
         )
 
 

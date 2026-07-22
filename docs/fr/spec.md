@@ -77,6 +77,12 @@ Un fichier de coordination non verrouille ne constitue pas une propriete : des m
 perimees ne peuvent donc pas bloquer la reprise. Le listing par statut utilise une base existante et
 migree en mode SQLite read-only ; il reste disponible pendant le fonctionnement du daemon.
 
+Le contrat d'erreur CLI reserve le code `2` a l'usage/configuration, `3` aux ressources locales
+indisponibles, `4` aux pannes de transport Datacron, `5` a la contention transitoire du store et
+`130` a une interruption operateur propagee a la CLI. Les erreurs connues omettent les tracebacks,
+sauf si le flag global `--debug` ou `ENGRAM_DEBUG=1` est actif. La disponibilite du port est
+verifiee avant l'ouverture de SQLite ou du verrou de processus.
+
 ## Idempotence
 
 La cle est calculee sur le contenu canonique pertinent. Un retry identique retourne la meme entree

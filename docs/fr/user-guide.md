@@ -73,6 +73,24 @@ commandes de confiance emettent du JSON exploitable. Redemarrer le daemon avant 
 nouvelle memoire active. `engram attest --help` documente provenance, confiance, validite,
 observation, evidence et acteur.
 
+## Diagnostiquer les erreurs CLI
+
+Les erreurs locales attendues utilisent des codes de sortie stables et un message stderr
+actionnable :
+
+| Code | Signification | Action corrective |
+| --- | --- | --- |
+| `2` | Usage ou configuration invalide | Corriger la commande ou la valeur dans `engram.toml` |
+| `3` | Ressource locale indisponible | Liberer port/verrou, reparer la base ou mettre SQLite a jour |
+| `4` | Datacron indisponible | Installer Datacron ou corriger sa commande et ses arguments |
+| `5` | Contention transitoire du store | Reessayer apres la fin de l'ecriture courante |
+| `130` | Interruption operateur recue par la CLI | Aucune reprise necessaire |
+
+Ces erreurs n'affichent pas de traceback. Pour diagnostiquer, placer le flag global avant la
+commande (`engram --debug serve`) ou definir `ENGRAM_DEBUG=1`. Le guard du runtime SQLite renvoie
+directement vers [installation-windows.md](installation-windows.md) si la version chargee est
+anterieure a `3.51.3`.
+
 ## Reindexer
 
 FTS5 et les vecteurs sont derives :

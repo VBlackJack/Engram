@@ -72,6 +72,22 @@ commands emit machine-readable JSON. Restart the daemon before recalling the new
 Use `engram attest --help` for provenance, confidence, validity, observation, evidence, and actor
 options.
 
+## Diagnose CLI failures
+
+Expected local failures use stable process exit codes and one actionable stderr message:
+
+| Code | Meaning | Corrective action |
+| --- | --- | --- |
+| `2` | Invalid usage or configuration | Fix the command or `engram.toml` value |
+| `3` | Local resource unavailable | Free the port/lock, repair the database, or upgrade SQLite |
+| `4` | Datacron unavailable | Install Datacron or fix its command and arguments |
+| `5` | Transient store contention | Retry after the current write finishes |
+| `130` | Operator interruption reached the CLI | No recovery required |
+
+Tracebacks are disabled for these failures. For diagnosis, place the global flag before the
+command (`engram --debug serve`) or set `ENGRAM_DEBUG=1`. The SQLite runtime guard points directly
+to [installation-windows.md](installation-windows.md) when the loaded version predates `3.51.3`.
+
 ## Reindex
 
 FTS5 and vectors are derived:
