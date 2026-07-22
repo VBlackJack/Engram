@@ -308,6 +308,12 @@ class EngramStore:
             LOGGER.info("Expired %d entries", len(entry_ids))
         return len(entry_ids)
 
+    def is_ttl_expired(self, entry: Entry) -> bool:
+        """Return whether an entry is due according to this store's injected clock."""
+        with self._write_lock:
+            self._ensure_open()
+            return entry.expires_at is not None and entry.expires_at <= self._now()
+
     def purge_expired(self, older_than: datetime) -> int:
         """Physically remove expired payloads older than a required cutoff."""
         cutoff = _aware_datetime(older_than, "older_than")
@@ -465,11 +471,13 @@ class EngramStore:
         clauses = [
             f"{FTS_TABLE_NAME} MATCH ?",
             "entries.status IN (?, ?)",
+            "(entries.expires_at IS NULL OR entries.expires_at > ?)",
         ]
         parameters: list[object] = [
             normalized_query,
             EntryStatus.ACTIVE.value,
             EntryStatus.QUARANTINED.value,
+            _format_datetime(self._now()),
         ]
         if scope is not None:
             clauses.append("entries.scope = ?")

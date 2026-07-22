@@ -66,6 +66,7 @@ rrf_k = 60
         "ENGRAM_LOGGING_FILE_LEVEL": "debug",
         "ENGRAM_SERVER_PORT": "9000",
         "ENGRAM_SERVER_PATH": "/memory",
+        "ENGRAM_SERVER_TTL_SWEEP_INTERVAL_SECONDS": "0.25",
         "ENGRAM_CAPSULE_DEFAULT_TOKEN_BUDGET": "700",
         "ENGRAM_RETRIEVAL_MODE": "hybrid",
         "ENGRAM_RETRIEVAL_EMBEDDINGS_MODEL": "text-embedding-test",
@@ -84,6 +85,7 @@ rrf_k = 60
     assert config.server.port == 9000
     assert config.server.path == "/memory"
     assert config.server.write_wait_timeout_ms == 2000
+    assert config.server.ttl_sweep_interval_seconds == 0.25
     assert config.capsule.default_token_budget == 700
     assert config.retrieval.mode is RetrievalMode.HYBRID
     assert config.retrieval.embeddings_model == "text-embedding-test"
@@ -106,6 +108,18 @@ def test_load_config_rejects_invalid_capsule_bounds(tmp_path: Path) -> None:
     )
 
     with pytest.raises(ConfigError, match="at least the minimum"):
+        load_config(config_path, environ={})
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "nan", "inf"])
+def test_load_config_rejects_invalid_ttl_sweep_interval(tmp_path: Path, value: str) -> None:
+    config_path = tmp_path / "engram.toml"
+    config_path.write_text(
+        f"[server]\nttl_sweep_interval_seconds = '{value}'\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError, match="ttl_sweep_interval_seconds"):
         load_config(config_path, environ={})
 
 

@@ -5,6 +5,9 @@
 
 from __future__ import annotations
 
+import logging
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from typing import Annotated, Literal, cast
 
@@ -16,6 +19,7 @@ from mcp.server.fastmcp.utilities.func_metadata import ArgModelBase
 from mcp.server.session import ServerSession
 from mcp.types import AnyFunction, CallToolResult, TextContent, ToolAnnotations
 from pydantic import BaseModel, ConfigDict, Field
+from starlette.applications import Starlette
 from starlette.requests import Request
 
 from .capsule import CapsuleBuilder, CapsuleResult
@@ -32,6 +36,7 @@ from .retrieval import EntryIndexer, RetrievalRequest, Retriever, build_retrieve
 from .store import EngramStore, StoreBusyError
 
 UNKNOWN_CLIENT = "unknown-client"
+LOGGER = logging.getLogger(__name__)
 ToolContext = Context[ServerSession, object, Request]
 McpLogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
 
@@ -80,6 +85,45 @@ class RememberResult(BaseModel):
     promotion_state: PromotionState
     expires_at: str | None
     idempotent: bool
+
+
+class EngramFastMCP(FastMCP[object]):
+    """FastMCP server with one daemon-scoped TTL maintenance task."""
+
+    def __init__(self, config: AppConfig, store: EngramStore, tools: list[Tool]) -> None:
+        """Configure the public MCP surface and retain daemon lifecycle dependencies."""
+        self._engram_config = config
+        self._engram_store = store
+        super().__init__(
+            name="Engram",
+            instructions="Selective shared memory with quarantined model candidates.",
+            tools=tools,
+            host=config.server.host,
+            port=config.server.port,
+            streamable_http_path=config.server.path,
+            log_level=cast("McpLogLevel", config.logging.console_level),
+        )
+
+    def streamable_http_app(self) -> Starlette:
+        """Return the SDK application with TTL maintenance bound to its lifespan."""
+        app = super().streamable_http_app()
+        session_lifespan = app.router.lifespan_context
+
+        @asynccontextmanager
+        async def lifespan(starlette_app: Starlette) -> AsyncIterator[None]:
+            async with session_lifespan(starlette_app), anyio.create_task_group() as task_group:
+                task_group.start_soon(
+                    _run_ttl_sweeper,
+                    self._engram_config,
+                    self._engram_store,
+                )
+                try:
+                    yield
+                finally:
+                    task_group.cancel_scope.cancel()
+
+        app.router.lifespan_context = lifespan
+        return app
 
 
 def create_mcp_server(
@@ -203,15 +247,25 @@ def create_mcp_server(
             ),
         ),
     ]
-    return FastMCP(
-        name="Engram",
-        instructions="Selective shared memory with quarantined model candidates.",
-        tools=tools,
-        host=config.server.host,
-        port=config.server.port,
-        streamable_http_path=config.server.path,
-        log_level=cast("McpLogLevel", config.logging.console_level),
-    )
+    return EngramFastMCP(config, store, tools)
+
+
+async def _run_ttl_sweeper(config: AppConfig, store: EngramStore) -> None:
+    while True:
+        await anyio.sleep(config.server.ttl_sweep_interval_seconds)
+        try:
+            expired_count = await anyio.to_thread.run_sync(_expire_due, config, store)
+        except StoreBusyError:
+            LOGGER.warning("TTL sweep skipped: server busy, retry")
+        except Exception:
+            LOGGER.exception("TTL sweep failed")
+        else:
+            LOGGER.info("TTL sweep complete: expired=%d", expired_count)
+
+
+def _expire_due(config: AppConfig, store: EngramStore) -> int:
+    with store.write_access(config.server.write_wait_timeout_ms):
+        return store.expire_due()
 
 
 def _strict_tool(

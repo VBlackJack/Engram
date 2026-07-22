@@ -23,6 +23,7 @@ host = "127.0.0.1"
 port = 8377
 path = "/mcp"
 write_wait_timeout_ms = 2000
+ttl_sweep_interval_seconds = 60
 
 [capsule]
 default_token_budget = 600

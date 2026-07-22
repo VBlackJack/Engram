@@ -15,7 +15,9 @@ des decisions du serveur, pas des affirmations libres du client.
 | `fact` | Fait stable verifie | Sans expiration |
 | `episode` | Evenement de session utile a court terme | 7 jours |
 
-Les TTL sont configurables dans `[ttl_days]`. La valeur `0` desactive l'expiration.
+Les TTL sont configurables dans `[ttl_days]`. La valeur `0` desactive l'expiration. Recall exclut
+immediatement les entrees a ou apres `expires_at`, puis le daemon passe periodiquement leur status
+a `expired`.
 
 ## Schema d'une entree
 

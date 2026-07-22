@@ -14,7 +14,7 @@ import pytest
 
 from engram.config import AppConfig, RetrievalConfig, RetrievalMode
 from engram.embeddings import EmbeddingError
-from engram.models import EntryKind, SourceType
+from engram.models import EntryKind, EntryStatus, SourceType
 from engram.retrieval import (
     FtsRetriever,
     HybridRetriever,
@@ -198,6 +198,31 @@ def test_expire_and_purge_remove_results_and_derived_rows(
         connection.close()
     assert row is not None
     assert row[0] == 0
+
+
+def test_read_time_guards_hide_due_entries_before_sweep(
+    store: EngramStore,
+    clock: MutableClock,
+) -> None:
+    entry = store.add_candidate(
+        kind="episode",
+        scope="user",
+        statement="Zero window TTL candidate.",
+        writer_model="test-client/1.0",
+    )
+    assert entry.expires_at is not None
+    clock.current = entry.expires_at
+    request = _request("zero window")
+    retriever = FtsRetriever(store)
+
+    assert store.search_fts('"zero" AND "window"', scope=None, kinds=None) == ()
+    assert retriever.eligible_entries(request) == ()
+    result = retriever.retrieve(request)
+    assert result.matches == ()
+    assert result.own_pending == ()
+    stored = store.get_entry(entry.id)
+    assert stored is not None
+    assert stored.status is EntryStatus.QUARANTINED
 
 
 def test_reciprocal_rank_fusion_is_deterministic() -> None:

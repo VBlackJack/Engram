@@ -15,7 +15,8 @@ decisions, not free-form client claims.
 | `fact` | Stable verified fact | No expiry |
 | `episode` | Short-lived useful session event | 7 days |
 
-TTLs are configurable in `[ttl_days]`. A value of `0` disables expiry.
+TTLs are configurable in `[ttl_days]`. A value of `0` disables expiry. Recall excludes entries at
+or past `expires_at` immediately, while the daemon periodically changes their status to `expired`.
 
 ## Entry schema
 

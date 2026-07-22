@@ -7,6 +7,10 @@ project uses date-derived CalVer releases in the form `YYYY.MMDD.NN`.
 
 ## [Unreleased]
 
+### Fixed
+
+- Enforce TTL at recall time and run a configurable logical-expiry sweep for the HTTP daemon.
+
 ### Backlog
 
 - Evaluate Porter stemming and prefix search only if real usage with weaker clients exposes

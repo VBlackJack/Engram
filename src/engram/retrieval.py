@@ -95,7 +95,7 @@ class FtsRetriever:
         normalized_scope = _normalized_scope(request.scope)
         entries: list[Entry] = []
         for entry in self._store.list_entries():
-            if entry.stale:
+            if entry.stale or self._store.is_ttl_expired(entry):
                 continue
             if normalized_scope is not None and entry.scope != normalized_scope:
                 continue

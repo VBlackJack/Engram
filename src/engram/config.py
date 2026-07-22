@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import shlex
 import tomllib
@@ -82,6 +83,7 @@ class ServerConfig:
     port: int = 8377
     path: str = "/mcp"
     write_wait_timeout_ms: int = 2000
+    ttl_sweep_interval_seconds: float = 60.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -249,6 +251,12 @@ def load_config(
                 environment,
                 DEFAULT_SERVER_CONFIG.write_wait_timeout_ms,
             ),
+            ttl_sweep_interval_seconds=_float_value(
+                server,
+                "ttl_sweep_interval_seconds",
+                environment,
+                DEFAULT_SERVER_CONFIG.ttl_sweep_interval_seconds,
+            ),
         ),
         capsule=CapsuleConfig(
             default_token_budget=_integer_value(
@@ -403,6 +411,25 @@ def _integer_value(
     raise ConfigError(f"Configuration value must be an integer: {key}")
 
 
+def _float_value(
+    section: dict[str, Any],
+    key: str,
+    environment: Mapping[str, str],
+    default: float,
+) -> float:
+    value = _raw_value(section, key, environment, default)
+    if isinstance(value, bool):
+        raise ConfigError(f"Configuration value must be a number: {key}")
+    if isinstance(value, int | float):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value)
+        except ValueError as exc:
+            raise ConfigError(f"Configuration value must be a number: {key}") from exc
+    raise ConfigError(f"Configuration value must be a number: {key}")
+
+
 def _string_value(
     section: dict[str, Any],
     key: str,
@@ -521,6 +548,11 @@ def _validate_server_config(config: AppConfig) -> None:
         raise ConfigError("server.path must start with a slash")
     if config.server.write_wait_timeout_ms <= 0:
         raise ConfigError("server.write_wait_timeout_ms must be greater than zero")
+    if (
+        not math.isfinite(config.server.ttl_sweep_interval_seconds)
+        or config.server.ttl_sweep_interval_seconds <= 0
+    ):
+        raise ConfigError("server.ttl_sweep_interval_seconds must be a finite positive number")
     if config.capsule.min_token_budget <= 0:
         raise ConfigError("capsule.min_token_budget must be greater than zero")
     if config.capsule.max_token_budget < config.capsule.min_token_budget:

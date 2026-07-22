@@ -15,6 +15,7 @@ from dataclasses import replace
 from statistics import fmean
 from typing import Any
 
+import anyio
 import httpx
 import pytest
 from mcp import ClientSession
@@ -35,6 +36,7 @@ from engram.models import EntryStatus, PromotionState, SourceType
 from engram.retrieval import HybridRetriever
 from engram.server import create_mcp_server
 from engram.store import EngramStore
+from tests.conftest import MutableClock
 
 LOGGER = logging.getLogger(__name__)
 
@@ -521,3 +523,39 @@ async def test_mcp_average_latency(app_config: AppConfig) -> None:
         fmean(recall_latencies),
         recall_p95,
     )
+
+
+@pytest.mark.anyio
+async def test_daemon_lifespan_sweeps_due_entries(
+    app_config: AppConfig,
+    clock: MutableClock,
+) -> None:
+    """Expire due rows autonomously while the HTTP application is alive."""
+    config = replace(
+        app_config,
+        server=replace(app_config.server, ttl_sweep_interval_seconds=0.01),
+    )
+    with EngramStore(config, clock=clock) as store:
+        entry = store.add_candidate(
+            kind="episode",
+            scope="user",
+            statement="Autonomous sweep candidate.",
+            writer_model="sweep-client/1.0",
+        )
+        assert entry.expires_at is not None
+        server = create_mcp_server(config, store)
+        app = server.streamable_http_app()
+
+        async with app.router.lifespan_context(app):
+            clock.current = entry.expires_at
+            with anyio.fail_after(1):
+                while True:
+                    refreshed = store.get_entry(entry.id)
+                    assert refreshed is not None
+                    if refreshed.status is EntryStatus.EXPIRED:
+                        break
+                    await anyio.sleep(0.01)
+
+        refreshed = store.get_entry(entry.id)
+        assert refreshed is not None
+        assert refreshed.status is EntryStatus.EXPIRED
