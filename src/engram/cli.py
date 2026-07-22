@@ -27,9 +27,14 @@ from .eval.models import EvalMode
 from .eval.runner import run_evaluation
 from .logging_setup import FileLogger
 from .models import Confidence, Entry, EntryKind, EntryStatus, Evidence, EvidenceType, SourceType
+from .process_lock import (
+    DatabaseLockError,
+    DatabaseLockRole,
+    DatabaseProcessLock,
+)
 from .retrieval import HybridRetriever, build_retriever
 from .server import create_mcp_server
-from .store import EngramStore
+from .store import EngramReader, EngramStore
 
 
 def main() -> None:
@@ -38,7 +43,11 @@ def main() -> None:
     arguments = parser.parse_args()
     config = load_config()
     logger = FileLogger(config.logging).configure()
-    _dispatch(parser, arguments, config=config, logger=logger)
+    try:
+        _dispatch(parser, arguments, config=config, logger=logger)
+    except DatabaseLockError as exc:
+        logger.log(logging.ERROR, "%s", exc)
+        parser.exit(status=2, message=f"engram: error: {exc}\n")
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -223,20 +232,25 @@ def _dispatch(
 
 
 def _serve(*, config: AppConfig, logger: logging.Logger) -> None:
-    store = EngramStore(config)
-    server = create_mcp_server(config, store)
-    logger.info(
-        "Starting Engram MCP server on http://%s:%d%s",
-        config.server.host,
-        config.server.port,
-        config.server.path,
-    )
-    try:
-        server.run(transport="streamable-http")
-    except KeyboardInterrupt:
-        logger.info("Engram MCP server stopped")
-    finally:
-        store.close()
+    with DatabaseProcessLock(
+        config.database.path,
+        role=DatabaseLockRole.DAEMON,
+        command="serve",
+    ):
+        store = EngramStore(config)
+        server = create_mcp_server(config, store)
+        logger.info(
+            "Starting Engram MCP server on http://%s:%d%s",
+            config.server.host,
+            config.server.port,
+            config.server.path,
+        )
+        try:
+            server.run(transport="streamable-http")
+        except KeyboardInterrupt:
+            logger.info("Engram MCP server stopped")
+        finally:
+            store.close()
 
 
 def _attest(  # noqa: PLR0913
@@ -259,7 +273,15 @@ def _attest(  # noqa: PLR0913
     """Create one trusted entry and retire its explicitly replaced versions."""
     selected_actor = config.attestation.default_actor if actor is None else actor
     unique_supersedes = tuple(dict.fromkeys(supersedes))
-    with EngramStore(config) as store, store.write_access(config.server.write_wait_timeout_ms):
+    with (
+        DatabaseProcessLock(
+            config.database.path,
+            role=DatabaseLockRole.OFFLINE_WRITER,
+            command="attest",
+        ),
+        EngramStore(config) as store,
+        store.write_access(config.server.write_wait_timeout_ms),
+    ):
         for old_id in unique_supersedes:
             if store.get_entry(old_id) is None:
                 raise KeyError(f"Entry does not exist: {old_id}")
@@ -296,7 +318,15 @@ def _supersede(
 ) -> None:
     """Retire one entry in favor of an existing replacement."""
     selected_actor = config.attestation.default_actor if actor is None else actor
-    with EngramStore(config) as store, store.write_access(config.server.write_wait_timeout_ms):
+    with (
+        DatabaseProcessLock(
+            config.database.path,
+            role=DatabaseLockRole.OFFLINE_WRITER,
+            command="supersede",
+        ),
+        EngramStore(config) as store,
+        store.write_access(config.server.write_wait_timeout_ms),
+    ):
         store.supersede(old_id, new_id, actor=selected_actor)
         old_entry = store.get_entry(old_id)
         new_entry = store.get_entry(new_id)
@@ -313,23 +343,28 @@ def _supersede(
 
 def _list_entries(*, config: AppConfig, status: EntryStatus) -> None:
     """Print entries matching one lifecycle status as stable JSON."""
-    with EngramStore(config) as store:
-        entries = tuple(entry for entry in store.list_entries() if entry.status is status)
+    with EngramReader(config) as reader:
+        entries = tuple(entry for entry in reader.list_entries() if entry.status is status)
     _write_json([_entry_payload(entry) for entry in entries])
 
 
 def _reindex(*, config: AppConfig, logger: logging.Logger) -> None:
-    store = EngramStore(config)
-    try:
-        store.rebuild_fts()
-        retriever = build_retriever(config, store)
-        if isinstance(retriever, HybridRetriever):
-            vector_count = retriever.rebuild_vectors()
-            logger.info("Reindex complete: FTS rebuilt, vectors=%d", vector_count)
-        else:
-            logger.info("Reindex complete: FTS rebuilt, vectors skipped in FTS mode")
-    finally:
-        store.close()
+    with DatabaseProcessLock(
+        config.database.path,
+        role=DatabaseLockRole.OFFLINE_WRITER,
+        command="reindex",
+    ):
+        store = EngramStore(config)
+        try:
+            store.rebuild_fts()
+            retriever = build_retriever(config, store)
+            if isinstance(retriever, HybridRetriever):
+                vector_count = retriever.rebuild_vectors()
+                logger.info("Reindex complete: FTS rebuilt, vectors=%d", vector_count)
+            else:
+                logger.info("Reindex complete: FTS rebuilt, vectors skipped in FTS mode")
+        finally:
+            store.close()
 
 
 def _evaluate(
@@ -358,7 +393,15 @@ def _consolidate(  # noqa: PLR0913
     output_path: Path | None,
 ) -> None:
     """Run one isolated consolidation workflow through Datacron MCP."""
-    with EngramStore(config) as store, McpDatacronGateway(config.datacron) as gateway:
+    with (
+        DatabaseProcessLock(
+            config.database.path,
+            role=DatabaseLockRole.OFFLINE_WRITER,
+            command="consolidate",
+        ),
+        EngramStore(config) as store,
+        McpDatacronGateway(config.datacron) as gateway,
+    ):
         service = ConsolidationService(store, gateway, config.datacron)
         if generate_plan:
             target = output_path or Path("local/consolidation/plan.json")

@@ -69,6 +69,14 @@ Les conflits actifs qui partagent des `subject_keys` sont symetriques : aucune v
 placee arbitrairement dans `current`. Ils apparaissent dans `conflicts` uniquement si le client le
 demande.
 
+## Propriete du processus
+
+Le daemon et chaque commande capable de modifier la base configuree prennent le meme verrou OS
+exclusif avant d'ouvrir le store. Une contention echoue immediatement avec le diagnostic de l'owner.
+Un fichier de coordination non verrouille ne constitue pas une propriete : des metadonnees de PID
+perimees ne peuvent donc pas bloquer la reprise. Le listing par statut utilise une base existante et
+migree en mode SQLite read-only ; il reste disponible pendant le fonctionnement du daemon.
+
 ## Idempotence
 
 La cle est calculee sur le contenu canonique pertinent. Un retry identique retourne la meme entree

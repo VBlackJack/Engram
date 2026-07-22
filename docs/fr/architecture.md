@@ -20,6 +20,13 @@ Engram est un processus stateful local. Plusieurs clients MCP peuvent l'utiliser
 instance Engram doit ecrire la base. Le serveur serialise les mutations et renvoie `server busy,
 retry` si le verrou ne peut pas etre acquis dans le delai configure.
 
+Un fichier de coordination place a cote de la base porte un verrou OS exclusif. Le daemon le garde
+pendant sa duree de vie ; chaque writer offline le garde pendant toute sa commande. Windows utilise
+un octet verrouille via le CRT, tandis que POSIX utilise `flock`. Le PID et la commande ne sont que
+des metadonnees de diagnostic : un fichier laisse par un processus mort est repris des que le verrou
+kernel a disparu. Le fichier n'est pas unlink a la liberation afin d'eviter les races de remplacement
+d'inode. Les lectures pures de `list` utilisent SQLite `mode=ro` sans ce verrou writer.
+
 ## Stockage SQLite
 
 SQLite est ouvert en WAL, avec foreign keys, busy timeout et migrations transactionnelles. Le

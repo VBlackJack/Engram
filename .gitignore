@@ -31,6 +31,9 @@ dist/
 *-shm
 *.sqlite
 *.sqlite3
+*.db.lock
+*.sqlite.lock
+*.sqlite3.lock
 *.log
 engram.toml
 logs/

@@ -14,7 +14,7 @@ from datetime import UTC, date, datetime
 import pytest
 
 from engram import __version__
-from engram.cli import _attest, _list_entries, _reindex, _supersede, main
+from engram.cli import _attest, _consolidate, _list_entries, _reindex, _supersede, main
 from engram.config import AppConfig
 from engram.models import (
     Confidence,
@@ -24,6 +24,7 @@ from engram.models import (
     EvidenceType,
     SourceType,
 )
+from engram.process_lock import DatabaseLockError, DatabaseLockRole, DatabaseProcessLock
 from engram.retrieval import FtsRetriever, RetrievalRequest
 from engram.store import EngramStore
 
@@ -133,3 +134,59 @@ def test_supersede_and_list_commands_expose_lifecycle_state(
     _list_entries(config=app_config, status=EntryStatus.ACTIVE)
     active_entries = json.loads(capsys.readouterr().out)
     assert [entry["id"] for entry in active_entries] == [new_entry.id]
+
+
+def test_daemon_lock_blocks_offline_writers_but_allows_list(
+    app_config: AppConfig,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with EngramStore(app_config):
+        pass
+
+    with DatabaseProcessLock(
+        app_config.database.path,
+        role=DatabaseLockRole.DAEMON,
+        command="serve",
+    ):
+        with pytest.raises(DatabaseLockError, match="stop it before an offline write"):
+            _attest(
+                config=app_config,
+                logger=logging.getLogger("engram.test.cli"),
+                statement="This write must be rejected.",
+                kind=EntryKind.FACT,
+                scope="user",
+                subject_keys=(),
+                source_type=SourceType.HUMAN,
+                confidence=Confidence.HIGH,
+                evidence=(),
+                valid_from=None,
+                valid_until=None,
+                observed_at=None,
+                actor=None,
+                supersedes=(),
+            )
+        with pytest.raises(DatabaseLockError):
+            _supersede(
+                config=app_config,
+                logger=logging.getLogger("engram.test.cli"),
+                old_id="01AAAAAAAAAAAAAAAAAAAAAAAA",
+                new_id="01BBBBBBBBBBBBBBBBBBBBBBBB",
+                actor=None,
+            )
+        with pytest.raises(DatabaseLockError):
+            _reindex(config=app_config, logger=logging.getLogger("engram.test.cli"))
+        with pytest.raises(DatabaseLockError):
+            _consolidate(
+                config=app_config,
+                logger=logging.getLogger("engram.test.cli"),
+                generate_plan=True,
+                apply_path=None,
+                check_freshness=False,
+                output_path=None,
+            )
+
+        _list_entries(config=app_config, status=EntryStatus.ACTIVE)
+        assert json.loads(capsys.readouterr().out) == []
+
+    with EngramStore(app_config) as store:
+        assert store.count_entries() == 0

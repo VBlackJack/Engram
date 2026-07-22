@@ -47,7 +47,9 @@ default_actor = "local-operator"
 ```
 
 Arreter `engram serve` avant une mutation de confiance afin qu'un seul processus ecrive dans la
-base. Inspecter les candidats, puis attester le contenu relu :
+base. La CLI applique cette frontiere : `attest`, `supersede`, `reindex` et tous les modes de
+`consolidate` echouent avec le PID du daemon et l'action corrective tant qu'il reste actif. `list`
+reste disponible en read-only. Inspecter les candidats, puis attester le contenu relu :
 
 ```powershell
 engram list --status quarantined

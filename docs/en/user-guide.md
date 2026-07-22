@@ -46,7 +46,9 @@ Set the default audit identity in `engram.toml`:
 default_actor = "local-operator"
 ```
 
-Stop `engram serve` before running a trusted mutation so only one process writes the database.
+Stop `engram serve` before running a trusted mutation so only one process writes the database. The
+CLI enforces this boundary: `attest`, `supersede`, `reindex`, and every `consolidate` mode fail with
+the daemon PID and corrective action while it is active. `list` remains available read-only.
 Inspect pending candidates, then attest reviewed content:
 
 ```powershell

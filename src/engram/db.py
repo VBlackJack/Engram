@@ -177,6 +177,29 @@ def open_database(config: DatabaseConfig) -> sqlite3.Connection:
     return connection
 
 
+def open_database_read_only(config: DatabaseConfig) -> sqlite3.Connection:
+    """Open an existing migrated database without taking a SQLite write transaction."""
+    database_path = config.path.expanduser().resolve()
+    if not database_path.is_file():
+        raise DatabaseError(f"Engram database does not exist: {database_path}")
+    connection = sqlite3.connect(
+        f"{database_path.as_uri()}?mode=ro",
+        uri=True,
+        timeout=config.busy_timeout_ms / 1000,
+        isolation_level=None,
+        check_same_thread=False,
+    )
+    connection.row_factory = sqlite3.Row
+    try:
+        verify_sqlite_version(connection)
+        _configure_read_only_connection(connection, config.busy_timeout_ms)
+        _validate_read_only_schema(connection)
+    except BaseException:
+        connection.close()
+        raise
+    return connection
+
+
 def verify_sqlite_version(
     connection: sqlite3.Connection,
     minimum: tuple[int, int, int] = MINIMUM_SQLITE_VERSION,
@@ -281,6 +304,35 @@ def _configure_connection(connection: sqlite3.Connection, busy_timeout_ms: int) 
     foreign_keys_row = connection.execute("PRAGMA foreign_keys").fetchone()
     if foreign_keys_row is None or int(foreign_keys_row[0]) != 1:
         raise DatabaseError("SQLite foreign key enforcement could not be enabled")
+
+
+def _configure_read_only_connection(
+    connection: sqlite3.Connection,
+    busy_timeout_ms: int,
+) -> None:
+    connection.execute(f"PRAGMA busy_timeout = {busy_timeout_ms:d}")
+    connection.execute("PRAGMA foreign_keys = ON")
+    connection.execute("PRAGMA query_only = ON")
+
+
+def _validate_read_only_schema(connection: sqlite3.Connection) -> None:
+    if not _table_exists(connection, "schema_version"):
+        raise DatabaseError("Engram database has no schema version")
+    current_version = _schema_version(connection)
+    latest_version = MIGRATIONS[-1].version if MIGRATIONS else 0
+    if current_version != latest_version:
+        raise DatabaseError(
+            f"Engram database schema version {current_version} requires offline migration "
+            f"to version {latest_version}"
+        )
+    missing_tables = [
+        name
+        for name in ("entries", "audit_log", FTS_TABLE_NAME, "entry_vectors")
+        if not _table_exists(connection, name)
+    ]
+    if missing_tables:
+        missing = ", ".join(missing_tables)
+        raise DatabaseError(f"Engram database is missing required tables: {missing}")
 
 
 def _ensure_version_table(connection: sqlite3.Connection) -> None:

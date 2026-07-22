@@ -29,7 +29,13 @@ and attestation remain explicit.
 Run one Engram instance per database file. The application lock serializes mutations, SQLite uses
 WAL and `BEGIN IMMEDIATE`, and a short timeout asks the client to retry. The guard rejects SQLite
 < 3.51.3. Do not put the database on a network share whose SQLite locking semantics are uncertain.
-Stop the daemon before `attest` or `supersede`, then restart it after the trusted mutation.
+
+The daemon holds an exclusive OS lock derived from the database path. Offline writers (`attest`,
+`supersede`, `reindex`, and `consolidate`) hold that same lock for their complete operation and
+fail before opening SQLite when another owner exists. The coordination file persists, but owner
+metadata alone never grants ownership: Windows byte-range locking or POSIX `flock` is authoritative
+and is released automatically when a process dies. `list` uses SQLite read-only mode and takes no
+writer lock. Stop the daemon before an offline write, then restart it afterward.
 
 ## Network
 

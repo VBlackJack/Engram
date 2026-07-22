@@ -23,7 +23,13 @@ from types import TracebackType
 from typing import Any, Literal, Self, cast, overload
 
 from .config import AppConfig
-from .db import FTS_TABLE_NAME, open_database, rebuild_fts_index, transaction
+from .db import (
+    FTS_TABLE_NAME,
+    open_database,
+    open_database_read_only,
+    rebuild_fts_index,
+    transaction,
+)
 from .models import (
     AuditAction,
     AuditRecord,
@@ -56,6 +62,45 @@ class StoreValidationError(ValueError):
 
 class StoreBusyError(RuntimeError):
     """Raised when the bounded writer wait expires."""
+
+
+class EngramReader:
+    """Read an existing database without migrations or SQLite write transactions."""
+
+    def __init__(self, config: AppConfig) -> None:
+        """Open the configured database in SQLite read-only mode."""
+        self._connection = open_database_read_only(config.database)
+        self._closed = False
+
+    def __enter__(self) -> Self:
+        """Return the open reader."""
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        """Close the reader when leaving a context manager."""
+        del exc_type, exc_value, traceback
+        self.close()
+
+    def close(self) -> None:
+        """Close the read-only SQLite connection."""
+        if self._closed:
+            return
+        self._connection.close()
+        self._closed = True
+
+    def list_entries(self) -> tuple[Entry, ...]:
+        """Return payload rows newest first."""
+        if self._closed:
+            raise StoreClosedError("Store is closed")
+        rows = self._connection.execute(
+            "SELECT * FROM entries ORDER BY recorded_at DESC, id DESC"
+        ).fetchall()
+        return tuple(_entry_from_row(row) for row in rows)
 
 
 class EngramStore:

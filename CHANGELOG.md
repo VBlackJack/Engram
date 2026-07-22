@@ -16,6 +16,8 @@ project uses date-derived CalVer releases in the form `YYYY.MMDD.NN`.
 
 - Enforce TTL at recall time and run a configurable logical-expiry sweep for the HTTP daemon.
 - Promote canonically identical quarantined content in place when it receives trusted attestation.
+- Enforce one cross-process database writer with an OS lock, stale-owner recovery, and a truly
+  read-only status listing path.
 
 ### Backlog
 

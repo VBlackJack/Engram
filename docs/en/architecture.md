@@ -20,6 +20,12 @@ Engram is a local stateful process. Multiple MCP clients may use it, but only on
 must write the database. The server serializes mutations and returns `server busy, retry` when the
 lock cannot be acquired within the configured timeout.
 
+A database-adjacent coordination file carries an OS-level exclusive lock. The daemon owns it for
+its lifetime; each offline writer owns it for the whole command. Windows uses a locked byte through
+the CRT, while POSIX uses `flock`. PID and command metadata are diagnostic only, so a file left by a
+dead process is safely reclaimed when the kernel lock is absent. The file is not unlinked on release
+to avoid inode replacement races. Pure `list` reads use SQLite `mode=ro` without this writer lock.
+
 ## SQLite storage
 
 SQLite opens in WAL mode with foreign keys, a busy timeout, and transactional migrations. The

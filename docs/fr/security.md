@@ -30,7 +30,14 @@ Executer une seule instance Engram par fichier de base. Le verrou applicatif ser
 mutations, SQLite utilise WAL et `BEGIN IMMEDIATE`, et un timeout court demande au client de retry.
 Le guard refuse SQLite < 3.51.3. Ne pas placer le fichier sur un partage reseau dont les verrous
 SQLite ne sont pas garantis.
-Arreter le daemon avant `attest` ou `supersede`, puis le redemarrer apres la mutation de confiance.
+
+Le daemon conserve un verrou OS exclusif derive du chemin de la base. Les writers offline
+(`attest`, `supersede`, `reindex` et `consolidate`) gardent ce meme verrou pendant toute leur
+operation et echouent avant d'ouvrir SQLite si un autre owner existe. Le fichier de coordination
+persiste, mais ses metadonnees ne donnent jamais la propriete : le verrou de plage Windows ou
+`flock` sous POSIX fait autorite et est libere automatiquement a la mort du processus. `list`
+utilise le mode SQLite read-only et ne prend aucun verrou writer. Arreter le daemon avant une
+ecriture offline, puis le redemarrer ensuite.
 
 ## Reseau
 

@@ -66,6 +66,13 @@ consolidation only when it is `active`, `approved`, not stale, and attested by o
 Active conflicts sharing `subject_keys` are symmetric: no version is arbitrarily placed in
 `current`. They appear in `conflicts` only when requested.
 
+## Process ownership
+
+The daemon and every command that can mutate the configured database acquire the same exclusive OS
+lock before opening the store. Contention fails immediately with owner diagnostics. An unlocked
+coordination file is not ownership, so stale PID metadata cannot block recovery. Status listing uses
+an existing migrated database in SQLite read-only mode and remains available while the daemon runs.
+
 ## Idempotency
 
 The key is computed from the relevant canonical content. An identical retry returns the same entry

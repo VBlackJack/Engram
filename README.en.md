@@ -126,8 +126,10 @@ engram consolidate --check-freshness
 
 `consolidate --plan` does not mutate data. Edit each JSON `decision` (`approve` or `reject`) before
 `--apply`. A diverged Datacron hash yields `stale` and requires a fresh plan; it is never forced.
-Stop the daemon before `attest` or `supersede` to preserve the single-writer boundary, then restart
-it before recall. Trusted commands use `[attestation].default_actor` unless `--actor` is provided.
+Stop the daemon before `attest`, `supersede`, `reindex`, or `consolidate`, then restart it before
+recall. These commands acquire the same OS lock as the daemon and fail clearly while it is active;
+`list` remains available through a read-only SQLite connection. Trusted commands use
+`[attestation].default_actor` unless `--actor` is provided.
 
 ## Current limitations
 
