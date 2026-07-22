@@ -86,7 +86,8 @@ overridden as `ENGRAM_<SECTION>_<KEY>`; relative paths resolve from the TOML fil
 
 For list variables, `ARGS` uses shell parsing and `READ_PATHS`/`WRITE_PATHS` use the OS path
 separator. Safe defaults are in [`engram.example.toml`](engram.example.toml). Datacron writes stay
-disabled while `write_paths` is empty.
+disabled while `write_paths` is empty, even if the parent process defines
+`DATACRON_WRITE_PATHS`. The default local transport launches `datacron mcp serve`.
 
 ## MCP tools
 

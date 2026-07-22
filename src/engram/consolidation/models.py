@@ -62,6 +62,7 @@ class NeighborSection(StrictModel):
     subject_keys: tuple[str, ...]
     content_hash: str
     heading_level: int = Field(default=2, ge=1, le=6)
+    search_rank: int = Field(default=0, ge=0)
     excerpt: str = ""
 
 

@@ -123,6 +123,7 @@ class ConsolidationService:
                     self._config.neighbor_limit,
                 ),
                 key=lambda item: (
+                    item.search_rank,
                     -item.heading_level,
                     item.rel_path,
                     item.heading,
@@ -151,7 +152,11 @@ class ConsolidationService:
             rel_path = self._available_new_path(entry)
             content = _render_new_note(heading, entry)
         else:
-            target = _target_neighbor(neighbors)
+            target = _target_neighbor(
+                neighbors,
+                classification=classification,
+                candidate_statement=entry.statement,
+            )
             rel_path = target.rel_path
             heading = target.heading
             expected_hash = target.content_hash
@@ -308,9 +313,27 @@ def _action_for(classification: ConsolidationClass) -> ConsolidationAction:
     return ConsolidationAction.SKIP
 
 
-def _target_neighbor(neighbors: Sequence[NeighborSection]) -> NeighborSection:
+def _target_neighbor(
+    neighbors: Sequence[NeighborSection],
+    *,
+    classification: ConsolidationClass,
+    candidate_statement: str,
+) -> NeighborSection:
     if not neighbors:
         raise ValueError("A non-new consolidation proposal requires a durable neighbor")
+    if classification is ConsolidationClass.REDUNDANT:
+        normalized_candidate = _normalize(candidate_statement)
+        exact = next(
+            (
+                neighbor
+                for neighbor in neighbors
+                if _normalize(neighbor.statement) == normalized_candidate
+            ),
+            None,
+        )
+        if exact is None:
+            raise ValueError("A redundant consolidation proposal requires an exact neighbor")
+        return exact
     return neighbors[0]
 
 

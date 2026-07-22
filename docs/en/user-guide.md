@@ -97,7 +97,12 @@ under `local/` and are not published.
 ## Consolidate into Datacron
 
 Configure `[datacron]` with a vault plus explicit read and write paths. An empty allowlist forbids
-writes.
+writes, including when the parent environment already defines `DATACRON_WRITE_PATHS`. The default
+CLI transport is `command = "datacron"` with `args = ["mcp", "serve"]`.
+
+The automated end-to-end gate must use an initialized disposable vault and a test-only Engram
+configuration. It must never target the durable vault. Running `consolidate --plan` against a real
+vault remains an explicit manual operator action; no smoke command includes that step.
 
 ### 1. Generate the plan
 

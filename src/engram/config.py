@@ -124,8 +124,8 @@ class RetrievalConfig:
 class DatacronConfig:
     """Datacron stdio transport and vault confinement settings."""
 
-    command: str = "datacron-mcp"
-    args: tuple[str, ...] = ()
+    command: str = "datacron"
+    args: tuple[str, ...] = ("mcp", "serve")
     vault_root: Path | None = None
     read_paths: tuple[Path, ...] = ()
     write_paths: tuple[Path, ...] = ()

@@ -11,8 +11,9 @@ import pytest
 
 import engram.cli as cli_module
 from engram.cli import _consolidate
-from engram.config import AppConfig
+from engram.config import AppConfig, DatacronConfig
 from engram.consolidation.gateway import FakeDatacronGateway
+from engram.consolidation.mcp_gateway import _server_parameters
 from engram.consolidation.models import (
     ApplyReport,
     ApplyStatus,
@@ -48,13 +49,14 @@ def _approve(plan: ConsolidationPlan) -> ConsolidationPlan:
     )
 
 
-def _neighbor(
+def _neighbor(  # noqa: PLR0913
     *,
     rel_path: str,
     heading: str,
     statement: str,
     subject_key: str,
     content: str,
+    search_rank: int = 0,
 ) -> NeighborSection:
     return NeighborSection(
         rel_path=rel_path,
@@ -62,6 +64,7 @@ def _neighbor(
         statement=statement,
         subject_keys=(subject_key,),
         content_hash=_hash(content),
+        search_rank=search_rank,
         excerpt=statement,
     )
 
@@ -157,6 +160,90 @@ def test_plan_maps_all_four_classifications_and_is_deterministic(
     }
     assert model_json(first) == model_json(second)
     assert render_plan_markdown(first).count("- Decision: `pending`") == 4
+
+
+def test_plan_targets_exact_redundancy_and_preserves_gateway_search_rank(
+    store: EngramStore,
+    app_config: AppConfig,
+) -> None:
+    redundant = store.add_attested(
+        kind=EntryKind.FACT,
+        scope="global",
+        statement="The redundant value is blue.",
+        source_type=SourceType.HUMAN,
+        subject_keys=("redundant/value",),
+    )
+    update = store.add_attested(
+        kind=EntryKind.FACT,
+        scope="global",
+        statement="The ranked value is green.",
+        source_type=SourceType.HUMAN,
+        subject_keys=("ranked/value",),
+    )
+    notes = {
+        "_memory/a-distractor.md": "# Distractor\n\nA different value.\n",
+        "_memory/z-exact.md": "# Exact\n\nThe redundant value is blue.\n",
+        "_memory/a-lower-rank.md": "# Lower\n\nThe ranked value is red.\n",
+        "_memory/z-top-rank.md": "# Top\n\nThe ranked value is blue.\n",
+    }
+    gateway = FakeDatacronGateway(
+        notes,
+        neighbors=(
+            _neighbor(
+                rel_path="_memory/a-distractor.md",
+                heading="Distractor",
+                statement="A different value.",
+                subject_key="redundant/value",
+                content=notes["_memory/a-distractor.md"],
+                search_rank=0,
+            ),
+            _neighbor(
+                rel_path="_memory/z-exact.md",
+                heading="Exact",
+                statement="The redundant value is blue.",
+                subject_key="redundant/value",
+                content=notes["_memory/z-exact.md"],
+                search_rank=1,
+            ),
+            _neighbor(
+                rel_path="_memory/a-lower-rank.md",
+                heading="Lower",
+                statement="The ranked value is red.",
+                subject_key="ranked/value",
+                content=notes["_memory/a-lower-rank.md"],
+                search_rank=1,
+            ),
+            _neighbor(
+                rel_path="_memory/z-top-rank.md",
+                heading="Top",
+                statement="The ranked value is blue.",
+                subject_key="ranked/value",
+                content=notes["_memory/z-top-rank.md"],
+                search_rank=0,
+            ),
+        ),
+    )
+
+    plan = ConsolidationService(store, gateway, app_config.datacron).plan()
+    propositions = {item.candidate_id: item for item in plan.propositions}
+
+    assert propositions[redundant.id].classification is ConsolidationClass.REDUNDANT
+    assert propositions[redundant.id].rel_path == "_memory/z-exact.md"
+    assert propositions[update.id].classification is ConsolidationClass.UPDATE
+    assert propositions[update.id].rel_path == "_memory/z-top-rank.md"
+
+
+def test_datacron_gateway_clears_inherited_write_allowlist(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DATACRON_WRITE_PATHS", str(Path("host-vault") / "_memory"))
+
+    parameters = _server_parameters(DatacronConfig(write_paths=()))
+
+    assert parameters.command == "datacron"
+    assert parameters.args == ["mcp", "serve"]
+    assert parameters.env is not None
+    assert parameters.env["DATACRON_WRITE_PATHS"] == ""
 
 
 def test_apply_continues_after_cas_conflict_and_records_verified_promotion(

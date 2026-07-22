@@ -123,7 +123,7 @@ class McpDatacronGateway:
             raise DatacronGatewayError("Datacron search_text returned no results array")
         neighbors: list[NeighborSection] = []
         seen: set[tuple[str, str]] = set()
-        for raw in raw_results:
+        for search_rank, raw in enumerate(raw_results):
             if not isinstance(raw, dict):
                 continue
             rel_path = raw.get("note_rel_path")
@@ -149,6 +149,7 @@ class McpDatacronGateway:
                     subject_keys=tuple(subject_keys),
                     content_hash=note.content_hash,
                     heading_level=_heading_level(note.content, heading),
+                    search_rank=search_rank,
                     excerpt=snippet,
                 )
             )
@@ -261,8 +262,7 @@ def _server_parameters(config: DatacronConfig) -> StdioServerParameters:
         env["DATACRON_VAULT_ROOT"] = str(config.vault_root)
     if config.read_paths:
         env["DATACRON_READ_PATHS"] = os.pathsep.join(str(path) for path in config.read_paths)
-    if config.write_paths:
-        env["DATACRON_WRITE_PATHS"] = os.pathsep.join(str(path) for path in config.write_paths)
+    env["DATACRON_WRITE_PATHS"] = os.pathsep.join(str(path) for path in config.write_paths)
     env["PYTHONUNBUFFERED"] = "1"
     return StdioServerParameters(command=config.command, args=list(config.args), env=env)
 

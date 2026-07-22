@@ -49,8 +49,9 @@ authentifie devant Engram, restreindre les origines et le reseau, et surveiller 
 
 Les lectures et ecritures passent par Datacron MCP. `vault_root`, `read_paths` et `write_paths`
 limitent les cibles ; `new_note_directory` doit rester sous `_memory/`. Une liste d'ecriture vide
-ferme le chemin. Une mutation exige le hash CAS attendu, puis une relecture avant de marquer la
-promotion.
+ferme le chemin : une valeur `DATACRON_WRITE_PATHS` du processus parent est explicitement effacee
+au lieu d'etre heritee. Une mutation exige le hash CAS attendu, puis une relecture avant de
+marquer la promotion.
 
 `contradiction_scan` est un signal read-only : il ne donne pas d'autorisation d'ecrire.
 

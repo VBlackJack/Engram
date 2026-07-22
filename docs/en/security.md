@@ -47,7 +47,8 @@ Engram, restrict origins and network access, and monitor requests.
 
 Reads and writes go through Datacron MCP. `vault_root`, `read_paths`, and `write_paths` constrain
 targets; `new_note_directory` must remain under `_memory/`. An empty write list closes the path. A
-mutation requires the expected CAS hash and a reread before promotion is recorded.
+parent-process `DATACRON_WRITE_PATHS` value is explicitly cleared in that case rather than
+inherited. A mutation requires the expected CAS hash and a reread before promotion is recorded.
 
 `contradiction_scan` is a read-only signal; it grants no write authority.
 

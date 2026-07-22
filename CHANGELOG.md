@@ -18,6 +18,10 @@ project uses date-derived CalVer releases in the form `YYYY.MMDD.NN`.
 - Promote canonically identical quarantined content in place when it receives trusted attestation.
 - Enforce one cross-process database writer with an OS lock, stale-owner recovery, and a truly
   read-only status listing path.
+- Preserve Datacron search rank while selecting consolidation targets and bind redundant
+  propositions to their exact normalized neighbor.
+- Launch the installed Datacron CLI shape by default and prevent an empty write allowlist from
+  inheriting parent-process write permissions.
 
 ### Backlog
 

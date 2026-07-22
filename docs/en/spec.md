@@ -83,3 +83,7 @@ with `idempotent=true` and creates an `idempotent_noop` event; it does not dupli
 After promotion, Engram stores `datacron_ref`, `datacron_hash`, and `synced_at`. The freshness
 check rereads the note. If its hash differs, the entry becomes `stale` and is hidden from `current`
 until review. History is retained and this check never rewrites Datacron.
+
+Consolidation preserves the deterministic search rank returned by Datacron when selecting a patch
+target. A `redundant` proposition always targets the neighbor whose normalized statement exactly
+matches the candidate, even when a broader search hit ranks first.

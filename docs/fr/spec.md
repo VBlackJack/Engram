@@ -87,3 +87,7 @@ avec `idempotent=true` et cree un evenement `idempotent_noop`; il ne duplique pa
 Apres promotion, Engram conserve `datacron_ref`, `datacron_hash` et `synced_at`. Le controle de
 fraicheur relit la note. Si son hash differe, l'entree devient `stale` et est masquee de `current`
 jusqu'a revue. L'historique n'est pas supprime et Datacron n'est pas reecrit par ce controle.
+
+La consolidation conserve le rang de recherche deterministe renvoye par Datacron pour choisir une
+cible de patch. Une proposition `redundant` cible toujours le voisin dont le statement normalise
+correspond exactement au candidat, meme si un resultat plus large arrive avant.

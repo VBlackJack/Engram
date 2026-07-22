@@ -42,9 +42,10 @@ embeddings_timeout_ms = 3000
 rrf_k = 60
 
 [datacron]
-command = "datacron-mcp"
-args = []
-# Empty values inherit the Datacron server environment and keep writes disabled by default.
+command = "datacron"
+args = ["mcp", "serve"]
+# Empty vault/read values inherit the Datacron server environment.
+# An empty write_paths always disables writes, even if the parent environment allows them.
 vault_root = ""
 read_paths = []
 write_paths = []

@@ -98,7 +98,14 @@ restent sous `local/` et ne sont pas publies.
 ## Consolider vers Datacron
 
 Configurer `[datacron]` avec un vault, des chemins de lecture et des chemins d'ecriture explicites.
-Une allowlist vide interdit l'ecriture.
+Une allowlist vide interdit l'ecriture, meme si le processus parent definit deja
+`DATACRON_WRITE_PATHS`. Le transport CLI par defaut utilise `command = "datacron"` avec
+`args = ["mcp", "serve"]`.
+
+La gate end-to-end automatisee doit utiliser un vault initialise et jetable ainsi qu'une
+configuration Engram reservee au test. Elle ne doit jamais cibler le vault durable. Un
+`consolidate --plan` contre un vault reel reste une action operateur manuelle et explicite ; aucun
+smoke ne contient cette etape.
 
 ### 1. Generer le plan
 

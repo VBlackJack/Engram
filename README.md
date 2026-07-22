@@ -90,7 +90,8 @@ dossier du fichier TOML.
 Pour une variable de liste, `ARGS` suit le decoupage shell et `READ_PATHS`/`WRITE_PATHS` utilisent
 le separateur de chemins de l'OS. Le fichier complet et ses valeurs sures sont dans
 [`engram.example.toml`](engram.example.toml). Les ecritures Datacron restent desactivees si
-`write_paths` est vide.
+`write_paths` est vide, meme si le processus parent definit `DATACRON_WRITE_PATHS`. Le transport
+local par defaut lance `datacron mcp serve`.
 
 ## Outils MCP
 
