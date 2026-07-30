@@ -235,7 +235,7 @@ wheels = [
 
 [[package]]
 name = "engram-memory-broker"
-version = "2026.721.4"
+version = "2026.730.1"
 source = { editable = "." }
 dependencies = [
     { name = "httpx" },

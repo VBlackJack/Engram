@@ -7,8 +7,10 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import socket
 import sqlite3
+import subprocess
 import sys
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -16,6 +18,7 @@ from pathlib import Path
 import pytest
 
 import engram.cli as cli_module
+import engram.db as db_module
 from engram import __version__
 from engram.cli import (
     EXIT_EXTERNAL_DEPENDENCY,
@@ -27,9 +30,11 @@ from engram.cli import (
     ConsolidationApplyError,
     ServerBindError,
     _attest,
+    _classify,
     _consolidate,
     _ensure_server_bind_available,
     _list_entries,
+    _migrate,
     _reindex,
     _serve,
     _supersede,
@@ -40,6 +45,7 @@ from engram.consolidation.gateway import DatacronGatewayError
 from engram.db import SQLiteVersionError
 from engram.logging_setup import FileLogger
 from engram.models import (
+    AuditAction,
     Confidence,
     EntryKind,
     EntryStatus,
@@ -47,9 +53,57 @@ from engram.models import (
     EvidenceType,
     SourceType,
 )
+from engram.normalization import canonical_key
 from engram.process_lock import DatabaseLockError, DatabaseLockRole, DatabaseProcessLock
 from engram.retrieval import FtsRetriever, RetrievalRequest
-from engram.store import EngramStore, StoreBusyError, StoreClosedError
+from engram.store import (
+    EngramStore,
+    StoreBusyError,
+    StoreClosedError,
+    StoreValidationError,
+)
+
+
+def _initialize_version_four(
+    config: AppConfig,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    seed_fact: bool,
+) -> str | None:
+    migrations = db_module.MIGRATIONS
+    entry_id = "01HHHHHHHHHHHHHHHHHHHHHHHH" if seed_fact else None
+    connection = sqlite3.connect(config.database.path, isolation_level=None)
+    connection.row_factory = sqlite3.Row
+    try:
+        connection.execute("PRAGMA foreign_keys = ON")
+        monkeypatch.setattr(db_module, "MIGRATIONS", migrations[:4])
+        db_module.apply_migrations(connection)
+        if entry_id is not None:
+            statement = "The legacy CLI entry needs classification."
+            connection.execute(
+                """
+                INSERT INTO entries(
+                    id, kind, scope, statement, subject_keys, status,
+                    promotion_state, source_type, writer_model, confidence,
+                    observed_at, recorded_at, valid_from, valid_until, expires_at,
+                    idempotency_key, supersedes, evidence, is_stale, datacron_ref,
+                    datacron_hash, synced_at
+                ) VALUES (
+                    ?, 'fact', 'user', ?, '[]', 'active', 'approved', 'human',
+                    NULL, 'high', NULL, '2026-07-21T12:00:00.000000Z', NULL,
+                    NULL, NULL, ?, '[]', '[]', 0, NULL, NULL, NULL
+                )
+                """,
+                (
+                    entry_id,
+                    statement,
+                    canonical_key(EntryKind.FACT, "user", statement),
+                ),
+            )
+    finally:
+        connection.close()
+        monkeypatch.setattr(db_module, "MIGRATIONS", migrations)
+    return entry_id
 
 
 def test_version_command_reports_package_version(
@@ -260,6 +314,7 @@ def test_reindex_command_rebuilds_a_dropped_fts_table(app_config: AppConfig) -> 
             scope="user",
             statement="The command rebuilds derived search.",
             source_type=SourceType.TOOL_VERIFIED,
+            claim_key="search/reindex",
         )
 
     connection = sqlite3.connect(app_config.database.path)
@@ -301,6 +356,7 @@ def test_attest_command_uses_configured_actor_and_prints_json(
         valid_until=None,
         observed_at=datetime(2026, 7, 22, 8, 0, tzinfo=UTC),
         actor=None,
+        claim_key="cli/trusted",
         supersedes=(),
     )
 
@@ -308,10 +364,157 @@ def test_attest_command_uses_configured_actor_and_prints_json(
     assert payload["status"] == EntryStatus.ACTIVE.value
     assert payload["promotion_state"] == "approved"
     assert payload["source_type"] == SourceType.HUMAN.value
+    assert payload["claim_key"] == "cli/trusted"
     assert payload["subject_keys"] == ["trusted-cli"]
     assert payload["evidence"] == [{"ref": "review-1", "type": "review"}]
     with EngramStore(app_config) as store:
         assert store.list_audit()[-1].actor == app_config.attestation.default_actor
+
+
+def test_invalid_attest_claim_does_not_migrate_version_four(
+    app_config: AppConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _initialize_version_four(app_config, monkeypatch, seed_fact=False)
+
+    with pytest.raises(StoreValidationError, match="attestation requires claim_key"):
+        _attest(
+            config=app_config,
+            logger=logging.getLogger("engram.test.cli"),
+            statement="This invalid attestation must not migrate.",
+            kind=EntryKind.FACT,
+            scope="user",
+            subject_keys=(),
+            source_type=SourceType.HUMAN,
+            confidence=Confidence.HIGH,
+            evidence=(),
+            valid_from=None,
+            valid_until=None,
+            observed_at=None,
+            actor=None,
+            claim_key=None,
+            supersedes=(),
+        )
+
+    connection = sqlite3.connect(app_config.database.path)
+    try:
+        version = connection.execute("SELECT version FROM schema_version").fetchone()
+        canonical_column = connection.execute(
+            "SELECT 1 FROM pragma_table_info('entries') WHERE name = 'canonical_key'"
+        ).fetchone()
+    finally:
+        connection.close()
+    assert version == (4,)
+    assert canonical_column is None
+
+
+def test_migrate_inventory_and_classify_are_retry_safe(
+    app_config: AppConfig,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    entry_id = _initialize_version_four(app_config, monkeypatch, seed_fact=True)
+    assert entry_id is not None
+    logger = logging.getLogger("engram.test.cli")
+
+    _migrate(config=app_config, logger=logger)
+    first_migration = json.loads(capsys.readouterr().out)
+    _migrate(config=app_config, logger=logger)
+    second_migration = json.loads(capsys.readouterr().out)
+    assert first_migration == second_migration == {"schema_version": 5}
+
+    _list_entries(config=app_config, unclassified=True)
+    inventory = json.loads(capsys.readouterr().out)
+    assert [entry["id"] for entry in inventory] == [entry_id]
+
+    _classify(
+        config=app_config,
+        logger=logger,
+        entry_id=entry_id,
+        claim_key="cli/legacy",
+        actor="reviewer",
+    )
+    first_classification = json.loads(capsys.readouterr().out)
+    _classify(
+        config=app_config,
+        logger=logger,
+        entry_id=entry_id,
+        claim_key=" CLI/LEGACY ",
+        actor="reviewer",
+    )
+    second_classification = json.loads(capsys.readouterr().out)
+    assert first_classification == second_classification
+    assert first_classification["claim_key"] == "cli/legacy"
+
+    with EngramStore(app_config) as store:
+        assert [record.action for record in store.list_audit()] == [
+            AuditAction.CLASSIFY,
+            AuditAction.IDEMPOTENT_NOOP,
+        ]
+
+
+def test_daemon_lock_blocks_migrate_without_advancing_schema(
+    app_config: AppConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _initialize_version_four(app_config, monkeypatch, seed_fact=False)
+
+    with (
+        DatabaseProcessLock(
+            app_config.database.path,
+            role=DatabaseLockRole.DAEMON,
+            command="serve",
+        ),
+        pytest.raises(DatabaseLockError),
+    ):
+        _migrate(
+            config=app_config,
+            logger=logging.getLogger("engram.test.cli"),
+        )
+
+    connection = sqlite3.connect(app_config.database.path)
+    try:
+        version = connection.execute("SELECT version FROM schema_version").fetchone()
+    finally:
+        connection.close()
+    assert version == (4,)
+
+
+def test_missing_supersession_ids_exit_without_traceback(
+    app_config: AppConfig,
+    tmp_path: Path,
+) -> None:
+    with EngramStore(app_config):
+        pass
+    config_path = tmp_path / "engram-cli.toml"
+    config_path.write_text(
+        f'[database]\npath = "{app_config.database.path.as_posix()}"\n',
+        encoding="utf-8",
+    )
+    environment = os.environ.copy()
+    environment["ENGRAM_CONFIG"] = str(config_path)
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from engram.cli import main; main()",
+            "supersede",
+            "--old",
+            "01AAAAAAAAAAAAAAAAAAAAAAAA",
+            "--new",
+            "01BBBBBBBBBBBBBBBBBBBBBBBB",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+
+    assert completed.returncode == EXIT_USAGE_OR_CONFIG
+    assert "does not exist" in completed.stderr
+    assert "Traceback" not in completed.stderr
+    assert completed.stdout == ""
 
 
 def test_supersede_and_list_commands_expose_lifecycle_state(
@@ -375,6 +578,7 @@ def test_daemon_lock_blocks_offline_writers_but_allows_list(
                 valid_until=None,
                 observed_at=None,
                 actor=None,
+                claim_key="cli/rejected",
                 supersedes=(),
             )
         with pytest.raises(DatabaseLockError):

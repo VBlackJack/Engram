@@ -30,8 +30,10 @@ or a different client is a different writer. Also verify `scope`, `kinds`, query
 
 ## The candidate is in `own_pending`, not `current`
 
-This is the normal security policy: `remember` produces an unconfirmed quarantined candidate. It
-needs explicit attestation before becoming active and shared.
+This is the normal security policy for that entry: anything visible in `own_pending` is an
+unconfirmed quarantined candidate. It needs explicit attestation before becoming active and shared.
+Canonically identical content that is already active and trusted would return
+`existing_trusted` without creating this candidate.
 
 ## `server busy, retry`
 

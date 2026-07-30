@@ -22,6 +22,7 @@ ENV_PREFIX = "ENGRAM_"
 DEFAULT_CONFIG_PATH = Path("engram.toml")
 SUPPORTED_LOG_LEVELS = frozenset({"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"})
 MAX_NETWORK_PORT = 65_535
+MAX_DATACRON_NEIGHBOR_LIMIT = 64
 
 
 class ConfigError(ValueError):
@@ -131,6 +132,9 @@ class DatacronConfig:
     write_paths: tuple[Path, ...] = ()
     new_note_directory: str = "_memory/engram"
     neighbor_limit: int = 8
+    startup_timeout_ms: int = 10_000
+    request_timeout_ms: int = 30_000
+    shutdown_timeout_ms: int = 5_000
 
 
 @dataclass(frozen=True, slots=True)
@@ -371,6 +375,24 @@ def load_config(
                 environment,
                 DEFAULT_DATACRON_CONFIG.neighbor_limit,
             ),
+            startup_timeout_ms=_integer_value(
+                datacron,
+                "startup_timeout_ms",
+                environment,
+                DEFAULT_DATACRON_CONFIG.startup_timeout_ms,
+            ),
+            request_timeout_ms=_integer_value(
+                datacron,
+                "request_timeout_ms",
+                environment,
+                DEFAULT_DATACRON_CONFIG.request_timeout_ms,
+            ),
+            shutdown_timeout_ms=_integer_value(
+                datacron,
+                "shutdown_timeout_ms",
+                environment,
+                DEFAULT_DATACRON_CONFIG.shutdown_timeout_ms,
+            ),
         ),
     )
     _validate_config(result)
@@ -596,8 +618,17 @@ def _validate_retrieval_config(config: AppConfig) -> None:
 
 
 def _validate_datacron_config(config: AppConfig) -> None:
-    if config.datacron.neighbor_limit <= 0:
-        raise ConfigError("datacron.neighbor_limit must be greater than zero")
+    if not 1 <= config.datacron.neighbor_limit <= MAX_DATACRON_NEIGHBOR_LIMIT:
+        raise ConfigError(
+            f"datacron.neighbor_limit must be between 1 and {MAX_DATACRON_NEIGHBOR_LIMIT}"
+        )
+    for name, value in (
+        ("startup_timeout_ms", config.datacron.startup_timeout_ms),
+        ("request_timeout_ms", config.datacron.request_timeout_ms),
+        ("shutdown_timeout_ms", config.datacron.shutdown_timeout_ms),
+    ):
+        if value <= 0:
+            raise ConfigError(f"datacron.{name} must be greater than zero")
     target = Path(config.datacron.new_note_directory)
     if (
         target.is_absolute()

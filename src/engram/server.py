@@ -22,6 +22,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from starlette.applications import Starlette
 from starlette.requests import Request
 
+from . import __version__
 from .capsule import CapsuleBuilder, CapsuleResult
 from .config import AppConfig
 from .models import (
@@ -31,6 +32,7 @@ from .models import (
     Evidence,
     EvidenceType,
     PromotionState,
+    RememberOutcome,
 )
 from .retrieval import EntryIndexer, RetrievalRequest, Retriever, build_retriever
 from .store import EngramStore, StoreBusyError
@@ -85,6 +87,7 @@ class RememberResult(BaseModel):
     promotion_state: PromotionState
     expires_at: str | None
     idempotent: bool
+    outcome: RememberOutcome
 
 
 class EngramFastMCP(FastMCP[object]):
@@ -103,6 +106,7 @@ class EngramFastMCP(FastMCP[object]):
             streamable_http_path=config.server.path,
             log_level=cast("McpLogLevel", config.logging.console_level),
         )
+        self._mcp_server.version = __version__
 
     def streamable_http_app(self) -> Starlette:
         """Return the SDK application with TTL maintenance bound to its lifespan."""
@@ -145,7 +149,7 @@ def create_mcp_server(
         evidence: list[EvidenceInput],
         ctx: ToolContext,
     ) -> Annotated[CallToolResult, RememberResult]:
-        """Store an unconfirmed model candidate with server-owned provenance."""
+        """Resolve one model observation through trust-aware idempotent storage."""
         writer_model = _client_identity(ctx)
 
         def write_candidate() -> CandidateWriteResult:
@@ -175,11 +179,9 @@ def create_mcp_server(
             promotion_state=entry.promotion_state,
             expires_at=(None if entry.expires_at is None else _format_datetime(entry.expires_at)),
             idempotent=outcome.idempotent,
+            outcome=outcome.outcome,
         )
-        text = (
-            f"Stored {entry.id} as {entry.status.value}/{entry.promotion_state.value}; "
-            "unconfirmed candidate."
-        )
+        text = _remember_text(outcome)
         return CallToolResult(
             content=[TextContent(type="text", text=text)],
             structuredContent=structured.model_dump(mode="json"),
@@ -228,7 +230,10 @@ def create_mcp_server(
             remember,
             arguments_model=RememberArguments,
             name="remember",
-            description="Store an unconfirmed memory candidate.",
+            description=(
+                "Resolve a memory observation as a new candidate, retry, "
+                "corroboration, trusted match, or renewal."
+            ),
             annotations=ToolAnnotations(
                 readOnlyHint=False,
                 destructiveHint=False,
@@ -298,6 +303,19 @@ def _client_identity(context: ToolContext) -> str:
     if not name or not version:
         return UNKNOWN_CLIENT
     return f"{name}/{version}"
+
+
+def _remember_text(outcome: CandidateWriteResult) -> str:
+    entry = outcome.entry
+    if outcome.outcome is RememberOutcome.EXISTING_TRUSTED:
+        return f"Found trusted entry {entry.id}; no unconfirmed replacement was created."
+    if outcome.outcome is RememberOutcome.RETRY:
+        return f"Resolved retry to existing unconfirmed candidate {entry.id}."
+    if outcome.outcome is RememberOutcome.CORROBORATED:
+        return f"Recorded corroboration as unconfirmed candidate {entry.id}."
+    if outcome.outcome is RememberOutcome.RENEWED:
+        return f"Renewed terminal content as unconfirmed candidate {entry.id}."
+    return f"Stored {entry.id} as an unconfirmed candidate."
 
 
 def _format_datetime(value: datetime) -> str:

@@ -24,11 +24,11 @@ date satisfies `valid_from <= today <= valid_until`; either missing bound is ope
 
 | Field | Type | Rule |
 | --- | --- | --- |
-| `id` | string | Stable server identifier |
+| `id` | string | Canonical server ULID |
 | `kind` | enum | One of the five kinds |
 | `scope` | string | Normalized logical space, `user` by default |
 | `statement` | string | Content bounded by `max_statement_chars` |
-| `subject_keys` | string list | Bounded and normalized subject identities |
+| `subject_keys` | string list | Bounded, normalized retrieval/topic keys |
 | `status` | enum | `active`, `superseded`, `quarantined`, `expired` |
 | `promotion_state` | enum | `candidate`, `approved`, `rejected`, `promoted` |
 | `source_type` | enum | `human`, `tool_verified`, `model_inferred`, `session_summary` |
@@ -39,7 +39,9 @@ date satisfies `valid_from <= today <= valid_until`; either missing bound is ope
 | `valid_from` | date or null | Business validity start |
 | `valid_until` | date or null | Business validity end |
 | `expires_at` | datetime or null | Expiry computed by kind |
-| `idempotency_key` | string | Unique deterministic fingerprint |
+| `canonical_key` | string | SHA-256 identity of normalized kind, scope, and statement |
+| `idempotency_key` | string | SHA-256 fingerprint of the canonical key and entry ULID |
+| `claim_key` | string or null | Normalized semantic conflict family for trusted claims |
 | `supersedes` | identifier list | Replaced versions |
 | `evidence` | `{type, ref}` list | Opaque references, never the source payload |
 | `stale` | boolean | Datacron promotion whose freshness diverged |
@@ -49,9 +51,17 @@ date satisfies `valid_from <= today <= valid_until`; either missing bound is ope
 
 ## Provenance and confidence
 
-`remember` always creates a `model_inferred`, `quarantined`, `candidate` entry. Writer identity
-comes from MCP initialization, not from an argument. A requested `high` confidence is stored as
-`medium`, and the cap event is audited.
+For new or renewed content, `remember` creates a `model_inferred`, `quarantined`, `candidate`
+entry. An exact retry by the same writer returns that generation; materially different metadata
+from that writer is retained as a corroborating observation. Canonically identical active trusted
+content is returned without creating a candidate. The explicit outcome is `created`, `retry`,
+`corroborated`, `existing_trusted`, or `renewed`. Writer identity comes from MCP initialization,
+not from an argument. A requested `high` confidence is stored as `medium`, and the cap event is
+audited.
+
+Every candidate generation owns at least one row in `entry_observations`. Additional observations
+retain their writer, confidence, dates, subject keys, and evidence without silently merging
+different writers into one provenance claim.
 
 Only the trusted local CLI path accepts `human` or `tool_verified`. An entry is eligible for
 consolidation only when it is `active`, `approved`, not stale, inside its business-validity window,
@@ -61,15 +71,20 @@ promoted.
 
 ## Lifecycle
 
-1. A `remember` call creates or idempotently finds a `quarantined` candidate.
+1. A `remember` call creates, renews, retries, or corroborates a `quarantined` candidate, or
+   returns canonically identical active trusted content.
 2. Explicit attestation produces an `active`, `approved` entry. Canonically identical candidate
    content is promoted in place and retains its identifier.
 3. A new version can mark previous versions `superseded` without erasing history.
 4. TTL marks an entry `expired`; physical purge is separate and audited.
-5. Reviewed consolidation changes the state to `promoted` only after a CAS write and reread.
+5. Reviewed consolidation changes the state to `promoted` only after an exactly reread create or
+   an exactly reverified `redundant` link.
 
-Active conflicts sharing `subject_keys` are symmetric: no version is arbitrarily placed in
-`current`. They appear in `conflicts` only when requested.
+Active trusted conflicts are grouped only by the exact `(kind, scope, claim_key)` tuple. Every
+version in such a family is returned symmetrically in `conflicts`; none is arbitrarily placed in
+`current`. `subject_keys` improve topic discovery but never define semantic conflict identity.
+Legacy trusted rows without a `claim_key` remain readable through the explicit unclassified
+inventory, but are hidden from `current` until an operator classifies them.
 
 ## Process ownership
 
@@ -86,8 +101,10 @@ propagated to the CLI. Known failures omit tracebacks unless the global `--debug
 
 ## Idempotency
 
-The key is computed from the relevant canonical content. An identical retry returns the same entry
-with `idempotent=true` and creates an `idempotent_noop` event; it does not duplicate memory.
+`canonical_key` identifies exact normalized content. `idempotency_key` identifies one stable
+generation by hashing that canonical key with its ULID, so it survives attestation in place.
+Retry detection uses the canonical identity, writer, and retained observation: an exact retry
+returns `retry` and records an `idempotent_noop`; a new observation returns `corroborated`.
 
 ## Datacron freshness
 
@@ -95,14 +112,29 @@ After promotion, Engram stores `datacron_ref`, `datacron_hash`, and `synced_at`.
 check rereads the note. If its hash differs, the entry becomes `stale` and is hidden from `current`
 until review. History is retained and this check never rewrites Datacron.
 
-Consolidation preserves the deterministic search rank returned by Datacron when selecting a patch
-target. A `redundant` proposition always targets the neighbor whose normalized statement exactly
-matches the candidate, even when a broader search hit ranks first. Planning persists a canonical
+Datacron search does not provide durable subject keys. The gateway therefore keeps those keys empty
+instead of copying them from the candidate. Search combines the full AND query with per-term
+variants. Work is bounded to three full queries plus at most eight single-term variants, and
+`neighbor_limit` remains between 1 and 64. Any hit without a path, unreadable, empty, or lacking a
+unique section selector fails the plan; it can never cause a `new` classification followed by a
+create. `get_note(full)` validates
+the returned `rel_path`, removes only the canonical Datacron sandbox envelope, and rejects
+truncated content. The server `content_hash`, computed over the file, stays intact for freshness
+and verification; the `freshness-contract-v1` contract is mandatory. A `redundant` proposition
+always targets the neighbor whose normalized statement exactly matches the candidate. An `update`
+proposition shows the classified target, its `H1` through `H6` level, and its diff in the report,
+but its current action is `skip`: section patching is not allowed without an independently verified
+durable identity anchor.
+
+A new note path is deterministic, bounds its ASCII slug to 64 characters, and always contains the
+candidate ID. Before each plan, Engram rereads that canonical path. A note whose full content
+exactly matches the expected rendering
+becomes `redundant`, including after a lost create response; only line endings and final-newline
+presence are normalized. Any other existing note becomes `update/skip`. No alternate path may
+create a duplicate. Planning persists a canonical
 immutable proposition snapshot under a generated `plan_id`. The review artifact may change only
 the per-proposition decision. Apply rejects any other divergence or remaining `pending` decision
 without consuming the plan. Once every decision is approve/reject, apply consumes the plan before
-external writes and refuses replay. It regenerates current neighbors before writing and requires
-the snapshotted target to remain current. The gateway passes the heading level to Datacron and rereads
-the exact section before marking the entry promoted. A final batch pass reconciles the whole-note
-hash of every promotion on a potentially written path before recall can expose it. Any `failed` or
-`stale` apply outcome produces exit code 6 after the report is written.
+external writes and refuses replay. A final batch pass reconciles the whole-note hash of every
+promotion on a potentially written path before recall can expose it. Any `failed` or `stale` apply
+outcome produces exit code 6 after the report is written.

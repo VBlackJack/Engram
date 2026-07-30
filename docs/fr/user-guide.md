@@ -47,14 +47,16 @@ default_actor = "local-operator"
 ```
 
 Arreter `engram serve` avant une mutation de confiance afin qu'un seul processus ecrive dans la
-base. La CLI applique cette frontiere : `attest`, `supersede`, `reindex` et tous les modes de
-`consolidate` echouent avec le PID du daemon et l'action corrective tant qu'il reste actif. `list`
-reste disponible en read-only. Inspecter les candidats, puis attester le contenu relu :
+base. La CLI applique cette frontiere : `migrate`, `classify`, `attest`, `supersede`, `reindex` et
+tous les modes de `consolidate` echouent avec le PID du daemon et l'action corrective tant qu'il
+reste actif. `list` reste disponible en read-only. Inspecter les candidats, puis attester le contenu
+relu :
 
 ```powershell
 engram list --status quarantined
 engram attest "Le service ecoute sur le port 8377." fact user `
   --subject-key "engram/server-port" `
+  --claim-key "engram/server-port" `
   --evidence "review=change-42"
 ```
 
@@ -65,6 +67,7 @@ l'identifiant remplace :
 ```powershell
 engram attest "Le service ecoute sur le port 9000." fact user `
   --subject-key "engram/server-port" `
+  --claim-key "engram/server-port" `
   --supersedes 01AAAAAAAAAAAAAAAAAAAAAAAA
 ```
 
@@ -72,6 +75,30 @@ Pour relier deux entrees existantes, utiliser `engram supersede --old OLD_ID --n
 commandes de confiance emettent du JSON exploitable. Redemarrer le daemon avant de rappeler la
 nouvelle memoire active. `engram attest --help` documente provenance, confiance, validite,
 observation, evidence et acteur.
+
+## Migrer et classer une base existante
+
+Arreter le daemon et creer une sauvegarde SQLite coherente avant toute migration. Travailler
+d'abord sur une copie lors d'une reprise ou d'un incident, puis executer :
+
+```powershell
+engram migrate
+engram list --unclassified
+```
+
+`migrate` applique le schema v5 dans une transaction et refuse une ligne historique mal formee sans
+laisser de migration partielle. Les `project_state` recoivent leur famille reservee ; les episodes
+n'en utilisent pas. Pour chaque preference, decision ou fait retourne par l'inventaire, relire le
+contenu et attribuer manuellement une famille semantique stable :
+
+```powershell
+engram classify ENTRY_ID --claim-key "engram/server-port"
+engram list --unclassified
+```
+
+Repeter jusqu'a ce que l'inventaire soit vide. Ne pas deriver automatiquement `claim_key` depuis
+`subject_keys` : ces dernieres servent a la recherche, pas a l'identite d'un conflit. Redemarrer
+ensuite le daemon.
 
 ## Diagnostiquer les erreurs CLI
 
@@ -119,7 +146,12 @@ restent sous `local/` et ne sont pas publies.
 Configurer `[datacron]` avec un vault, des chemins de lecture et des chemins d'ecriture explicites.
 Une allowlist vide interdit l'ecriture, meme si le processus parent definit deja
 `DATACRON_WRITE_PATHS`. Le transport CLI par defaut utilise `command = "datacron"` avec
-`args = ["mcp", "serve"]`.
+`args = ["mcp", "serve"]`. `startup_timeout_ms`, `request_timeout_ms` et
+`shutdown_timeout_ms` bornent chaque frontiere du sous-processus. Un timeout empoisonne la session :
+le plan ne doit jamais etre rejoue. Le runtime pince `mcp==1.28.1` : son context manager stdio
+ferme stdin puis termine l'arbre de processus (Job Object sous Windows, groupe de processus sous
+POSIX) dans deux attentes bornees de 2 s. Le timeout d'arret par defaut de 5 s couvre ce cleanup ;
+le thread proprietaire non-daemon empeche la sortie du processus avant son `finally`.
 
 La gate end-to-end automatisee doit utiliser un vault initialise et jetable ainsi qu'une
 configuration Engram reservee au test. Elle ne doit jamais cibler le vault durable. Un
@@ -142,6 +174,8 @@ Pour chaque proposition :
 
 - verifier `classification`, `proposed_action`, `rel_path`, `heading`, `heading_level`, `new_content`,
   `expected_hash` et les voisins ;
+- pour `update`, lire le diff avant/apres ; l'action actuelle est `skip` et aucune section existante
+  n'est modifiee sans ancrage d'identite durable independamment verifie ;
 - modifier uniquement `decision`, avec `"approve"` ou `"reject"`.
 
 Ne pas recibler une proposition ni modifier un champ genere. Engram compare tous les champs
@@ -157,6 +191,10 @@ uv run --python 3.14.3 engram consolidate --apply local/consolidation/plan.json
 Un resultat peut etre `applied`, `skipped`, `stale` ou `failed`. Le plan est consomme avant toute
 tentative d'ecriture externe et ne peut pas etre rejoue. Si un resultat vaut `stale` ou `failed`, le
 rapport est conserve et la commande sort avec le code 6. Regenerer un plan depuis la note courante.
+Une creation utilise un chemin canonique qui contient l'ID candidat. Si la reponse d'ecriture se
+perd apres la creation, le plan suivant relit ce meme chemin et ne classe `redundant` que son
+contenu canonique complet identique (fins de ligne et newline final exceptes), au lieu de creer un
+doublon.
 
 ### 4. Controler la fraicheur
 

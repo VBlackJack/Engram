@@ -13,7 +13,15 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from .config import CapsuleConfig
 from .models import Entry, EntryKind, EntryStatus
-from .retrieval import RetrievalResult
+from .retrieval import RetrievalResult, effective_claim_key
+
+CURRENT_KINDS = frozenset(
+    {
+        EntryKind.PREFERENCE,
+        EntryKind.DECISION,
+        EntryKind.FACT,
+    }
+)
 
 
 class CapsuleItem(BaseModel):
@@ -37,11 +45,12 @@ class PendingItem(CapsuleItem):
 
 
 class ConflictItem(BaseModel):
-    """Symmetric unresolved versions sharing a queried subject."""
+    """Symmetric unresolved versions of one explicit claim."""
 
     model_config = ConfigDict(extra="forbid")
 
     status: Literal["unresolved"] = "unresolved"
+    claim_key: str
     subject_keys: list[str]
     versions: list[CapsuleItem]
 
@@ -95,19 +104,27 @@ class CapsuleBuilder:
         token_budget: int,
     ) -> tuple[CapsuleResult, str]:
         """Build structured and text capsules under one shared item budget."""
-        conflict_groups, conflict_ids = _find_conflicts(retrieval.matches)
+        selected_entries = _unique_entries((*retrieval.matches, *retrieval.next_actions))
+        conflict_groups, conflict_ids = _find_conflicts(selected_entries)
+        unclassified_ids = {
+            entry.id
+            for entry in selected_entries
+            if entry.status is EntryStatus.ACTIVE
+            and entry.kind in CURRENT_KINDS
+            and effective_claim_key(entry) is None
+        }
         active_matches = [
             entry
             for entry in retrieval.matches
-            if entry.status is EntryStatus.ACTIVE and entry.id not in conflict_ids
+            if entry.status is EntryStatus.ACTIVE
+            and entry.id not in conflict_ids
+            and entry.id not in unclassified_ids
         ]
-        current = [
-            _capsule_item(entry)
-            for entry in active_matches
-            if entry.kind in {EntryKind.PREFERENCE, EntryKind.DECISION, EntryKind.FACT}
-        ]
+        current = [_capsule_item(entry) for entry in active_matches if entry.kind in CURRENT_KINDS]
         next_action = [
-            _capsule_item(entry) for entry in retrieval.next_actions if entry.id not in conflict_ids
+            _capsule_item(entry)
+            for entry in retrieval.next_actions
+            if entry.id not in conflict_ids and entry.id not in unclassified_ids
         ]
         relevant = [
             _capsule_item(entry) for entry in active_matches if entry.kind is EntryKind.EPISODE
@@ -117,6 +134,13 @@ class CapsuleBuilder:
         reasons = ["retrieval rank with recency tie-break"]
         if scope is not None:
             reasons.append(f"scope filter: {scope}")
+        if unclassified_ids:
+            reasons.append(_unclassified_omission_note(len(unclassified_ids)))
+        if conflict_ids and not include_conflicts:
+            reasons.append(
+                f"{len(conflict_ids)} unresolved conflict entries omitted; "
+                "retry with include_conflicts=true"
+            )
 
         candidates: list[tuple[str, CapsuleItem | ConflictItem | PendingItem]] = []
         candidates.extend(("current", item) for item in current)
@@ -159,8 +183,7 @@ def render_capsule_text(capsule: CapsuleResult) -> str:
     lines.append("CONFLICTS")
     if capsule.conflicts:
         for conflict in capsule.conflicts:
-            keys = ", ".join(conflict.subject_keys) or "shared identity"
-            lines.append(f"- unresolved: {keys}")
+            lines.append(f"- unresolved: {conflict.claim_key}")
             lines.extend(f"  - {_item_line(version)}" for version in conflict.versions)
     else:
         lines.append("- none")
@@ -176,40 +199,44 @@ def render_capsule_text(capsule: CapsuleResult) -> str:
 
 
 def _find_conflicts(entries: Sequence[Entry]) -> tuple[list[ConflictItem], set[str]]:
-    active = [
-        entry for entry in entries if entry.status is EntryStatus.ACTIVE and entry.subject_keys
-    ]
-    groups: list[list[Entry]] = []
-    partitions: dict[tuple[EntryKind, str], list[Entry]] = {}
+    active = [entry for entry in entries if entry.status is EntryStatus.ACTIVE]
+    partitions: dict[tuple[EntryKind, str, str], list[Entry]] = {}
     for entry in active:
-        partitions.setdefault((entry.kind, entry.scope), []).append(entry)
+        claim_key = effective_claim_key(entry)
+        if claim_key is not None:
+            partitions.setdefault((entry.kind, entry.scope, claim_key), []).append(entry)
 
-    for partition in partitions.values():
-        remaining = partition.copy()
-        while remaining:
-            group = [remaining.pop(0)]
-            group_keys = set(group[0].subject_keys)
-            changed = True
-            while changed:
-                changed = False
-                for entry in remaining.copy():
-                    if group_keys.intersection(entry.subject_keys):
-                        group.append(entry)
-                        group_keys.update(entry.subject_keys)
-                        remaining.remove(entry)
-                        changed = True
-            if len(group) > 1 and len({entry.idempotency_key for entry in group}) > 1:
-                groups.append(group)
+    groups = [
+        (claim_key, group)
+        for (_, _, claim_key), group in partitions.items()
+        if len(group) > 1 and len({entry.canonical_key for entry in group}) > 1
+    ]
 
     conflict_items = [
         ConflictItem(
+            claim_key=claim_key,
             subject_keys=sorted({key for entry in group for key in entry.subject_keys}),
             versions=[_capsule_item(entry) for entry in group],
         )
-        for group in groups
+        for claim_key, group in groups
     ]
-    conflict_ids = {entry.id for group in groups for entry in group}
+    conflict_ids = {entry.id for _, group in groups for entry in group}
     return conflict_items, conflict_ids
+
+
+def _unique_entries(entries: Sequence[Entry]) -> tuple[Entry, ...]:
+    unique: list[Entry] = []
+    seen: set[str] = set()
+    for entry in entries:
+        if entry.id not in seen:
+            seen.add(entry.id)
+            unique.append(entry)
+    return tuple(unique)
+
+
+def _unclassified_omission_note(count: int) -> str:
+    noun = "entry" if count == 1 else "entries"
+    return f"{count} trusted {noun} omitted: claim_key classification required"
 
 
 def _capsule_item(entry: Entry) -> CapsuleItem:

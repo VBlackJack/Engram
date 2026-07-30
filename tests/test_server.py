@@ -24,6 +24,7 @@ from mcp.types import CallToolResult, Implementation, TextContent
 from starlette.applications import Starlette
 
 import engram.server as server_module
+from engram import __version__
 from engram.config import (
     AppConfig,
     CapsuleConfig,
@@ -76,7 +77,8 @@ async def _client(
             client_info=Implementation(name=name, version=version),
         ) as session,
     ):
-        await session.initialize()
+        initialization = await session.initialize()
+        assert initialization.serverInfo.version == __version__
         yield session
 
 
@@ -85,8 +87,15 @@ def _structured(result: CallToolResult) -> dict[str, Any]:
     return result.structuredContent
 
 
+def _fallback_text(result: CallToolResult) -> str:
+    assert len(result.content) == 1
+    content = result.content[0]
+    assert isinstance(content, TextContent)
+    return content.text
+
+
 @pytest.mark.anyio
-async def test_remember_round_trip_is_strict_owned_and_idempotent(
+async def test_remember_round_trip_is_strict_owned_and_idempotent(  # noqa: PLR0915
     app_config: AppConfig,
 ) -> None:
     """Exercise discovery and duplicate writes through the public HTTP transport."""
@@ -107,6 +116,26 @@ async def test_remember_round_trip_is_strict_owned_and_idempotent(
             assert "source_type" not in tools["remember"].inputSchema["properties"]
             evidence_schema = tools["remember"].inputSchema["$defs"]["EvidenceInput"]
             assert evidence_schema["additionalProperties"] is False
+            output_schema = tools["remember"].outputSchema
+            assert output_schema is not None
+            assert set(output_schema["required"]) == {
+                "entry_id",
+                "status",
+                "promotion_state",
+                "expires_at",
+                "idempotent",
+                "outcome",
+            }
+            assert output_schema["$defs"]["RememberOutcome"]["enum"] == [
+                "created",
+                "retry",
+                "corroborated",
+                "existing_trusted",
+                "renewed",
+            ]
+            recall_output_schema = tools["recall"].outputSchema
+            assert recall_output_schema is not None
+            assert "claim_key" in recall_output_schema["$defs"]["ConflictItem"]["required"]
             assert tools["remember"].annotations is not None
             assert tools["remember"].annotations.readOnlyHint is False
             assert tools["remember"].annotations.destructiveHint is False
@@ -125,20 +154,37 @@ async def test_remember_round_trip_is_strict_owned_and_idempotent(
             }
             first = await session.call_tool("remember", arguments)
             second = await session.call_tool("remember", arguments)
+            corroborated = await session.call_tool(
+                "remember",
+                {
+                    **arguments,
+                    "evidence": [{"type": "tool_result", "ref": "tool://result/2"}],
+                },
+            )
 
             assert first.isError is False
             assert second.isError is False
+            assert corroborated.isError is False
             assert _structured(first)["status"] == "quarantined"
             assert _structured(first)["promotion_state"] == "candidate"
             assert _structured(first)["idempotent"] is False
+            assert _structured(first)["outcome"] == "created"
             assert _structured(second)["idempotent"] is True
+            assert _structured(second)["outcome"] == "retry"
+            assert _structured(corroborated)["outcome"] == "corroborated"
+            assert _structured(corroborated)["idempotent"] is False
             assert _structured(first)["entry_id"] == _structured(second)["entry_id"]
+            assert _structured(first)["entry_id"] == _structured(corroborated)["entry_id"]
+            assert "unconfirmed candidate" in _fallback_text(first)
+            assert "Resolved retry" in _fallback_text(second)
+            assert "Recorded corroboration" in _fallback_text(corroborated)
             assert store.count_entries() == 1
             stored = store.list_entries()[0]
             assert stored.writer_model == "sdk-client/2.4"
             assert stored.status is EntryStatus.QUARANTINED
             assert stored.promotion_state is PromotionState.CANDIDATE
             assert stored.source_type is SourceType.MODEL_INFERRED
+            assert len(store.list_observations(stored.id)) == 2
 
             rejected = await session.call_tool(
                 "remember",
@@ -151,6 +197,63 @@ async def test_remember_round_trip_is_strict_owned_and_idempotent(
             )
             assert rejected.isError is True
             assert store.count_entries() == 1
+
+
+@pytest.mark.anyio
+async def test_remember_reports_trusted_match_and_terminal_renewal_over_http(
+    app_config: AppConfig,
+    clock: MutableClock,
+) -> None:
+    with EngramStore(app_config, clock=clock) as store:
+        trusted = store.add_attested(
+            kind="fact",
+            scope="user",
+            statement="The verified endpoint is stable.",
+            source_type=SourceType.TOOL_VERIFIED,
+            claim_key="endpoint/stability",
+        )
+        terminal = store.add_candidate(
+            kind="episode",
+            scope="session/retry",
+            statement="The terminal observation can be renewed.",
+            writer_model="sdk-client/2.4",
+        )
+        assert terminal.expires_at is not None
+        clock.current = terminal.expires_at
+
+        server = create_mcp_server(app_config, store)
+        app = server.streamable_http_app()
+        async with (
+            app.router.lifespan_context(app),
+            _client(app, name="sdk-client", version="2.4") as session,
+        ):
+            trusted_result = await session.call_tool(
+                "remember",
+                {
+                    "statement": "The verified endpoint is stable.",
+                    "kind": "fact",
+                },
+            )
+            renewed_result = await session.call_tool(
+                "remember",
+                {
+                    "statement": "The terminal observation can be renewed.",
+                    "kind": "episode",
+                    "scope": "session/retry",
+                },
+            )
+
+        assert _structured(trusted_result)["outcome"] == "existing_trusted"
+        assert _structured(trusted_result)["entry_id"] == trusted.id
+        assert _structured(trusted_result)["status"] == "active"
+        assert "Found trusted entry" in _fallback_text(trusted_result)
+        assert _structured(renewed_result)["outcome"] == "renewed"
+        assert _structured(renewed_result)["entry_id"] != terminal.id
+        assert _structured(renewed_result)["status"] == "quarantined"
+        assert "Renewed terminal content" in _fallback_text(renewed_result)
+        expired = store.get_entry(terminal.id)
+        assert expired is not None
+        assert expired.status is EntryStatus.EXPIRED
 
 
 @pytest.mark.anyio
@@ -258,6 +361,7 @@ async def test_recall_places_trusted_entries_and_excludes_superseded_versions(
             statement="Theme color was blue.",
             source_type=SourceType.HUMAN,
             subject_keys=("theme/color",),
+            claim_key="theme/color",
         )
         current = store.add_attested(
             kind="fact",
@@ -265,6 +369,7 @@ async def test_recall_places_trusted_entries_and_excludes_superseded_versions(
             statement="Theme color is green.",
             source_type=SourceType.TOOL_VERIFIED,
             subject_keys=("theme/color",),
+            claim_key="theme/color",
         )
         store.supersede(old.id, current.id)
         next_action = store.add_attested(
@@ -286,6 +391,7 @@ async def test_recall_places_trusted_entries_and_excludes_superseded_versions(
             scope="project/other",
             statement="Theme color is orange.",
             source_type=SourceType.HUMAN,
+            claim_key="theme/color",
         )
 
         server = create_mcp_server(app_config, store)
@@ -333,6 +439,7 @@ async def test_recall_renders_conflicts_only_when_requested(
             statement="The editor theme is light.",
             source_type=SourceType.HUMAN,
             subject_keys=("editor/theme",),
+            claim_key="editor/theme",
         )
         second = store.add_attested(
             kind="decision",
@@ -340,6 +447,7 @@ async def test_recall_renders_conflicts_only_when_requested(
             statement="The editor theme is dark.",
             source_type=SourceType.TOOL_VERIFIED,
             subject_keys=("editor/theme",),
+            claim_key="editor/theme",
         )
         server = create_mcp_server(app_config, store)
         app = server.streamable_http_app()
@@ -361,6 +469,7 @@ async def test_recall_renders_conflicts_only_when_requested(
         assert len(shown_capsule["conflicts"]) == 1
         conflict = shown_capsule["conflicts"][0]
         assert conflict["status"] == "unresolved"
+        assert conflict["claim_key"] == "editor/theme"
         assert {item["id"] for item in conflict["versions"]} == {first.id, second.id}
 
 
@@ -376,6 +485,7 @@ async def test_recall_keeps_complementary_kinds_in_current(
             statement="The storage engine is SQLite.",
             source_type=SourceType.TOOL_VERIFIED,
             subject_keys=("storage/engine",),
+            claim_key="storage/engine/fact",
         )
         decision = store.add_attested(
             kind="decision",
@@ -383,6 +493,7 @@ async def test_recall_keeps_complementary_kinds_in_current(
             statement="Keep the storage engine local.",
             source_type=SourceType.HUMAN,
             subject_keys=("storage/engine",),
+            claim_key="storage/engine/decision",
         )
         server = create_mcp_server(app_config, store)
         app = server.streamable_http_app()
@@ -413,6 +524,7 @@ async def test_recall_does_not_merge_conflicts_across_scopes(
             statement="Shared theme stays green in Engram.",
             source_type=SourceType.HUMAN,
             subject_keys=("shared/theme",),
+            claim_key="shared/theme",
         )
         second = store.add_attested(
             kind="decision",
@@ -420,6 +532,7 @@ async def test_recall_does_not_merge_conflicts_across_scopes(
             statement="Shared theme stays blue elsewhere.",
             source_type=SourceType.HUMAN,
             subject_keys=("shared/theme",),
+            claim_key="shared/theme",
         )
         server = create_mcp_server(app_config, store)
         app = server.streamable_http_app()
@@ -458,6 +571,7 @@ async def test_recall_budget_omits_whole_entries_and_validates_bounds(
                 statement=statement,
                 source_type=SourceType.HUMAN,
                 subject_keys=(f"budget/{index}",),
+                claim_key=f"budget/{index}",
             )
         server = create_mcp_server(config, store)
         app = server.streamable_http_app()

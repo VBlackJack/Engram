@@ -72,6 +72,9 @@ rrf_k = 60
         "ENGRAM_RETRIEVAL_MODE": "hybrid",
         "ENGRAM_RETRIEVAL_EMBEDDINGS_MODEL": "text-embedding-test",
         "ENGRAM_RETRIEVAL_RRF_K": "80",
+        "ENGRAM_DATACRON_STARTUP_TIMEOUT_MS": "11000",
+        "ENGRAM_DATACRON_REQUEST_TIMEOUT_MS": "31000",
+        "ENGRAM_DATACRON_SHUTDOWN_TIMEOUT_MS": "6000",
     }
 
     config = load_config(config_path, environ=environment)
@@ -92,6 +95,9 @@ rrf_k = 60
     assert config.retrieval.mode is RetrievalMode.HYBRID
     assert config.retrieval.embeddings_model == "text-embedding-test"
     assert config.retrieval.rrf_k == 80
+    assert config.datacron.startup_timeout_ms == 11000
+    assert config.datacron.request_timeout_ms == 31000
+    assert config.datacron.shutdown_timeout_ms == 6000
 
 
 def test_load_config_rejects_invalid_limits(tmp_path: Path) -> None:
@@ -122,6 +128,29 @@ def test_load_config_rejects_invalid_ttl_sweep_interval(tmp_path: Path, value: s
     )
 
     with pytest.raises(ConfigError, match="ttl_sweep_interval_seconds"):
+        load_config(config_path, environ={})
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["startup_timeout_ms", "request_timeout_ms", "shutdown_timeout_ms"],
+)
+def test_load_config_rejects_nonpositive_datacron_timeout(
+    tmp_path: Path,
+    name: str,
+) -> None:
+    config_path = tmp_path / "engram.toml"
+    config_path.write_text(f"[datacron]\n{name} = 0\n", encoding="utf-8")
+
+    with pytest.raises(ConfigError, match=rf"datacron\.{name}"):
+        load_config(config_path, environ={})
+
+
+def test_load_config_rejects_excessive_datacron_neighbor_limit(tmp_path: Path) -> None:
+    config_path = tmp_path / "engram.toml"
+    config_path.write_text("[datacron]\nneighbor_limit = 65\n", encoding="utf-8")
+
+    with pytest.raises(ConfigError, match=r"neighbor_limit.*between 1 and 64"):
         load_config(config_path, environ={})
 
 

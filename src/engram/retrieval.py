@@ -15,7 +15,7 @@ from typing import Protocol, runtime_checkable
 
 from .config import AppConfig, RetrievalConfig, RetrievalMode
 from .embeddings import EmbeddingError, EmbeddingProvider, HttpEmbeddingProvider
-from .models import Entry, EntryKind, EntryStatus
+from .models import PROJECT_STATE_CLAIM_KEY, Entry, EntryKind, EntryStatus
 from .store import EngramStore
 
 LOGGER = logging.getLogger(__name__)
@@ -278,11 +278,20 @@ def _cosine_similarity(left: Sequence[float], right: Sequence[float]) -> float |
 
 
 def _same_conflict_family(candidate: Entry, seed: Entry) -> bool:
+    seed_claim_key = effective_claim_key(seed)
     return (
-        candidate.kind is seed.kind
+        seed_claim_key is not None
+        and candidate.kind is seed.kind
         and candidate.scope == seed.scope
-        and bool(set(candidate.subject_keys).intersection(seed.subject_keys))
+        and effective_claim_key(candidate) == seed_claim_key
     )
+
+
+def effective_claim_key(entry: Entry) -> str | None:
+    """Return the explicit claim identity or the reserved project-state identity."""
+    if entry.kind is EntryKind.PROJECT_STATE:
+        return PROJECT_STATE_CLAIM_KEY
+    return entry.claim_key
 
 
 def _embedding_text(entry: Entry) -> str:

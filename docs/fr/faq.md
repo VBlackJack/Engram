@@ -32,8 +32,10 @@ requete, le TTL et le budget.
 
 ## Le candidat est dans `own_pending`, pas dans `current`
 
-C'est le comportement de securite normal : `remember` produit un candidat non confirme en
-quarantaine. Il faut une attestation explicite avant qu'il puisse devenir actif et partage.
+C'est le comportement de securite normal pour cette entree : tout element visible dans
+`own_pending` est un candidat non confirme en quarantaine. Il faut une attestation explicite avant
+qu'il puisse devenir actif et partage. Un contenu canonique deja actif et fiable serait retourne
+avec l'outcome `existing_trusted` et ne creerait pas ce candidat.
 
 ## `server busy, retry`
 

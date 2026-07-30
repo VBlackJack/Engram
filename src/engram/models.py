@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from enum import StrEnum
 
+PROJECT_STATE_CLAIM_KEY = "project_state/current"
+
 
 class EntryKind(StrEnum):
     """Supported memory entry kinds."""
@@ -75,6 +77,18 @@ class AuditAction(StrEnum):
     PROMOTE = "promote"
     MARK_STALE = "mark_stale"
     MARK_FRESH = "mark_fresh"
+    CORROBORATE = "corroborate"
+    CLASSIFY = "classify"
+
+
+class RememberOutcome(StrEnum):
+    """Explicit result of one model candidate write."""
+
+    CREATED = "created"
+    RETRY = "retry"
+    CORROBORATED = "corroborated"
+    EXISTING_TRUSTED = "existing_trusted"
+    RENEWED = "renewed"
 
 
 @dataclass(frozen=True, slots=True)
@@ -111,6 +125,8 @@ class Entry:
     datacron_ref: str | None
     datacron_hash: str | None
     synced_at: datetime | None
+    canonical_key: str = ""
+    claim_key: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -131,3 +147,20 @@ class CandidateWriteResult:
 
     entry: Entry
     idempotent: bool
+    outcome: RememberOutcome
+
+
+@dataclass(frozen=True, slots=True)
+class EntryObservation:
+    """One normalized model observation retained behind an entry generation."""
+
+    entry_id: str
+    writer_model: str
+    claim_hash: str
+    recorded_at: datetime
+    confidence: Confidence
+    observed_at: datetime | None
+    valid_from: date | None
+    valid_until: date | None
+    subject_keys: tuple[str, ...]
+    evidence: tuple[Evidence, ...]

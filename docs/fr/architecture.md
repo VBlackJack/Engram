@@ -73,12 +73,13 @@ peut pas se glisser dans `current`.
 Le gateway parle au serveur Datacron en MCP stdio et applique les allowlists configurees. Le flux
 est volontairement en deux temps :
 
-1. `--plan` recherche les sections voisines, classe create/patch/skip, ancre un snapshot SQLite
-   immuable et produit JSON + Markdown ;
+1. `--plan` relit le chemin canonique, recherche plusieurs variantes de sections voisines, classe
+   create/link/skip, ancre un snapshot SQLite immuable et produit JSON + Markdown ;
 2. un humain modifie uniquement chaque decision approve/reject ;
-3. `--apply` verifie l'artefact contre le snapshot, consomme le plan, relit la note, compare le hash
-   CAS, ecrit via MCP, puis relit ;
-4. Engram marque `promoted` seulement si la relecture confirme la mutation ;
+3. `--apply` verifie l'artefact contre le snapshot et consomme le plan ; `new` cree une seule note
+   canonique puis la relit, `redundant` reverifie et lie la note sans ecriture, tandis que `update`
+   et `contradictory` restent `skip` ;
+4. Engram marque `promoted` seulement si la creation exacte ou la liaison exacte est reverifiee ;
 5. `--check-freshness` compare ensuite les hashes sans reecrire le vault.
 
 Une erreur sur une proposition n'autorise pas le forcement d'une autre. Un rapport apply contenant
@@ -88,8 +89,10 @@ non resolues doivent etre replannifiees depuis l'etat Datacron courant.
 Seuls `plan_id` et les decisions franchissent la frontiere de revue comme entrees. Chemin, heading,
 niveau, contenu, hashes, voisins, classification et action doivent correspondre exactement au
 snapshot de confiance ; le reciblage manuel est refuse. Apply regenere toujours les voisins courants
-et recontrole la cible live avant ecriture. Les chemins emploient des slashs canoniques et les
-headings tiennent sur une ligne. Apres relecture, la section exacte doit correspondre au corps
-canonique du candidat ; trouver ce corps ailleurs dans la note ne suffit pas a verifier l'ecriture.
+et recontrole la cible live avant creation ou liaison. Les chemins emploient des slashs canoniques
+et les headings tiennent sur une ligne. Un chemin de creation contient l'ID candidat et n'admet
+aucune variante. Apres une reponse ambigue, seule une note dont le contenu canonique complet est
+identique, hors normalisation des fins de ligne et du newline final, devient `redundant`. Tout
+contenu supplementaire reste `update/skip`.
 En fin de lot, apply relit chaque chemin potentiellement ecrit et marque stale toute promotion dont
 le hash de note complete diverge.

@@ -39,6 +39,7 @@ class DatacronGateway(Protocol):
         self,
         subject_keys: Sequence[str],
         scope: str,
+        statement: str,
         limit: int,
     ) -> tuple[NeighborSection, ...]:
         """Return bounded durable sections relevant to one candidate."""
@@ -106,9 +107,11 @@ class FakeDatacronGateway:
         self,
         subject_keys: Sequence[str],
         scope: str,
+        statement: str,
         limit: int,
     ) -> tuple[NeighborSection, ...]:
         """Return seeded neighbors sharing one requested subject key."""
+        del statement
         self.calls.append(("search_neighbors", scope))
         requested = set(subject_keys)
         matches = [

@@ -47,14 +47,15 @@ default_actor = "local-operator"
 ```
 
 Stop `engram serve` before running a trusted mutation so only one process writes the database. The
-CLI enforces this boundary: `attest`, `supersede`, `reindex`, and every `consolidate` mode fail with
-the daemon PID and corrective action while it is active. `list` remains available read-only.
-Inspect pending candidates, then attest reviewed content:
+CLI enforces this boundary: `migrate`, `classify`, `attest`, `supersede`, `reindex`, and every
+`consolidate` mode fail with the daemon PID and corrective action while it is active. `list` remains
+available read-only. Inspect pending candidates, then attest reviewed content:
 
 ```powershell
 engram list --status quarantined
 engram attest "The service listens on port 8377." fact user `
   --subject-key "engram/server-port" `
+  --claim-key "engram/server-port" `
   --evidence "review=change-42"
 ```
 
@@ -64,6 +65,7 @@ entry ID to `active`/`approved`. For a corrected statement, pass the replaced ID
 ```powershell
 engram attest "The service listens on port 9000." fact user `
   --subject-key "engram/server-port" `
+  --claim-key "engram/server-port" `
   --supersedes 01AAAAAAAAAAAAAAAAAAAAAAAA
 ```
 
@@ -71,6 +73,29 @@ To link two entries that already exist, use `engram supersede --old OLD_ID --new
 commands emit machine-readable JSON. Restart the daemon before recalling the newly active memory.
 Use `engram attest --help` for provenance, confidence, validity, observation, evidence, and actor
 options.
+
+## Migrate and classify an existing database
+
+Stop the daemon and take a SQLite-consistent backup before migrating. During a recovery or incident,
+exercise the workflow on a copy first, then run:
+
+```powershell
+engram migrate
+engram list --unclassified
+```
+
+`migrate` applies schema v5 in one transaction and rejects malformed historical rows without
+leaving a partial migration. Project states receive their reserved family; episodes do not use one.
+For every preference, decision, or fact in the inventory, review the content and assign a stable
+semantic family manually:
+
+```powershell
+engram classify ENTRY_ID --claim-key "engram/server-port"
+engram list --unclassified
+```
+
+Repeat until the inventory is empty. Never derive `claim_key` automatically from `subject_keys`:
+the latter support retrieval and do not identify a conflict. Then restart the daemon.
 
 ## Diagnose CLI failures
 
@@ -116,6 +141,11 @@ under `local/` and are not published.
 Configure `[datacron]` with a vault plus explicit read and write paths. An empty allowlist forbids
 writes, including when the parent environment already defines `DATACRON_WRITE_PATHS`. The default
 CLI transport is `command = "datacron"` with `args = ["mcp", "serve"]`.
+`startup_timeout_ms`, `request_timeout_ms`, and `shutdown_timeout_ms` bound each subprocess
+boundary. A timeout poisons the session: the plan must never be replayed. The runtime pins
+`mcp==1.28.1`: its stdio context manager closes stdin and then terminates the process tree (Windows
+Job Object or POSIX process group) across two bounded 2 s waits. The default 5 s shutdown timeout
+covers that cleanup, and the non-daemon owner thread prevents process exit before its `finally`.
 
 The automated end-to-end gate must use an initialized disposable vault and a test-only Engram
 configuration. It must never target the durable vault. Running `consolidate --plan` against a real
@@ -137,6 +167,8 @@ For each proposition:
 
 - verify `classification`, `proposed_action`, `rel_path`, `heading`, `heading_level`, `new_content`,
   `expected_hash`, and the neighbors;
+- for `update`, inspect the before/after diff; the current action is `skip` and no existing section
+  is changed without an independently verified durable identity anchor;
 - edit only `decision`, choosing `"approve"` or `"reject"`.
 
 Do not retarget a proposition or edit any generated field. Engram compares every immutable field
@@ -152,6 +184,10 @@ uv run --python 3.14.3 engram consolidate --apply local/consolidation/plan.json
 An outcome may be `applied`, `skipped`, `stale`, or `failed`. A plan is consumed before any external
 write attempt and cannot be replayed. If any outcome is `stale` or `failed`, the report is preserved
 and the command exits with code 6. Regenerate a plan from the current note.
+A create uses one canonical path containing the candidate ID. If the write response is lost after
+creation, the next plan rereads that same path and classifies only its identical full canonical
+content (apart from line endings and the final newline) as `redundant`, instead of creating a
+duplicate.
 
 ### 4. Check freshness
 

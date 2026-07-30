@@ -5,11 +5,18 @@
 
 from __future__ import annotations
 
+import difflib
 import json
 
 from pydantic import BaseModel
 
-from .models import ApplyReport, ConsolidationPlan, FreshnessReport
+from .models import (
+    ApplyReport,
+    ConsolidationPlan,
+    FreshnessReport,
+    NeighborSection,
+    Proposition,
+)
 
 
 def model_json(model: BaseModel) -> str:
@@ -24,6 +31,11 @@ def render_plan_markdown(plan: ConsolidationPlan) -> str:
     if not plan.propositions:
         lines.extend(["Aucune memoire eligible a promouvoir.", ""])
     for proposition in plan.propositions:
+        target_selector = (
+            f"H{proposition.heading_level} {proposition.heading}"
+            if proposition.heading_level is not None
+            else f"nouvelle note {proposition.heading}"
+        )
         signal = (
             proposition.contradiction_signal.summary
             if proposition.contradiction_signal is not None
@@ -35,7 +47,7 @@ def render_plan_markdown(plan: ConsolidationPlan) -> str:
                 "",
                 f"- Classification: `{proposition.classification.value}`",
                 f"- Action: `{proposition.proposed_action.value}`",
-                f"- Cible: `{proposition.rel_path}` / `{proposition.heading}`",
+                f"- Cible: `{proposition.rel_path}` / `{target_selector}`",
                 f"- Hash CAS: `{proposition.expected_hash or 'nouvelle note'}`",
                 f"- Decision: `{proposition.decision.value}`",
                 f"- Signal Datacron: {signal}",
@@ -46,6 +58,25 @@ def render_plan_markdown(plan: ConsolidationPlan) -> str:
                 "",
             ]
         )
+        if proposition.classification.value == "update":
+            target = _review_target(proposition)
+            lines.extend(["### Diff de la cible (lecture seule)", ""])
+            if target is None:
+                lines.extend(
+                    [
+                        "Diff indisponible: la cible ne correspond pas a un voisin unique.",
+                        "",
+                    ]
+                )
+            else:
+                diff = difflib.unified_diff(
+                    target.statement.strip().splitlines(),
+                    proposition.new_content.strip().splitlines(),
+                    fromfile=f"{target.rel_path}#{target.heading}",
+                    tofile=f"candidate:{proposition.candidate_id}",
+                    lineterm="",
+                )
+                lines.extend(["```diff", *diff, "```", ""])
         if proposition.classification.value == "contradictory":
             lines.extend(["### Versions voisines", ""])
             lines.extend(
@@ -54,6 +85,27 @@ def render_plan_markdown(plan: ConsolidationPlan) -> str:
             )
             lines.append("")
     return "\n".join(lines).rstrip() + "\n"
+
+
+def _review_target(proposition: Proposition) -> NeighborSection | None:
+    """Return the unique snapshotted neighbor selected by the proposition."""
+    matches = tuple(
+        neighbor
+        for neighbor in proposition.neighbors
+        if (
+            neighbor.rel_path,
+            neighbor.heading,
+            neighbor.heading_level,
+            neighbor.content_hash,
+        )
+        == (
+            proposition.rel_path,
+            proposition.heading,
+            proposition.heading_level,
+            proposition.expected_hash,
+        )
+    )
+    return matches[0] if len(matches) == 1 else None
 
 
 def render_apply_markdown(report: ApplyReport) -> str:

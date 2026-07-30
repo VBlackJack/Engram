@@ -26,7 +26,7 @@ operational memory across clients and proposes reviewed consolidation into Datac
 | Retrieval | FTS5/BM25 by default, optional local hybrid mode behind a flag |
 | Trust | Server-side provenance, confidence cap, anti-poisoning quarantine |
 | Recall | Bounded capsule: current, next_action, relevant, conflicts, own_pending, sources |
-| Consolidation | Human plan, Datacron CAS write, reread, freshness check |
+| Consolidation | Human plan, verified Datacron create/link, reread, freshness check |
 | Evaluation | Seeded corpus and deterministic graders, without Datacron vault access |
 
 ## Installation
@@ -82,7 +82,7 @@ overridden as `ENGRAM_<SECTION>_<KEY>`; relative paths resolve from the TOML fil
 | `[server]` | `ENGRAM_SERVER_HOST`, `_PORT`, `_PATH`, `_WRITE_WAIT_TIMEOUT_MS`, `_TTL_SWEEP_INTERVAL_SECONDS` | HTTP endpoint, backpressure, and logical-expiry sweep |
 | `[capsule]` | `ENGRAM_CAPSULE_DEFAULT_TOKEN_BUDGET`, `_MIN_TOKEN_BUDGET`, `_MAX_TOKEN_BUDGET` | Recall budget |
 | `[retrieval]` | `ENGRAM_RETRIEVAL_MODE`, `_EMBEDDINGS_ENDPOINT`, `_EMBEDDINGS_MODEL`, `_EMBEDDINGS_TIMEOUT_MS`, `_RRF_K` | FTS or local hybrid |
-| `[datacron]` | `ENGRAM_DATACRON_COMMAND`, `_ARGS`, `_VAULT_ROOT`, `_READ_PATHS`, `_WRITE_PATHS`, `_NEW_NOTE_DIRECTORY`, `_NEIGHBOR_LIMIT` | Gateway and Datacron confinement |
+| `[datacron]` | `ENGRAM_DATACRON_COMMAND`, `_ARGS`, `_VAULT_ROOT`, `_READ_PATHS`, `_WRITE_PATHS`, `_NEW_NOTE_DIRECTORY`, `_NEIGHBOR_LIMIT`, `_STARTUP_TIMEOUT_MS`, `_REQUEST_TIMEOUT_MS`, `_SHUTDOWN_TIMEOUT_MS` | Gateway, timeouts, and Datacron confinement |
 
 For list variables, `ARGS` uses shell parsing and `READ_PATHS`/`WRITE_PATHS` use the OS path
 separator. Safe defaults are in [`engram.example.toml`](engram.example.toml). Datacron writes stay
@@ -93,7 +93,7 @@ disabled while `write_paths` is empty, even if the parent process defines
 
 | Tool | Essential inputs | Result and policy |
 | --- | --- | --- |
-| `remember` | `statement`, `kind`, `scope`, `subject_keys`, `observed_at`, `evidence` | Creates a `model_inferred`, `quarantined` candidate with confidence capped at `medium` |
+| `remember` | `statement`, `kind`, `scope`, `subject_keys`, `observed_at`, `evidence` | Returns `created`, `retry`, `corroborated`, `existing_trusted`, or `renewed`; new/renewed content remains quarantined |
 | `recall` | `query`, `scope`, `kinds`, `include_conflicts`, `token_budget` | Returns a trust-aware capsule; only the current client's candidates appear in `own_pending` |
 
 Accepted kinds: `preference`, `decision`, `project_state`, `fact`, `episode`. The server assigns
@@ -105,7 +105,8 @@ provenance; a client can never declare itself a `human` source.
 - No cloud LLM call or telemetry is implemented.
 - Client candidates are quarantined so an unattested assertion cannot become shared truth.
 - Hybrid mode contacts only the explicitly configured embeddings endpoint; FTS is the default.
-- Datacron writes use allowlists under `_memory/`, a CAS check, and a reread.
+- Datacron writes use allowlists under `_memory/`, one deterministic canonical path, and an exact
+  reread.
 - Do not bind to `0.0.0.0` without an authentication proxy and network controls.
 
 See the complete [security model](docs/en/security.md).
@@ -116,9 +117,12 @@ See the complete [security model](docs/en/security.md).
 engram --version
 engram --debug serve
 engram serve
+engram migrate
 engram reindex
 engram list --status quarantined
-engram attest "Reviewed statement" fact user --subject-key "topic/key"
+engram list --unclassified
+engram classify ENTRY_ID --claim-key "topic/claim"
+engram attest "Reviewed statement" fact user --subject-key "topic/key" --claim-key "topic/claim"
 engram supersede --old OLD_ID --new NEW_ID
 engram eval --mode both --out local/eval
 engram consolidate --plan --out local/consolidation/plan.json
@@ -130,11 +134,19 @@ engram consolidate --check-freshness
 Engram database. Edit only each JSON `decision` (`approve` or `reject`) before `--apply`. The plan is
 single-use: changing any other field or replaying it after apply is refused and requires a new plan.
 A diverged Datacron hash yields `stale`, preserves the report, and returns exit code 6; it is never
-forced.
-Stop the daemon before `attest`, `supersede`, `reindex`, or `consolidate`, then restart it before
-recall. These commands acquire the same OS lock as the daemon and fail clearly while it is active;
-`list` remains available through a read-only SQLite connection. Trusted commands use
-`[attestation].default_actor` unless `--actor` is provided.
+forced. Currently, an `update` result remains visible with its target and diff in the report, but
+always produces `skip`: Engram does not patch a section until Datacron supplies an independently
+verified durable identity anchor.
+Every create targets one canonical path containing the candidate ID. After an ambiguous write
+response, a new plan reconciles only identical full canonical content at that path instead of
+creating a duplicate.
+Stop the daemon before `migrate`, `classify`, `attest`, `supersede`, `reindex`, or `consolidate`,
+then restart it before recall. These commands acquire the same OS lock as the daemon and fail
+clearly while it is active; `list` remains available through a read-only SQLite connection. For an
+existing database, first take a SQLite-consistent backup, run `engram migrate`, then inventory
+`engram list --unclassified`. Review every historical preference, decision, or fact and assign its
+family explicitly with `engram classify ENTRY_ID --claim-key "topic/claim"`; never infer these keys
+in bulk. Trusted commands use `[attestation].default_actor` unless `--actor` is provided.
 
 Known CLI failures never print a traceback by default. Exit code `2` means usage or configuration,
 `3` means a local resource is unavailable (port, process lock, database, or SQLite runtime), `4`

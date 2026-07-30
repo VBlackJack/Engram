@@ -7,26 +7,94 @@ from __future__ import annotations
 
 import hashlib
 import inspect
+import json
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+from datetime import timedelta
 from pathlib import Path
 from threading import Barrier
 
 import pytest
 
 import engram.db as db_module
+from engram.cli import _list_entries
 from engram.config import AppConfig
-from engram.db import SQLiteVersionError, open_database, verify_sqlite_version
+from engram.db import DatabaseError, SQLiteVersionError, open_database, verify_sqlite_version
 from engram.models import (
     AuditAction,
     Confidence,
+    Entry,
     EntryKind,
     EntryStatus,
     PromotionState,
+    RememberOutcome,
     SourceType,
 )
+from engram.normalization import canonical_key, generation_key
+from engram.retrieval import FtsRetriever, RetrievalRequest
 from engram.store import EngramStore, StoreValidationError
+from tests.conftest import MutableClock
+
+
+def _seed_v4_trusted_entry(  # noqa: PLR0913
+    config: AppConfig,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    entry_id: str,
+    kind: EntryKind,
+    statement: str,
+    promotion_state: PromotionState = PromotionState.APPROVED,
+    stale: bool = False,
+    valid_from: str | None = None,
+) -> None:
+    migrations = db_module.MIGRATIONS
+    content_key = canonical_key(kind, "project/engram", statement)
+    promoted = promotion_state is PromotionState.PROMOTED
+    connection = sqlite3.connect(config.database.path, isolation_level=None)
+    connection.row_factory = sqlite3.Row
+    try:
+        connection.execute("PRAGMA foreign_keys = ON")
+        monkeypatch.setattr(db_module, "MIGRATIONS", migrations[:4])
+        db_module.apply_migrations(connection)
+        connection.execute(
+            """
+            INSERT INTO entries(
+                id, kind, scope, statement, subject_keys, status, promotion_state,
+                source_type, writer_model, confidence, observed_at, recorded_at,
+                valid_from, valid_until, expires_at, idempotency_key, supersedes,
+                evidence, is_stale, datacron_ref, datacron_hash, synced_at
+            ) VALUES (
+                ?, ?, 'project/engram', ?, '[]', 'active', ?, 'human', NULL,
+                'high', NULL, '2026-07-21T12:00:00.000000Z', ?, NULL, NULL, ?,
+                '[]', '[]', ?, ?, ?, ?
+            )
+            """,
+            (
+                entry_id,
+                kind.value,
+                statement,
+                promotion_state.value,
+                valid_from,
+                content_key,
+                int(stale),
+                "datacron://legacy" if promoted else None,
+                "a" * 64 if promoted else None,
+                "2026-07-21T12:00:00.000000Z" if promoted else None,
+            ),
+        )
+    finally:
+        connection.close()
+        monkeypatch.setattr(db_module, "MIGRATIONS", migrations)
+
+
+def _retrieval_request(query: str) -> RetrievalRequest:
+    return RetrievalRequest(
+        query=query,
+        scope="project/engram",
+        kinds=None,
+        writer_model="test-client",
+    )
 
 
 def test_add_candidate_owns_provenance_fields(store: EngramStore) -> None:
@@ -53,12 +121,45 @@ def test_add_candidate_owns_provenance_fields(store: EngramStore) -> None:
     assert len(entry.id) == 26
 
 
+def test_public_entry_constructor_preserves_version_four_arguments(
+    clock: MutableClock,
+) -> None:
+    legacy = Entry(
+        "01JJJJJJJJJJJJJJJJJJJJJJJJ",
+        EntryKind.EPISODE,
+        "user",
+        "Legacy public constructor.",
+        (),
+        EntryStatus.ACTIVE,
+        PromotionState.APPROVED,
+        SourceType.HUMAN,
+        None,
+        Confidence.HIGH,
+        None,
+        clock.current,
+        None,
+        None,
+        None,
+        "legacy-idempotency",
+        (),
+        (),
+        False,  # noqa: FBT003
+        None,
+        None,
+        None,
+    )
+
+    assert legacy.canonical_key == ""
+    assert legacy.claim_key is None
+
+
 def test_add_attested_restricts_trusted_provenance(store: EngramStore) -> None:
     entry = store.add_attested(
         kind="fact",
         scope="global",
         statement="The value was verified by a tool.",
         source_type=SourceType.TOOL_VERIFIED,
+        claim_key="runtime/sqlite-version",
     )
 
     assert entry.status is EntryStatus.ACTIVE
@@ -72,7 +173,42 @@ def test_add_attested_restricts_trusted_provenance(store: EngramStore) -> None:
             scope="global",
             statement="Untrusted input",
             source_type=SourceType.MODEL_INFERRED,
+            claim_key="invalid/provenance",
         )
+
+
+@pytest.mark.parametrize(
+    ("datacron_ref", "datacron_hash", "expected"),
+    [
+        (" ", "a" * 64, "datacron_ref"),
+        ("datacron://verified", "A" * 64, "datacron_hash"),
+        ("datacron://verified", "not-a-digest", "datacron_hash"),
+    ],
+)
+def test_mark_promoted_rejects_noncanonical_datacron_identity_before_writing(
+    store: EngramStore,
+    datacron_ref: str,
+    datacron_hash: str,
+    expected: str,
+) -> None:
+    entry = store.add_attested(
+        kind="fact",
+        scope="user",
+        statement="Promotion metadata is canonical.",
+        source_type=SourceType.HUMAN,
+        claim_key="promotion/metadata",
+    )
+    audit_before = store.list_audit()
+
+    with pytest.raises(StoreValidationError, match=expected):
+        store.mark_promoted(
+            entry.id,
+            datacron_ref=datacron_ref,
+            datacron_hash=datacron_hash,
+        )
+
+    assert store.get_entry(entry.id) == entry
+    assert store.list_audit() == audit_before
 
 
 def test_add_attested_promotes_matching_candidate_in_place(store: EngramStore) -> None:
@@ -91,6 +227,7 @@ def test_add_attested_promotes_matching_candidate_in_place(store: EngramStore) -
         statement=" the local endpoint is VERIFIED. ",
         source_type=SourceType.HUMAN,
         confidence=Confidence.HIGH,
+        claim_key="endpoint/local",
     )
 
     assert attested.id == candidate.id
@@ -132,7 +269,10 @@ def test_database_uses_wal_and_numbered_migration(
             str(row[0])
             for row in connection.execute(
                 "SELECT name FROM sqlite_schema "
-                "WHERE name IN ('entries_fts', 'entry_vectors', 'consolidation_plans')"
+                "WHERE name IN ("
+                "'entries_fts', 'entry_vectors', 'consolidation_plans', "
+                "'entry_observations', 'entry_supersessions'"
+                ")"
             ).fetchall()
         }
     finally:
@@ -145,49 +285,226 @@ def test_database_uses_wal_and_numbered_migration(
     assert foreign_keys is not None
     assert foreign_keys[0] == 1
     assert schema_version is not None
-    assert schema_version[0] == 4
-    assert schema_tables == {"entries_fts", "entry_vectors", "consolidation_plans"}
+    assert schema_version[0] == 5
+    assert schema_tables == {
+        "entries_fts",
+        "entry_vectors",
+        "consolidation_plans",
+        "entry_observations",
+        "entry_supersessions",
+    }
 
 
-def test_migration_four_preserves_existing_version_three_entries(
+def test_migration_five_preserves_existing_version_four_entries(
     app_config: AppConfig,
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    database_path = tmp_path / "version-three.db"
+    database_path = tmp_path / "version-four.db"
     config = replace(
         app_config,
         database=replace(app_config.database, path=database_path),
     )
-    with EngramStore(config) as initial:
-        entry = initial.add_attested(
-            kind=EntryKind.FACT,
-            scope="project/engram",
-            statement="Migration four preserves existing entries.",
-            source_type=SourceType.HUMAN,
-        )
-    connection = sqlite3.connect(database_path)
+    legacy_canonical = canonical_key(
+        EntryKind.FACT,
+        "project/engram",
+        "Migration five preserves existing entries.",
+    )
+    migrations = db_module.MIGRATIONS
+    connection = sqlite3.connect(database_path, isolation_level=None)
+    connection.row_factory = sqlite3.Row
     try:
-        connection.execute("DROP INDEX consolidation_plans_consumed_idx")
-        connection.execute("DROP TABLE consolidation_plans")
-        connection.execute("UPDATE schema_version SET version = 3")
-        connection.commit()
+        connection.execute("PRAGMA foreign_keys = ON")
+        monkeypatch.setattr(db_module, "MIGRATIONS", migrations[:4])
+        db_module.apply_migrations(connection)
+        connection.execute(
+            """
+            INSERT INTO entries(
+                id, kind, scope, statement, subject_keys, status, promotion_state,
+                source_type, writer_model, confidence, observed_at, recorded_at,
+                valid_from, valid_until, expires_at, idempotency_key, supersedes,
+                evidence, is_stale, datacron_ref, datacron_hash, synced_at
+            ) VALUES (
+                '01AAAAAAAAAAAAAAAAAAAAAAAA', 'fact', 'project/engram',
+                'Migration five preserves existing entries.', '[]', 'active',
+                'approved', 'human', NULL, 'high', NULL,
+                '2026-07-21T12:00:00.000000Z', NULL, NULL, NULL, ?, '[]', '[]',
+                0, NULL, NULL, NULL
+            )
+            """,
+            (legacy_canonical,),
+        )
     finally:
         connection.close()
+        monkeypatch.setattr(db_module, "MIGRATIONS", migrations)
 
     with EngramStore(config) as upgraded:
-        preserved = upgraded.get_entry(entry.id)
+        preserved = upgraded.get_entry("01AAAAAAAAAAAAAAAAAAAAAAAA")
         assert preserved is not None
-        assert preserved.statement == entry.statement
-        assert upgraded.get_consolidation_plan("01AAAAAAAAAAAAAAAAAAAAAAAA") is None
+        assert preserved.statement == "Migration five preserves existing entries."
+        assert preserved.canonical_key == legacy_canonical
+        assert preserved.claim_key is None
+        classified = upgraded.add_attested(
+            kind="fact",
+            scope="project/engram",
+            statement="Migration five preserves existing entries.",
+            source_type=SourceType.HUMAN,
+            claim_key="migration/preservation",
+        )
+        assert classified.id == preserved.id
+        assert classified.claim_key == "migration/preservation"
 
     connection = sqlite3.connect(database_path)
     try:
         version = connection.execute("SELECT version FROM schema_version").fetchone()
-        plan_count = connection.execute("SELECT count(*) FROM consolidation_plans").fetchone()
+        observations = connection.execute("SELECT count(*) FROM entry_observations").fetchone()
     finally:
         connection.close()
-    assert version == (4,)
-    assert plan_count == (0,)
+    assert version == (5,)
+    assert observations == (0,)
+
+
+@pytest.mark.parametrize("mode", ["stale", "future"])
+def test_legacy_unclassified_inventory_and_explicit_classification(  # noqa: PLR0913
+    app_config: AppConfig,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    clock: MutableClock,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+    mode: str,
+) -> None:
+    database_path = tmp_path / f"legacy-{mode}.db"
+    config = replace(
+        app_config,
+        database=replace(app_config.database, path=database_path),
+    )
+    entry_id = "01EEEEEEEEEEEEEEEEEEEEEEEE"
+    statement = f"The legacy {mode} setting is retained."
+    _seed_v4_trusted_entry(
+        config,
+        monkeypatch,
+        entry_id=entry_id,
+        kind=EntryKind.FACT,
+        statement=statement,
+        promotion_state=(PromotionState.PROMOTED if mode == "stale" else PromotionState.APPROVED),
+        stale=mode == "stale",
+        valid_from="2026-07-22" if mode == "future" else None,
+    )
+
+    with caplog.at_level("WARNING"), EngramStore(config, clock=clock) as upgraded:
+        assert "list --unclassified" in caplog.text
+        _list_entries(config=config, unclassified=True)
+        inventory = json.loads(capsys.readouterr().out)
+        assert [item["id"] for item in inventory] == [entry_id]
+
+        classified = upgraded.classify_claim(
+            entry_id,
+            "legacy/setting",
+            actor="migration-reviewer",
+        )
+        assert classified.claim_key == "legacy/setting"
+        assert classified.stale is (mode == "stale")
+        assert classified.valid_from is not None if mode == "future" else True
+        assert upgraded.list_audit()[-1].action is AuditAction.CLASSIFY
+
+        retriever = FtsRetriever(upgraded)
+        assert retriever.retrieve(_retrieval_request(statement)).matches == ()
+        if mode == "stale":
+            upgraded.set_stale(entry_id, stale=False)
+        else:
+            clock.current += timedelta(days=1)
+        assert [item.id for item in retriever.retrieve(_retrieval_request(statement)).matches] == [
+            entry_id
+        ]
+
+
+def test_migration_backfills_project_state_claim_for_recall_and_supersession(
+    app_config: AppConfig,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    clock: MutableClock,
+) -> None:
+    database_path = tmp_path / "legacy-project-state.db"
+    config = replace(
+        app_config,
+        database=replace(app_config.database, path=database_path),
+    )
+    entry_id = "01FFFFFFFFFFFFFFFFFFFFFFFF"
+    statement = "The legacy project state is active."
+    _seed_v4_trusted_entry(
+        config,
+        monkeypatch,
+        entry_id=entry_id,
+        kind=EntryKind.PROJECT_STATE,
+        statement=statement,
+    )
+
+    with EngramStore(config, clock=clock) as upgraded:
+        legacy = upgraded.get_entry(entry_id)
+        assert legacy is not None
+        assert legacy.claim_key == "project_state/current"
+        recalled = FtsRetriever(upgraded).retrieve(_retrieval_request(statement))
+        assert [entry.id for entry in recalled.next_actions] == [entry_id]
+
+        promoted = upgraded.mark_promoted(
+            entry_id,
+            datacron_ref="datacron://project-state",
+            datacron_hash="b" * 64,
+        )
+        assert promoted.promotion_state is PromotionState.PROMOTED
+        replacement = upgraded.add_attested(
+            kind="project_state",
+            scope="project/engram",
+            statement="The migrated project state is complete.",
+            source_type=SourceType.HUMAN,
+            supersedes=(entry_id,),
+        )
+        retired = upgraded.get_entry(entry_id)
+        assert retired is not None
+        assert retired.status is EntryStatus.SUPERSEDED
+        assert replacement.supersedes == (entry_id,)
+
+
+def test_legacy_supersession_classifies_old_entry_atomically(
+    app_config: AppConfig,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    clock: MutableClock,
+) -> None:
+    database_path = tmp_path / "legacy-supersession.db"
+    config = replace(
+        app_config,
+        database=replace(app_config.database, path=database_path),
+    )
+    old_id = "01GGGGGGGGGGGGGGGGGGGGGGGG"
+    _seed_v4_trusted_entry(
+        config,
+        monkeypatch,
+        entry_id=old_id,
+        kind=EntryKind.FACT,
+        statement="The legacy release is pending.",
+    )
+
+    with EngramStore(config, clock=clock) as upgraded:
+        replacement = upgraded.add_attested(
+            kind="fact",
+            scope="project/engram",
+            statement="The legacy release is complete.",
+            source_type=SourceType.HUMAN,
+            claim_key="release/state",
+            supersedes=(old_id,),
+        )
+        retired = upgraded.get_entry(old_id)
+        assert retired is not None
+        assert retired.claim_key == "release/state"
+        assert retired.status is EntryStatus.SUPERSEDED
+        assert replacement.supersedes == (old_id,)
+        assert [record.action for record in upgraded.list_audit()] == [
+            AuditAction.ATTEST,
+            AuditAction.CLASSIFY,
+            AuditAction.SUPERSEDE,
+        ]
 
 
 def test_migration_transaction_rolls_back_schema_and_version(
@@ -218,6 +535,400 @@ def test_migration_transaction_rolls_back_schema_and_version(
     assert probe == (0,)
 
 
+def test_migration_five_rejects_invalid_v4_lifecycle_without_advancing(
+    app_config: AppConfig,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_path = tmp_path / "invalid-version-four.db"
+    config = replace(
+        app_config,
+        database=replace(app_config.database, path=database_path),
+    )
+    migrations = db_module.MIGRATIONS
+    connection = sqlite3.connect(database_path, isolation_level=None)
+    connection.row_factory = sqlite3.Row
+    try:
+        connection.execute("PRAGMA foreign_keys = ON")
+        monkeypatch.setattr(db_module, "MIGRATIONS", migrations[:4])
+        db_module.apply_migrations(connection)
+        connection.execute(
+            """
+            INSERT INTO entries(
+                id, kind, scope, statement, subject_keys, status, promotion_state,
+                source_type, writer_model, confidence, observed_at, recorded_at,
+                valid_from, valid_until, expires_at, idempotency_key, supersedes,
+                evidence, is_stale, datacron_ref, datacron_hash, synced_at
+            ) VALUES (
+                '01AAAAAAAAAAAAAAAAAAAAAAAA', 'fact', 'user', 'Invalid trusted state.',
+                '[]', 'active', 'candidate', 'model_inferred', 'model-a', 'medium',
+                NULL, '2026-07-21T12:00:00.000000Z', NULL, NULL, NULL, ?, '[]',
+                '[]', 0, NULL, NULL, NULL
+            )
+            """,
+            ("b" * 64,),
+        )
+    finally:
+        connection.close()
+        monkeypatch.setattr(db_module, "MIGRATIONS", migrations)
+
+    with pytest.raises(DatabaseError, match="invalid lifecycle"):
+        EngramStore(config)
+
+    connection = sqlite3.connect(database_path)
+    try:
+        version = connection.execute("SELECT version FROM schema_version").fetchone()
+        canonical_column = connection.execute(
+            "SELECT 1 FROM pragma_table_info('entries') WHERE name = 'canonical_key'"
+        ).fetchone()
+    finally:
+        connection.close()
+    assert version == (4,)
+    assert canonical_column is None
+
+
+def test_database_triggers_reject_illegal_lifecycle_and_claim_links(
+    store: EngramStore,
+    app_config: AppConfig,
+) -> None:
+    candidate = store.add_candidate(
+        kind="fact",
+        scope="user",
+        statement="Candidate must stay quarantined.",
+        writer_model="model-a",
+    )
+    old = store.add_attested(
+        kind="fact",
+        scope="user",
+        statement="Storage uses one engine.",
+        source_type=SourceType.HUMAN,
+        claim_key="storage/engine",
+    )
+    wrong_claim = store.add_attested(
+        kind="fact",
+        scope="user",
+        statement="Storage uses another engine.",
+        source_type=SourceType.HUMAN,
+        claim_key="storage/other",
+    )
+    connection = sqlite3.connect(app_config.database.path)
+    connection.execute("PRAGMA foreign_keys = ON")
+    try:
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "UPDATE entries SET status = 'active' WHERE id = ?",
+                (candidate.id,),
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="transition"):
+            connection.execute(
+                "UPDATE entries SET status = 'superseded' WHERE id = ?",
+                (old.id,),
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="claim_key"):
+            connection.execute(
+                """
+                INSERT INTO entry_supersessions(
+                    old_entry_id, new_entry_id, recorded_at, actor
+                ) VALUES (?, ?, '2026-07-21T12:00:00.000000Z', 'sql-test')
+                """,
+                (old.id, wrong_claim.id),
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="identical canonical"):
+            connection.execute(
+                """
+                INSERT INTO entry_supersessions(
+                    old_entry_id, new_entry_id, recorded_at, actor
+                ) VALUES (?, ?, '2026-07-21T12:00:00.000000Z', 'sql-test')
+                """,
+                (candidate.id, wrong_claim.id),
+            )
+    finally:
+        connection.close()
+
+    stored_candidate = store.get_entry(candidate.id)
+    stored_old = store.get_entry(old.id)
+    assert stored_candidate is not None
+    assert stored_candidate.status is EntryStatus.QUARANTINED
+    assert stored_old is not None
+    assert stored_old.status is EntryStatus.ACTIVE
+
+
+@pytest.mark.parametrize(
+    ("object_type", "name", "expected"),
+    [
+        ("TRIGGER", "entries_lifecycle_insert", "required trigger"),
+        ("INDEX", "entries_live_trusted_canonical_idx", "required partial index"),
+    ],
+)
+def test_reopen_rejects_missing_critical_schema_objects(
+    store: EngramStore,
+    app_config: AppConfig,
+    object_type: str,
+    name: str,
+    expected: str,
+) -> None:
+    del store
+    connection = sqlite3.connect(app_config.database.path)
+    try:
+        connection.execute(f'DROP {object_type} "{name}"')
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(DatabaseError, match=expected):
+        EngramStore(app_config)
+
+
+@pytest.mark.parametrize(
+    ("drop_sql", "create_sql", "expected"),
+    [
+        (
+            "DROP TRIGGER entries_lifecycle_insert",
+            """
+            CREATE TRIGGER entries_lifecycle_insert
+            BEFORE INSERT ON entries
+            BEGIN
+                SELECT 1;
+            END
+            """,
+            "trigger definition is invalid",
+        ),
+        (
+            "DROP INDEX entries_live_trusted_canonical_idx",
+            """
+            CREATE UNIQUE INDEX entries_live_trusted_canonical_idx
+            ON entries(canonical_key)
+            WHERE status = 'active' AND kind = 'fact'
+            """,
+            "partial index definition is invalid",
+        ),
+    ],
+)
+def test_reopen_rejects_same_name_schema_definition_drift(
+    store: EngramStore,
+    app_config: AppConfig,
+    drop_sql: str,
+    create_sql: str,
+    expected: str,
+) -> None:
+    del store
+    connection = sqlite3.connect(app_config.database.path)
+    try:
+        connection.execute(drop_sql)
+        connection.execute(create_sql)
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(DatabaseError, match=expected):
+        EngramStore(app_config)
+
+
+@pytest.mark.parametrize(
+    ("corruption", "expected"),
+    [
+        ("canonical", "canonical_key"),
+        ("scope", "scope"),
+        ("statement", "statement"),
+        ("subject_keys", "subject_keys"),
+        ("claim_key", "claim_key"),
+        ("idempotency", "idempotency_key"),
+    ],
+)
+def test_reopen_rejects_direct_sql_content_corruption(
+    store: EngramStore,
+    app_config: AppConfig,
+    corruption: str,
+    expected: str,
+) -> None:
+    del store
+    scope = "USER" if corruption == "scope" else "user"
+    statement = (
+        "Direct   SQL statement is malformed."
+        if corruption == "statement"
+        else "Direct SQL content must remain normalized."
+    )
+    subject_keys = '["Runtime","runtime"]' if corruption == "subject_keys" else "[]"
+    claim_key = " Editor/Theme " if corruption == "claim_key" else "editor/theme"
+    computed_canonical = canonical_key(EntryKind.FACT, scope, statement)
+    stored_canonical = "f" * 64 if corruption == "canonical" else computed_canonical
+    stored_idempotency = (
+        "d" * 64
+        if corruption == "idempotency"
+        else generation_key(
+            canonical_key=stored_canonical,
+            entry_id="01CCCCCCCCCCCCCCCCCCCCCCCC",
+        )
+    )
+    connection = sqlite3.connect(app_config.database.path)
+    connection.execute("PRAGMA foreign_keys = ON")
+    try:
+        connection.execute(
+            """
+            INSERT INTO entries(
+                id, kind, scope, statement, subject_keys, status, promotion_state,
+                source_type, writer_model, confidence, observed_at, recorded_at,
+                valid_from, valid_until, expires_at, idempotency_key, supersedes,
+                evidence, is_stale, datacron_ref, datacron_hash, synced_at,
+                canonical_key, claim_key
+            ) VALUES (
+                '01CCCCCCCCCCCCCCCCCCCCCCCC', 'fact', ?, ?, ?, 'active',
+                'approved', 'human', NULL, 'high', NULL,
+                '2026-07-21T12:00:00.000000Z', NULL, NULL, NULL, ?, '[]', '[]',
+                0, NULL, NULL, NULL, ?, ?
+            )
+            """,
+            (
+                scope,
+                statement,
+                subject_keys,
+                stored_idempotency,
+                stored_canonical,
+                claim_key,
+            ),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(DatabaseError, match=expected):
+        EngramStore(app_config)
+
+
+def test_reopen_rejects_live_candidate_without_owner_observation(
+    store: EngramStore,
+    app_config: AppConfig,
+) -> None:
+    candidate = store.add_candidate(
+        kind="fact",
+        scope="user",
+        statement="A live candidate retains its owner observation.",
+        writer_model="model-a",
+    )
+    connection = sqlite3.connect(app_config.database.path)
+    try:
+        connection.execute(
+            "DELETE FROM entry_observations WHERE entry_id = ?",
+            (candidate.id,),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(DatabaseError, match="no retained owner observation"):
+        EngramStore(app_config)
+
+
+@pytest.mark.parametrize(
+    ("column", "value", "expected"),
+    [
+        ("claim_hash", "z" * 64, "claim_hash"),
+        ("subject_keys", '[" Runtime "]', "subject_keys"),
+        ("recorded_at", "2026-07-21T12:00:00", "recorded_at"),
+    ],
+)
+def test_reopen_rejects_corrupt_observation_content(
+    store: EngramStore,
+    app_config: AppConfig,
+    column: str,
+    value: str,
+    expected: str,
+) -> None:
+    candidate = store.add_candidate(
+        kind="fact",
+        scope="user",
+        statement="Observation metadata remains canonical.",
+        writer_model="model-a",
+    )
+    connection = sqlite3.connect(app_config.database.path)
+    try:
+        connection.execute(
+            f'UPDATE entry_observations SET "{column}" = ? WHERE entry_id = ?',  # noqa: S608
+            (value, candidate.id),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(DatabaseError, match=expected):
+        EngramStore(app_config)
+
+
+@pytest.mark.parametrize(
+    ("column", "value", "expected"),
+    [
+        ("subject_keys", "not-json", "subject_keys"),
+        ("evidence", '[{"type":"unknown","ref":"tool://bad"}]', "evidence"),
+        ("recorded_at", "2026-07-21T12:00:00", "recorded_at"),
+        ("valid_from", "2026-99-99", "valid_from"),
+        ("scope", "USER", "scope"),
+        ("statement", "Legacy   spacing is invalid.", "statement"),
+        ("is_stale", "broken", "is_stale"),
+    ],
+)
+def test_migration_five_rejects_malformed_v4_content_atomically(  # noqa: PLR0913
+    app_config: AppConfig,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    column: str,
+    value: str,
+    expected: str,
+) -> None:
+    database_path = tmp_path / f"invalid-v4-{column}.db"
+    config = replace(
+        app_config,
+        database=replace(app_config.database, path=database_path),
+    )
+    migrations = db_module.MIGRATIONS
+    statement = "Legacy normalized content."
+    legacy_canonical = canonical_key(EntryKind.FACT, "user", statement)
+    connection = sqlite3.connect(database_path, isolation_level=None)
+    connection.row_factory = sqlite3.Row
+    try:
+        connection.execute("PRAGMA foreign_keys = ON")
+        monkeypatch.setattr(db_module, "MIGRATIONS", migrations[:4])
+        db_module.apply_migrations(connection)
+        connection.execute(
+            """
+            INSERT INTO entries(
+                id, kind, scope, statement, subject_keys, status, promotion_state,
+                source_type, writer_model, confidence, observed_at, recorded_at,
+                valid_from, valid_until, expires_at, idempotency_key, supersedes,
+                evidence, is_stale, datacron_ref, datacron_hash, synced_at
+            ) VALUES (
+                '01DDDDDDDDDDDDDDDDDDDDDDDD', 'fact', 'user', ?, '[]',
+                'active', 'approved', 'human', NULL, 'high', NULL,
+                '2026-07-21T12:00:00.000000Z', NULL, NULL, NULL, ?, '[]', '[]',
+                0, NULL, NULL, NULL
+            )
+            """,
+            (statement, legacy_canonical),
+        )
+        if column == "is_stale":
+            connection.execute("PRAGMA ignore_check_constraints = ON")
+        connection.execute(
+            f'UPDATE entries SET "{column}" = ? WHERE id = ?',  # noqa: S608
+            (value, "01DDDDDDDDDDDDDDDDDDDDDDDD"),
+        )
+    finally:
+        connection.close()
+        monkeypatch.setattr(db_module, "MIGRATIONS", migrations)
+
+    with pytest.raises(DatabaseError, match=rf"{expected}.*01D|01D.*{expected}"):
+        EngramStore(config)
+
+    connection = sqlite3.connect(database_path)
+    try:
+        version = connection.execute("SELECT version FROM schema_version").fetchone()
+        canonical_column = connection.execute(
+            "SELECT 1 FROM pragma_table_info('entries') WHERE name = 'canonical_key'"
+        ).fetchone()
+    finally:
+        connection.close()
+    assert version == (4,)
+    assert canonical_column is None
+
+
 def test_concurrent_writes_are_serialized_without_loss(store: EngramStore) -> None:
     entry_count = 48
 
@@ -234,6 +945,138 @@ def test_concurrent_writes_are_serialized_without_loss(store: EngramStore) -> No
 
     assert len(set(identifiers)) == entry_count
     assert store.count_entries() == entry_count
+
+
+def test_independent_stores_share_one_retry_identity(
+    app_config: AppConfig,
+    clock: MutableClock,
+) -> None:
+    with EngramStore(app_config, clock=clock):
+        pass
+    stores = [EngramStore(app_config, clock=clock) for _ in range(12)]
+    barrier = Barrier(len(stores))
+
+    def remember(instance: EngramStore) -> tuple[str, RememberOutcome]:
+        barrier.wait()
+        result = instance.add_candidate(
+            kind="fact",
+            scope="project/engram",
+            statement="All clients observe one canonical retry generation.",
+            writer_model="shared-client",
+            include_outcome=True,
+        )
+        return result.entry.id, result.outcome
+
+    try:
+        with ThreadPoolExecutor(max_workers=len(stores)) as executor:
+            outcomes = tuple(executor.map(remember, stores))
+    finally:
+        for instance in stores:
+            instance.close()
+
+    assert len({entry_id for entry_id, _ in outcomes}) == 1
+    assert sum(outcome is RememberOutcome.CREATED for _, outcome in outcomes) == 1
+    assert sum(outcome is RememberOutcome.RETRY for _, outcome in outcomes) == 11
+
+
+def test_concurrent_replacements_leave_one_commit_and_no_orphan(
+    store: EngramStore,
+    app_config: AppConfig,
+    clock: MutableClock,
+) -> None:
+    old = store.add_attested(
+        kind="fact",
+        scope="project/engram",
+        statement="The release is pending.",
+        source_type=SourceType.HUMAN,
+        claim_key="release/state",
+    )
+    first = EngramStore(app_config, clock=clock)
+    second = EngramStore(app_config, clock=clock)
+    barrier = Barrier(2)
+
+    def replace(item: tuple[EngramStore, str]) -> str:
+        instance, statement = item
+        barrier.wait()
+        try:
+            entry = instance.add_attested(
+                kind="fact",
+                scope="project/engram",
+                statement=statement,
+                source_type=SourceType.HUMAN,
+                claim_key="release/state",
+                supersedes=(old.id,),
+            )
+        except StoreValidationError as exc:
+            return f"error:{exc}"
+        return f"committed:{entry.id}"
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            outcomes = tuple(
+                executor.map(
+                    replace,
+                    (
+                        (first, "The release is complete."),
+                        (second, "The release was cancelled."),
+                    ),
+                )
+            )
+    finally:
+        first.close()
+        second.close()
+
+    assert sum(outcome.startswith("committed:") for outcome in outcomes) == 1
+    assert sum("different replacement" in outcome for outcome in outcomes) == 1
+    assert store.count_entries() == 2
+    stored_old = store.get_entry(old.id)
+    assert stored_old is not None
+    assert stored_old.status is EntryStatus.SUPERSEDED
+    assert [record.action for record in store.list_audit()] == [
+        AuditAction.ATTEST,
+        AuditAction.ATTEST,
+        AuditAction.SUPERSEDE,
+    ]
+
+
+def test_supersession_chain_expires_and_purges_without_dangling_links(
+    store: EngramStore,
+    app_config: AppConfig,
+    clock: MutableClock,
+) -> None:
+    first = store.add_attested(
+        kind="project_state",
+        scope="project/engram",
+        statement="The reliability work is planned.",
+        source_type=SourceType.HUMAN,
+    )
+    second = store.add_attested(
+        kind="project_state",
+        scope="project/engram",
+        statement="The reliability work is active.",
+        source_type=SourceType.HUMAN,
+        supersedes=(first.id,),
+    )
+    third = store.add_attested(
+        kind="project_state",
+        scope="project/engram",
+        statement="The reliability work is complete.",
+        source_type=SourceType.HUMAN,
+        supersedes=(second.id,),
+    )
+    assert third.expires_at is not None
+    clock.current = third.expires_at + timedelta(microseconds=1)
+
+    assert store.expire_due() == 3
+    assert store.purge_expired(clock.current) == 3
+    assert store.count_entries() == 0
+
+    connection = sqlite3.connect(app_config.database.path)
+    try:
+        relation_count = connection.execute("SELECT COUNT(*) FROM entry_supersessions").fetchone()
+    finally:
+        connection.close()
+    assert relation_count == (0,)
 
 
 def test_consolidation_plan_snapshot_is_persisted_and_consumed_once(

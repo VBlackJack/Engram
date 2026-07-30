@@ -50,4 +50,10 @@ vault_root = ""
 read_paths = []
 write_paths = []
 new_note_directory = "_memory/engram"
+# Accepted range: 1..64. Search also caps single-term query variants at 8.
 neighbor_limit = 8
+# Operation wait budgets. Keep the default 5000 ms shutdown budget for the pinned MCP stdio
+# process-tree cleanup unless the transport guarantee is revalidated.
+startup_timeout_ms = 10000
+request_timeout_ms = 30000
+shutdown_timeout_ms = 5000

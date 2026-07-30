@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from engram.models import Entry
+from engram.models import Entry, EntryKind
 from engram.store import EngramStore
 from evalsets.engram_corpus import (
     DEGRADED_RECALL_TASKS,
@@ -41,6 +41,16 @@ def seed_corpus(store: EngramStore) -> SeededCorpus:
                 source_type=seed.source_type,
                 subject_keys=seed.subject_keys,
                 actor="eval-seed",
+                claim_key=(
+                    seed.subject_keys[0]
+                    if seed.kind
+                    in {
+                        EntryKind.PREFERENCE,
+                        EntryKind.DECISION,
+                        EntryKind.FACT,
+                    }
+                    else None
+                ),
             )
         else:
             entry = store.add_candidate(

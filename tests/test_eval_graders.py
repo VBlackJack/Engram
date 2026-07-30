@@ -66,7 +66,11 @@ def test_conflict_grader_has_manual_pass_and_fail_cases() -> None:
     expected = frozenset({"left-id", "right-id"})
     shown = _capsule(
         conflicts=[
-            ConflictItem(subject_keys=["theme"], versions=[_item("left-id"), _item("right-id")])
+            ConflictItem(
+                claim_key="theme/current",
+                subject_keys=["theme"],
+                versions=[_item("left-id"), _item("right-id")],
+            )
         ]
     )
 

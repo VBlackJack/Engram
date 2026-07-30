@@ -14,7 +14,8 @@ from engram.config import DatacronConfig
 from engram.eval.consolidation import propose_consolidation
 from engram.eval.models import ConsolidationClass, ConsolidationStatement
 from engram.models import Entry, EntryStatus, PromotionState, SourceType
-from engram.store import EngramStore, StoreValidationError
+from engram.normalization import StoreValidationError
+from engram.store import EngramStore
 
 from .gateway import DatacronConflictError, DatacronGateway, DatacronGatewayError
 from .models import (
@@ -28,11 +29,13 @@ from .models import (
     FreshnessOutcome,
     FreshnessReport,
     NeighborSection,
+    NoteView,
     Proposition,
     ReviewDecision,
 )
 
 SLUG_PATTERN = re.compile(r"[^a-z0-9]+")
+MAX_NEW_NOTE_SLUG_CHARS = 64
 
 
 class ConsolidationService:
@@ -168,11 +171,34 @@ class ConsolidationService:
         entry: Entry,
         signal: ContradictionSignal | None,
     ) -> Proposition:
+        canonical_path = self._new_path(entry)
+        canonical_note = self._gateway.get_note(canonical_path)
+        if canonical_note is not None:
+            neighbor = _canonical_neighbor(entry, canonical_note, canonical_path)
+            canonical_neighbors = (neighbor,)
+            classification = (
+                ConsolidationClass.REDUNDANT
+                if _canonical_note_matches(entry, canonical_note)
+                else ConsolidationClass.UPDATE
+            )
+            return Proposition(
+                candidate_id=entry.id,
+                classification=classification,
+                proposed_action=_action_for(classification),
+                rel_path=canonical_path,
+                heading=neighbor.heading,
+                heading_level=neighbor.heading_level,
+                new_content=_render_section(entry),
+                expected_hash=canonical_note.content_hash,
+                neighbors=canonical_neighbors,
+                contradiction_signal=signal,
+            )
         neighbors = tuple(
             sorted(
                 self._gateway.search_neighbors(
                     entry.subject_keys,
                     entry.scope,
+                    entry.statement,
                     self._config.neighbor_limit,
                 ),
                 key=lambda item: (
@@ -197,13 +223,13 @@ class ConsolidationService:
             )
             for neighbor in neighbors
         )
-        classification = propose_consolidation((candidate,), durable)[0].classification
+        classification = _classify_candidate(candidate, durable, has_neighbors=bool(neighbors))
         action = _action_for(classification)
         heading = _candidate_heading(entry)
         heading_level: int | None = None
         expected_hash: str | None = None
         if classification is ConsolidationClass.NEW:
-            rel_path = self._available_new_path(entry)
+            rel_path = canonical_path
             content = _render_new_note(heading, entry)
         else:
             target = _target_neighbor(
@@ -229,17 +255,12 @@ class ConsolidationService:
             contradiction_signal=signal,
         )
 
-    def _available_new_path(self, entry: Entry) -> str:
-        primary, fallback = self._new_paths(entry)
-        if self._gateway.get_note(primary) is None:
-            return primary
-        return fallback
-
-    def _new_paths(self, entry: Entry) -> tuple[str, str]:
+    def _new_path(self, entry: Entry) -> str:
+        """Return the sole deterministic create target for one candidate."""
         directory = self._config.new_note_directory.rstrip("/")
         slug = _slug(entry.subject_keys[0] if entry.subject_keys else entry.id)
-        primary = f"{directory}/{slug}.md"
-        return primary, f"{directory}/{slug}-{entry.id.casefold()}.md"
+        slug = slug[:MAX_NEW_NOTE_SLUG_CHARS].rstrip("-") or "memory"
+        return f"{directory}/{slug}-{entry.id.casefold()}.md"
 
     def _apply_approved(  # noqa: PLR0911
         self,
@@ -269,7 +290,7 @@ class ConsolidationService:
             _validate_current_plan(
                 proposition,
                 current,
-                allowed_new_paths=self._new_paths(entry),
+                allowed_new_path=self._new_path(entry),
             )
             _validate_candidate_semantics(proposition, entry)
             proposition = proposition.model_copy(
@@ -280,6 +301,12 @@ class ConsolidationService:
                     proposition,
                     ApplyStatus.SKIPPED,
                     "contradiction requires a separate human resolution",
+                )
+            if proposition.classification is ConsolidationClass.UPDATE:
+                return _outcome(
+                    proposition,
+                    ApplyStatus.SKIPPED,
+                    "update requires an independently verified durable target anchor",
                 )
             if proposition.classification is ConsolidationClass.REDUNDANT:
                 return self._promote_redundant(proposition, entry)
@@ -460,8 +487,6 @@ def _is_promotable(entry: Entry) -> bool:
 def _action_for(classification: ConsolidationClass) -> ConsolidationAction:
     if classification is ConsolidationClass.NEW:
         return ConsolidationAction.CREATE_NOTE
-    if classification is ConsolidationClass.UPDATE:
-        return ConsolidationAction.PATCH_SECTION
     return ConsolidationAction.SKIP
 
 
@@ -509,6 +534,38 @@ def _render_new_note(heading: str, entry: Entry) -> str:
     return f"# {heading}\n\n{_render_section(entry)}\n"
 
 
+def _canonical_note_matches(entry: Entry, note: NoteView) -> bool:
+    """Recognize only the exact canonical bytes of a prior ambiguous create."""
+    expected = _render_new_note(_candidate_heading(entry), entry)
+    return _canonical_note_content(note.content) == _canonical_note_content(expected)
+
+
+def _canonical_neighbor(entry: Entry, note: NoteView, rel_path: str) -> NeighborSection:
+    """Represent the stable candidate-owned path as review evidence."""
+    heading_match = re.search(r"^(#{1,6})\s+(.+?)\s*$", note.content, flags=re.MULTILINE)
+    heading = (
+        heading_match.group(2).strip() if heading_match is not None else _candidate_heading(entry)
+    )
+    heading_level = len(heading_match.group(1)) if heading_match is not None else 1
+    statement = entry.statement if _canonical_note_matches(entry, note) else note.content
+    return NeighborSection(
+        rel_path=rel_path,
+        heading=heading,
+        statement=statement,
+        subject_keys=(),
+        content_hash=note.content_hash,
+        heading_level=heading_level,
+        search_rank=0,
+        excerpt=statement,
+    )
+
+
+def _canonical_note_content(content: str) -> str:
+    """Normalize only line endings and the presence of the final newline."""
+    normalized = content.replace("\r\n", "\n").replace("\r", "\n")
+    return normalized.removesuffix("\n")
+
+
 def _canonical_content(proposition: Proposition, entry: Entry) -> str:
     if proposition.proposed_action is ConsolidationAction.CREATE_NOTE:
         return _render_new_note(proposition.heading, entry)
@@ -547,23 +604,16 @@ def _validate_current_plan(
     reviewed: Proposition,
     current: Proposition,
     *,
-    allowed_new_paths: tuple[str, str],
+    allowed_new_path: str,
 ) -> None:
-    immutable_fields = (
-        "candidate_id",
-        "classification",
-        "proposed_action",
-    )
-    if any(getattr(reviewed, field) != getattr(current, field) for field in immutable_fields):
+    if reviewed.candidate_id != current.candidate_id:
         raise ValueError("reviewed proposition no longer matches the current deterministic plan")
     if reviewed.classification is ConsolidationClass.NEW:
-        if reviewed.expected_hash is not None or reviewed.heading_level is not None:
-            raise ValueError("new-note target must not include an existing section selector")
-        if reviewed.heading != current.heading or reviewed.rel_path not in allowed_new_paths:
-            raise ValueError("reviewed new-note target does not match the current plan")
-        if reviewed.rel_path != current.rel_path:
-            raise DatacronConflictError("create target changed; generate a new plan")
+        _validate_current_new_plan(reviewed, current, allowed_new_path)
         return
+    immutable_fields = ("classification", "proposed_action")
+    if any(getattr(reviewed, field) != getattr(current, field) for field in immutable_fields):
+        raise ValueError("reviewed proposition no longer matches the current deterministic plan")
     if reviewed.classification is ConsolidationClass.REDUNDANT:
         allowed = tuple(
             item
@@ -601,6 +651,24 @@ def _validate_current_plan(
         raise ValueError("reviewed target is not a current deterministic neighbor")
 
 
+def _validate_current_new_plan(
+    reviewed: Proposition,
+    current: Proposition,
+    allowed_new_path: str,
+) -> None:
+    if (
+        current.classification is not ConsolidationClass.NEW
+        or current.proposed_action is not ConsolidationAction.CREATE_NOTE
+    ):
+        raise DatacronConflictError("create target appeared; generate a new plan")
+    if reviewed.expected_hash is not None or reviewed.heading_level is not None:
+        raise ValueError("new-note target must not include an existing section selector")
+    if reviewed.heading != current.heading or reviewed.rel_path != allowed_new_path:
+        raise ValueError("reviewed new-note target does not match the current plan")
+    if reviewed.rel_path != current.rel_path:
+        raise DatacronConflictError("create target changed; generate a new plan")
+
+
 def _validate_candidate_semantics(proposition: Proposition, entry: Entry) -> None:
     candidate = ConsolidationStatement(
         statement_id=entry.id,
@@ -615,7 +683,11 @@ def _validate_candidate_semantics(proposition: Proposition, entry: Entry) -> Non
         )
         for neighbor in proposition.neighbors
     )
-    current_class = propose_consolidation((candidate,), durable)[0].classification
+    current_class = _classify_candidate(
+        candidate,
+        durable,
+        has_neighbors=bool(proposition.neighbors),
+    )
     if current_class is not proposition.classification:
         raise ValueError("classification does not match the reviewed candidate evidence")
     expected_body = _render_section(entry).strip()
@@ -626,6 +698,21 @@ def _validate_candidate_semantics(proposition: Proposition, entry: Entry) -> Non
         preview_body = proposition.new_content.strip()
     if preview_body != expected_body:
         raise ValueError("new_content is not the generated candidate preview")
+
+
+def _classify_candidate(
+    candidate: ConsolidationStatement,
+    durable: Sequence[ConsolidationStatement],
+    *,
+    has_neighbors: bool,
+) -> ConsolidationClass:
+    """Classify lexical-only neighbors as review-only ambiguity."""
+    classification = propose_consolidation((candidate,), durable)[0].classification
+    if classification is ConsolidationClass.NEW and has_neighbors:
+        # Datacron search hits have no durable subject identity. Treat a non-exact
+        # lexical neighbor as review-only ambiguity instead of creating a competing note.
+        return ConsolidationClass.UPDATE
+    return classification
 
 
 def _section_content(content: str, heading: str, heading_level: int) -> str:

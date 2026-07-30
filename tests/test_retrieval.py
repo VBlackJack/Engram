@@ -77,6 +77,7 @@ def test_fts_matches_lexical_subjects_and_diacritics(store: EngramStore) -> None
         statement="The lexical engine uses BM25 ranking.",
         source_type=SourceType.TOOL_VERIFIED,
         subject_keys=("search/lexical",),
+        claim_key="search/lexical-engine",
     )
     accented = store.add_attested(
         kind="preference",
@@ -84,6 +85,7 @@ def test_fts_matches_lexical_subjects_and_diacritics(store: EngramStore) -> None
         statement="Le cafe est prefere le matin.",
         source_type=SourceType.HUMAN,
         subject_keys=("routine/matinee",),
+        claim_key="routine/morning-beverage",
     )
     retriever = FtsRetriever(store)
 
@@ -106,6 +108,7 @@ def test_fts_treats_operators_as_terms_and_falls_back_to_substring(
         scope="user",
         statement="Alphabetical fallback remains available.",
         source_type=SourceType.HUMAN,
+        claim_key="search/alphabetical-fallback",
     )
     retriever = FtsRetriever(store)
 
@@ -122,12 +125,14 @@ def test_fts_reindex_preserves_results(store: EngramStore) -> None:
         scope="project/engram",
         statement="Rebuild the derived lexical index.",
         source_type=SourceType.HUMAN,
+        claim_key="search/reindex-action",
     )
     second = store.add_attested(
         kind="decision",
         scope="project/engram",
         statement="The derived lexical index remains reconstructible.",
         source_type=SourceType.TOOL_VERIFIED,
+        claim_key="search/reconstructibility",
     )
     retriever = FtsRetriever(store)
     before = tuple(item.id for item in retriever.retrieve(_request("derived lexical")).matches)
@@ -148,6 +153,7 @@ def test_fts_breaks_equal_bm25_scores_by_recency(
         scope="user",
         statement="Rank token older.",
         source_type=SourceType.HUMAN,
+        claim_key="ranking/older",
     )
     clock.current += timedelta(seconds=1)
     newer = store.add_attested(
@@ -155,6 +161,7 @@ def test_fts_breaks_equal_bm25_scores_by_recency(
         scope="user",
         statement="Rank token newer.",
         source_type=SourceType.HUMAN,
+        claim_key="ranking/newer",
     )
 
     result = FtsRetriever(store).retrieve(_request("rank token"))
@@ -169,6 +176,7 @@ def test_missing_fts_index_is_rebuilt_on_startup(app_config: AppConfig) -> None:
             scope="user",
             statement="Startup rebuild restores search.",
             source_type=SourceType.TOOL_VERIFIED,
+            claim_key="search/startup-rebuild",
         )
 
     connection = sqlite3.connect(app_config.database.path)
@@ -248,6 +256,7 @@ def test_business_validity_window_is_inclusive_across_read_paths(
         scope="user",
         statement="Business window future.",
         source_type=SourceType.HUMAN,
+        claim_key="business-window/future",
         valid_from=today + timedelta(days=2),
     )
     store.add_attested(
@@ -255,6 +264,7 @@ def test_business_validity_window_is_inclusive_across_read_paths(
         scope="user",
         statement="Business window elapsed.",
         source_type=SourceType.HUMAN,
+        claim_key="business-window/elapsed",
         valid_until=today - timedelta(days=1),
     )
     boundary = store.add_attested(
@@ -262,6 +272,7 @@ def test_business_validity_window_is_inclusive_across_read_paths(
         scope="user",
         statement="Business window boundary.",
         source_type=SourceType.HUMAN,
+        claim_key="business-window/boundary",
         valid_from=today,
         valid_until=today,
     )
@@ -301,12 +312,14 @@ def test_hybrid_retrieval_fuses_stored_vectors(store: EngramStore) -> None:
         scope="user",
         statement="Lexical phrase matches directly.",
         source_type=SourceType.HUMAN,
+        claim_key="hybrid/lexical",
     )
     semantic = store.add_attested(
         kind="fact",
         scope="user",
         statement="Semantic neighbour uses different wording.",
         source_type=SourceType.HUMAN,
+        claim_key="hybrid/semantic",
     )
     config = RetrievalConfig(
         mode=RetrievalMode.HYBRID,
@@ -334,6 +347,7 @@ def test_hybrid_endpoint_failure_degrades_to_fts_with_warning(
         scope="user",
         statement="Lexical fallback survives endpoint failure.",
         source_type=SourceType.HUMAN,
+        claim_key="hybrid/fallback",
     )
     config = RetrievalConfig(
         mode=RetrievalMode.HYBRID,
@@ -361,6 +375,7 @@ def test_hybrid_recall_excludes_entry_that_becomes_invalid_during_embedding(
         scope="user",
         statement="Hybrid midnight boundary remains safe.",
         source_type=SourceType.HUMAN,
+        claim_key="hybrid/midnight-boundary",
         valid_until=clock.current.date(),
     )
     retriever = HybridRetriever(

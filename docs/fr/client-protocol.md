@@ -51,9 +51,12 @@ Before ending a session whose state materially changed, call remember with one c
 project_state containing the completed work, current state, any confirmed blocker, and the next
 concrete action. Store an episode only when the event itself has short-term future value.
 
-The remember tool always creates an unconfirmed quarantined candidate. Do not describe it as human
-verified and do not use own_pending to justify irreversible action. If recall returns a conflict,
-surface all versions symmetrically and ask for resolution when it matters.
+The remember tool reports created, retry, corroborated, existing_trusted, or renewed. New and
+renewed generations are unconfirmed quarantined candidates; existing_trusted is already trusted
+content, while own_pending remains unresolved and must never justify an irreversible action.
+If recall returns a conflict, surface every version in the exact kind/scope/claim_key family
+symmetrically and ask for resolution when it matters. subject_keys are discovery hints, not
+conflict identity.
 ```
 
 Le texte est volontairement en anglais pour etre reutilisable tel quel par les trois clients. Il ne

@@ -27,7 +27,7 @@ sa consolidation vers Datacron.
 | Recherche | FTS5/BM25 par defaut, hybride local optionnel derriere un flag |
 | Confiance | Provenance serveur, plafond de confiance, quarantaine anti-poisoning |
 | Rappel | Capsule bornee : current, next_action, relevant, conflicts, own_pending, sources |
-| Consolidation | Plan humain, ecriture Datacron par CAS, relecture, controle de fraicheur |
+| Consolidation | Plan humain, create/link Datacron verifie, relecture, controle de fraicheur |
 | Evaluation | Corpus seede et graders deterministes, sans acces au vault Datacron |
 
 ## Installation
@@ -85,7 +85,7 @@ dossier du fichier TOML.
 | `[server]` | `ENGRAM_SERVER_HOST`, `_PORT`, `_PATH`, `_WRITE_WAIT_TIMEOUT_MS`, `_TTL_SWEEP_INTERVAL_SECONDS` | Endpoint HTTP, backpressure et balayage d'expiration logique |
 | `[capsule]` | `ENGRAM_CAPSULE_DEFAULT_TOKEN_BUDGET`, `_MIN_TOKEN_BUDGET`, `_MAX_TOKEN_BUDGET` | Budget du rappel |
 | `[retrieval]` | `ENGRAM_RETRIEVAL_MODE`, `_EMBEDDINGS_ENDPOINT`, `_EMBEDDINGS_MODEL`, `_EMBEDDINGS_TIMEOUT_MS`, `_RRF_K` | FTS ou hybride local |
-| `[datacron]` | `ENGRAM_DATACRON_COMMAND`, `_ARGS`, `_VAULT_ROOT`, `_READ_PATHS`, `_WRITE_PATHS`, `_NEW_NOTE_DIRECTORY`, `_NEIGHBOR_LIMIT` | Gateway et confinement Datacron |
+| `[datacron]` | `ENGRAM_DATACRON_COMMAND`, `_ARGS`, `_VAULT_ROOT`, `_READ_PATHS`, `_WRITE_PATHS`, `_NEW_NOTE_DIRECTORY`, `_NEIGHBOR_LIMIT`, `_STARTUP_TIMEOUT_MS`, `_REQUEST_TIMEOUT_MS`, `_SHUTDOWN_TIMEOUT_MS` | Gateway, timeouts et confinement Datacron |
 
 Pour une variable de liste, `ARGS` suit le decoupage shell et `READ_PATHS`/`WRITE_PATHS` utilisent
 le separateur de chemins de l'OS. Le fichier complet et ses valeurs sures sont dans
@@ -97,7 +97,7 @@ local par defaut lance `datacron mcp serve`.
 
 | Outil | Entrees essentielles | Resultat et politique |
 | --- | --- | --- |
-| `remember` | `statement`, `kind`, `scope`, `subject_keys`, `observed_at`, `evidence` | Cree un candidat `model_inferred`, `quarantined`, confiance au plus `medium` |
+| `remember` | `statement`, `kind`, `scope`, `subject_keys`, `observed_at`, `evidence` | Retourne `created`, `retry`, `corroborated`, `existing_trusted` ou `renewed` ; les contenus nouveaux/renouveles restent quarantaines |
 | `recall` | `query`, `scope`, `kinds`, `include_conflicts`, `token_budget` | Retourne une capsule trust-aware ; seuls les candidats du client courant figurent dans `own_pending` |
 
 Kinds acceptes : `preference`, `decision`, `project_state`, `fact`, `episode`. Le serveur attribue
@@ -111,8 +111,8 @@ la provenance ; un client ne peut jamais declarer lui-meme une source `human`.
   devienne la verite partagee.
 - Le mode hybride contacte uniquement l'endpoint d'embeddings explicitement configure ; FTS est
   le mode par defaut.
-- Les ecritures Datacron passent par des allowlists sous `_memory/`, une verification CAS et une
-  relecture.
+- Les ecritures Datacron passent par des allowlists sous `_memory/`, un chemin canonique
+  deterministe et une relecture exacte.
 - Ne pas exposer le serveur sur `0.0.0.0` sans proxy d'authentification et controle reseau.
 
 Voir le [modele de securite complet](docs/fr/security.md).
@@ -123,9 +123,12 @@ Voir le [modele de securite complet](docs/fr/security.md).
 engram --version
 engram --debug serve
 engram serve
+engram migrate
 engram reindex
 engram list --status quarantined
-engram attest "Statement relu" fact user --subject-key "topic/key"
+engram list --unclassified
+engram classify ENTRY_ID --claim-key "topic/claim"
+engram attest "Statement relu" fact user --subject-key "topic/key" --claim-key "topic/claim"
 engram supersede --old OLD_ID --new NEW_ID
 engram eval --mode both --out local/eval
 engram consolidate --plan --out local/consolidation/plan.json
@@ -137,11 +140,20 @@ engram consolidate --check-freshness
 base Engram. Editez uniquement chaque `decision` du JSON (`approve` ou `reject`) avant `--apply`.
 Le plan est a usage unique : toute modification d'un autre champ ou toute relecture apres apply est
 refusee et exige un nouveau plan. Un hash Datacron divergent produit `stale`, conserve le rapport et
-renvoie le code 6 ; il n'est jamais force.
-Arreter le daemon avant `attest`, `supersede`, `reindex` ou `consolidate`, puis le redemarrer avant
-recall. Ces commandes prennent le meme verrou OS que le daemon et echouent clairement tant qu'il
-est actif ; `list` reste disponible via une connexion SQLite read-only. Les commandes de confiance
-utilisent `[attestation].default_actor`, sauf si `--actor` est fourni.
+renvoie le code 6 ; il n'est jamais force. Actuellement, un resultat `update` reste visible avec sa
+cible et son diff dans le rapport, mais produit toujours `skip` : Engram ne patche aucune section
+tant que Datacron ne fournit pas un ancrage d'identite durable independamment verifie.
+Chaque creation cible un seul chemin canonique contenant l'ID candidat. Apres une reponse
+d'ecriture ambigue, un nouveau plan ne reconcilie que le contenu canonique complet identique de ce
+chemin au lieu de creer un doublon.
+Arreter le daemon avant `migrate`, `classify`, `attest`, `supersede`, `reindex` ou `consolidate`,
+puis le redemarrer avant recall. Ces commandes prennent le meme verrou OS que le daemon et echouent
+clairement tant qu'il est actif ; `list` reste disponible via une connexion SQLite read-only. Pour
+une base existante, effectuer d'abord une sauvegarde SQLite coherente, lancer `engram migrate`, puis
+inventorier `engram list --unclassified`. Relire chaque preference, decision ou fait historique et
+lui attribuer explicitement sa famille avec
+`engram classify ENTRY_ID --claim-key "topic/claim"` ; ne jamais inferer ces cles en masse. Les
+commandes de confiance utilisent `[attestation].default_actor`, sauf si `--actor` est fourni.
 
 Les erreurs CLI connues n'affichent aucun traceback par defaut. Le code `2` signale l'usage ou la
 configuration, `3` une ressource locale indisponible (port, verrou de processus, base ou runtime

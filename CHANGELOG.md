@@ -9,12 +9,30 @@ project uses date-derived CalVer releases in the form `YYYY.MMDD.NN`.
 
 ### Added
 
+- Add schema-v5 claim families, canonical content identities, retained observation evidence,
+  relational supersession integrity, explicit remember outcomes, and fail-closed startup checks.
+- Add offline `migrate` and `classify` workflows, including retry-safe legacy classification and
+  `list --unclassified` inventory.
 - Add trusted local `attest`, `supersede`, and status-filtered `list` commands with configurable
   audit identity and stable JSON output.
 - Anchor consolidation plans as immutable SQLite snapshots with generated single-use identifiers.
 
+### Changed
+
+- Trusted `preference`, `decision`, and `fact` attestations now require `--claim-key`;
+  `project_state` uses the reserved `project_state/current` family and `episode` has no claim key.
+- `remember` now reports `created`, `retry`, `corroborated`, `existing_trusted`, or `renewed`.
+  Equivalent retries share one generation while independent writers retain separate observations.
+- The public `Entry` constructor remains source compatible: new `canonical_key` and `claim_key`
+  fields are trailing optional fields. This release still changes persisted and CLI contracts.
+
 ### Fixed
 
+- Reject malformed v4 data before migration, forged normalized identities, drifted triggers or
+  indexes, missing candidate observations, unsafe supersession links, and invisible trusted-write
+  successes.
+- Make attestation plus multi-entry supersession atomic and preserve relation/legacy JSON coherence
+  through expiry and purge.
 - Reject any reviewed-plan retargeting, content substitution, or pending decision; refuse
   consumed-plan replay; and return a distinct nonzero exit after persisting apply reports with
   failed or stale outcomes.
@@ -23,8 +41,8 @@ project uses date-derived CalVer releases in the form `YYYY.MMDD.NN`.
 - Enforce business validity inside the promotion transaction and tolerate eligibility changes while
   hybrid retrieval waits for embeddings.
 - Enforce inclusive business-validity windows at recall, plan, and apply time.
-- Revalidate reviewed consolidation targets against current Datacron neighbors, pass heading levels
-  through the live gateway, and verify the exact patched section before promotion.
+- Keep reviewed `update` propositions visible for audit while forcing `skip` until Datacron
+  provides an independently verified durable section identity.
 - Enforce TTL at recall time and run a configurable logical-expiry sweep for the HTTP daemon.
 - Promote canonically identical quarantined content in place when it receives trusted attestation.
 - Enforce one cross-process database writer with an OS lock, stale-owner recovery, and a truly

@@ -27,11 +27,12 @@ from .consolidation.report import (
     render_plan_markdown,
 )
 from .consolidation.service import ConsolidationService
-from .db import DatabaseError, SQLiteVersionError
+from .db import DatabaseError, SQLiteVersionError, latest_schema_version
 from .eval.models import EvalMode
 from .eval.runner import run_evaluation
 from .logging_setup import FileLogger
 from .models import Confidence, Entry, EntryKind, EntryStatus, Evidence, EvidenceType, SourceType
+from .normalization import normalize_claim_key, normalize_trusted_claim_key
 from .process_lock import (
     DatabaseLockError,
     DatabaseLockRole,
@@ -104,6 +105,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("serve", help="Run the streamable HTTP MCP server")
+    commands.add_parser("migrate", help="Migrate and validate storage offline")
     commands.add_parser("reindex", help="Rebuild derived FTS and vector indexes")
     _add_trusted_command_parsers(commands)
     _add_evaluation_parser(commands)
@@ -123,7 +125,7 @@ def _add_trusted_command_parsers(
         "--subject-key",
         action="append",
         default=[],
-        help="Conflict subject key (repeatable)",
+        help="Retrieval/topic subject key (repeatable)",
     )
     attest.add_argument(
         "--source-type",
@@ -148,6 +150,13 @@ def _add_trusted_command_parsers(
     attest.add_argument("--observed-at", type=_parse_datetime, metavar="ISO-8601")
     attest.add_argument("--actor", help="Audit actor (default: attestation.default_actor)")
     attest.add_argument(
+        "--claim-key",
+        help=(
+            "Semantic conflict-family identity; required for preference, decision, "
+            "and fact attestations"
+        ),
+    )
+    attest.add_argument(
         "--supersedes",
         action="append",
         default=[],
@@ -158,11 +167,26 @@ def _add_trusted_command_parsers(
     supersede.add_argument("--old", required=True, metavar="ENTRY_ID")
     supersede.add_argument("--new", required=True, metavar="ENTRY_ID")
     supersede.add_argument("--actor", help="Audit actor (default: attestation.default_actor)")
+    classify = commands.add_parser(
+        "classify",
+        help="Assign a claim key to one trusted legacy entry",
+    )
+    classify.add_argument("entry_id", metavar="ENTRY_ID")
+    classify.add_argument("--claim-key", required=True)
+    classify.add_argument(
+        "--actor",
+        help="Audit actor (default: attestation.default_actor)",
+    )
     list_command = commands.add_parser("list", help="List entries by lifecycle status")
-    list_command.add_argument(
+    list_filter = list_command.add_mutually_exclusive_group(required=True)
+    list_filter.add_argument(
         "--status",
-        required=True,
         choices=tuple(status.value for status in EntryStatus),
+    )
+    list_filter.add_argument(
+        "--unclassified",
+        action="store_true",
+        help="List active trusted legacy entries that still need a claim key",
     )
 
 
@@ -227,6 +251,8 @@ def _dispatch(
     """Execute one parsed command."""
     if arguments.command == "serve":
         _serve(config=config, logger=logger)
+    elif arguments.command == "migrate":
+        _migrate(config=config, logger=logger)
     elif arguments.command == "reindex":
         _reindex(config=config, logger=logger)
     elif arguments.command == "attest":
@@ -244,6 +270,7 @@ def _dispatch(
             valid_until=arguments.valid_until,
             observed_at=arguments.observed_at,
             actor=arguments.actor,
+            claim_key=arguments.claim_key,
             supersedes=tuple(arguments.supersedes),
         )
     elif arguments.command == "supersede":
@@ -254,10 +281,19 @@ def _dispatch(
             new_id=arguments.new,
             actor=arguments.actor,
         )
+    elif arguments.command == "classify":
+        _classify(
+            config=config,
+            logger=logger,
+            entry_id=arguments.entry_id,
+            claim_key=arguments.claim_key,
+            actor=arguments.actor,
+        )
     elif arguments.command == "list":
         _list_entries(
             config=config,
-            status=EntryStatus(arguments.status),
+            status=(None if arguments.status is None else EntryStatus(arguments.status)),
+            unclassified=bool(arguments.unclassified),
         )
     elif arguments.command == "eval":
         _evaluate(
@@ -335,6 +371,22 @@ def _ensure_server_bind_available(host: str, port: int) -> None:
             ) from exc
 
 
+def _migrate(*, config: AppConfig, logger: logging.Logger) -> None:
+    """Apply pending migrations under the offline-writer process lock."""
+    with (
+        DatabaseProcessLock(
+            config.database.path,
+            role=DatabaseLockRole.OFFLINE_WRITER,
+            command="migrate",
+        ),
+        EngramStore(config),
+    ):
+        pass
+    schema_version = latest_schema_version()
+    logger.info("Database migration complete: schema_version=%d", schema_version)
+    _write_json({"schema_version": schema_version})
+
+
 def _environment_debug_enabled() -> bool:
     value = os.environ.get(DEBUG_ENVIRONMENT_KEY, "")
     return value.strip().casefold() in DEBUG_TRUE_VALUES
@@ -388,10 +440,12 @@ def _attest(  # noqa: PLR0913
     valid_until: date | None,
     observed_at: datetime | None,
     actor: str | None,
+    claim_key: str | None,
     supersedes: tuple[str, ...],
 ) -> None:
     """Create one trusted entry and retire its explicitly replaced versions."""
     selected_actor = config.attestation.default_actor if actor is None else actor
+    normalized_claim_key = normalize_trusted_claim_key(kind, claim_key)
     unique_supersedes = tuple(dict.fromkeys(supersedes))
     with (
         DatabaseProcessLock(
@@ -402,9 +456,6 @@ def _attest(  # noqa: PLR0913
         EngramStore(config) as store,
         store.write_access(config.server.write_wait_timeout_ms),
     ):
-        for old_id in unique_supersedes:
-            if store.get_entry(old_id) is None:
-                raise KeyError(f"Entry does not exist: {old_id}")
         entry = store.add_attested(
             kind=kind,
             scope=scope,
@@ -417,15 +468,43 @@ def _attest(  # noqa: PLR0913
             valid_from=valid_from,
             valid_until=valid_until,
             evidence=evidence,
+            claim_key=normalized_claim_key,
+            supersedes=unique_supersedes,
         )
-        for old_id in unique_supersedes:
-            if old_id != entry.id:
-                store.supersede(old_id, entry.id, actor=selected_actor)
         stored_entry = store.get_entry(entry.id)
         if stored_entry is None:  # pragma: no cover - protected by the writer lock
             raise RuntimeError("Attested entry disappeared")
     logger.info("Attested entry %s as %s", stored_entry.id, selected_actor)
     _write_json(_entry_payload(stored_entry))
+
+
+def _classify(
+    *,
+    config: AppConfig,
+    logger: logging.Logger,
+    entry_id: str,
+    claim_key: str,
+    actor: str | None,
+) -> None:
+    """Classify one trusted legacy entry through the offline writer path."""
+    normalized_claim_key = normalize_claim_key(claim_key)
+    selected_actor = config.attestation.default_actor if actor is None else actor
+    with (
+        DatabaseProcessLock(
+            config.database.path,
+            role=DatabaseLockRole.OFFLINE_WRITER,
+            command="classify",
+        ),
+        EngramStore(config) as store,
+        store.write_access(config.server.write_wait_timeout_ms),
+    ):
+        entry = store.classify_claim(
+            entry_id,
+            normalized_claim_key,
+            actor=selected_actor,
+        )
+    logger.info("Classified entry %s as %s", entry.id, normalized_claim_key)
+    _write_json(_entry_payload(entry))
 
 
 def _supersede(
@@ -461,10 +540,27 @@ def _supersede(
     )
 
 
-def _list_entries(*, config: AppConfig, status: EntryStatus) -> None:
-    """Print entries matching one lifecycle status as stable JSON."""
+def _list_entries(
+    *,
+    config: AppConfig,
+    status: EntryStatus | None = None,
+    unclassified: bool = False,
+) -> None:
+    """Print entries matching one lifecycle filter as stable JSON."""
+    if (status is None) == (not unclassified):
+        raise StoreValidationError("list requires exactly one of status or unclassified")
     with EngramReader(config) as reader:
-        entries = tuple(entry for entry in reader.list_entries() if entry.status is status)
+        entries = reader.list_entries()
+        if unclassified:
+            entries = tuple(
+                entry
+                for entry in entries
+                if entry.status is EntryStatus.ACTIVE
+                and entry.kind in {EntryKind.PREFERENCE, EntryKind.DECISION, EntryKind.FACT}
+                and entry.claim_key is None
+            )
+        else:
+            entries = tuple(entry for entry in entries if entry.status is status)
     _write_json([_entry_payload(entry) for entry in entries])
 
 
@@ -513,14 +609,22 @@ def _consolidate(  # noqa: PLR0913
     output_path: Path | None,
 ) -> None:
     """Run one isolated consolidation workflow through Datacron MCP."""
+    # Preserve the daemon/offline-writer diagnostic before starting Datacron,
+    # without retaining the database lock across subprocess startup.
+    with DatabaseProcessLock(
+        config.database.path,
+        role=DatabaseLockRole.OFFLINE_WRITER,
+        command="consolidate",
+    ):
+        pass
     with (
+        McpDatacronGateway(config.datacron) as gateway,
         DatabaseProcessLock(
             config.database.path,
             role=DatabaseLockRole.OFFLINE_WRITER,
             command="consolidate",
         ),
         EngramStore(config) as store,
-        McpDatacronGateway(config.datacron) as gateway,
     ):
         service = ConsolidationService(store, gateway, config.datacron)
         if generate_plan:
@@ -596,6 +700,8 @@ def _parse_evidence(value: str) -> Evidence:
 def _entry_payload(entry: Entry) -> dict[str, object]:
     return {
         "confidence": entry.confidence.value,
+        "canonical_key": entry.canonical_key,
+        "claim_key": entry.claim_key,
         "datacron_hash": entry.datacron_hash,
         "datacron_ref": entry.datacron_ref,
         "evidence": [

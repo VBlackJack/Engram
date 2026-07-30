@@ -71,12 +71,13 @@ a stale, superseded, expired, or other-client quarantined entry cannot enter `cu
 The gateway talks to the Datacron server over stdio MCP and enforces configured allowlists. The
 flow is deliberately split:
 
-1. `--plan` searches neighboring sections, classifies create/patch/skip, anchors an immutable SQLite
-   snapshot, and writes JSON + Markdown;
+1. `--plan` rereads the canonical path, searches several neighboring-section variants, classifies
+   create/link/skip, anchors an immutable SQLite snapshot, and writes JSON + Markdown;
 2. a human changes only each approve/reject decision;
-3. `--apply` verifies the artifact against the snapshot, consumes the plan, rereads the note,
-   compares the CAS hash, writes through MCP, then rereads;
-4. Engram marks `promoted` only when the reread confirms the mutation;
+3. `--apply` verifies the artifact against the snapshot and consumes the plan; `new` creates one
+   canonical note and rereads it, `redundant` reverifies and links without a write, while `update`
+   and `contradictory` remain `skip`;
+4. Engram marks `promoted` only when the exact create or exact link is reverified;
 5. `--check-freshness` later compares hashes without rewriting the vault.
 
 A failure on one proposition does not authorize forcing another. An apply report containing
@@ -86,7 +87,9 @@ propositions must be replanned from current Datacron state.
 Only `plan_id` and decisions cross the review boundary as inputs. Path, heading, heading level,
 content, hashes, neighbors, classification, and action must exactly match the trusted snapshot;
 manual retargeting is rejected. Apply still regenerates the current neighbor set and rechecks the
-live target before writing. Paths use canonical forward-slash syntax and headings are one line. The
-exact patched section must match the canonical candidate body after reread; finding that body
-elsewhere in the note is not sufficient verification. After all propositions, apply rereads every
+live target before creating or linking. Paths use canonical forward-slash syntax and headings are
+one line. A create path contains the candidate ID and has no alternate. After an ambiguous response,
+only a note whose full canonical content is identical, apart from line-ending and final-newline
+normalization, becomes `redundant`; any extra content remains `update/skip`. After all propositions,
+apply rereads every
 potentially written path and marks any promotion whose whole-note hash diverged as stale.
