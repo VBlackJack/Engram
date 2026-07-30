@@ -48,9 +48,9 @@ embeddings.
 
 ## FTS misses a morphological variant
 
-Try words from the statement or `subject_keys`. The substring fallback is not a stemmer. Porter
-and prefix search are deferred until real evidence warrants them; hybrid mode is the current
-extension path.
+Try words from the statement or `subject_keys`. Engram applies controlled prefixes after exact
+phrase, all-term, and any-term stages, but it is not a stemmer or fuzzy spell checker. Use hybrid
+mode for paraphrases with no shared vocabulary.
 
 ## Consolidation reports `stale`
 

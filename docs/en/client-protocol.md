@@ -22,6 +22,26 @@ Call `remember` only after durable, explicit information: a decision, correction
 preference, verified fact, or state change. Choose the kind and stable `subject_keys`. Do not store
 intermediate reasoning, assumptions, secrets, transcripts, large outputs, or facts already present.
 
+## Incomplete recall
+
+Always inspect `notes.recall_complete`. When it is `false`, do not infer that an absent memory does
+not exist. `notes.warnings` contains stable, bounded codes:
+
+| Code | Meaning | Client action |
+| --- | --- | --- |
+| `query_too_long` | The query exceeded the configured character cap and was not searched. | Shorten the query and retry. |
+| `query_too_many_terms` | The query exceeded the configured term cap and was not searched. | Use a smaller, focused set of subjects and retry. |
+| `query_has_no_search_terms` | Normalization produced no searchable lexical term. | Provide at least one word or number. |
+| `capsule_budget_overflow` | Whole entries were omitted to respect the serialized payload cap. | Retry with a larger allowed budget or narrower query; do not infer absence. |
+| `unclassified_claim_omitted` | A trusted legacy claim lacked explicit proposition identity and was omitted fail-closed. | Ask the operator to classify the legacy entry before relying on recall completeness. |
+| `conflicts_hidden_by_request` | Conflicting versions matched but `include_conflicts` was false. | Retry with `include_conflicts=true` and handle every version symmetrically. |
+| `conflict_family_overflow` | A complete conflict family did not fit the retrieval cap and was omitted. | Narrow the request or ask the operator to review `fts_top_k`; never choose a version implicitly. |
+| `project_state_overflow` | Scoped project-state history exceeded the retrieval cap and was omitted. | Do not infer that there is no next action; narrow the scope or use an operator inventory. |
+| `hybrid_provider_unavailable` | Embeddings failed and recall used lexical FTS only. | Treat semantic recall as incomplete; retry later or continue with explicit lexical limits. |
+| `hybrid_provider_invalid_vector` | The embedding provider returned an empty, non-finite, or zero-norm query vector. | Treat semantic recall as unavailable and repair or replace the provider. |
+| `hybrid_candidate_overflow` | The exact vector scan exceeded `hybrid_max_candidates` and recall used lexical FTS only. | Narrow scope/kinds or have the operator review the bounded hybrid cap. |
+| `hybrid_vector_coverage_incomplete` | At least one visible entry had no vector, or an incompatible vector dimension, for the configured model. | Reindex vectors or treat semantic absence as unknown. |
+
 ### 3. At the end
 
 When state changed in a way useful to the next session, call `remember` with a concise
@@ -54,7 +74,8 @@ renewed generations are unconfirmed quarantined candidates; existing_trusted is 
 content, while own_pending remains unresolved and must never justify an irreversible action.
 If recall returns a conflict, surface every version in the exact kind/scope/claim_key family
 symmetrically and ask for resolution when it matters. subject_keys are discovery hints, not
-conflict identity.
+conflict identity. If notes.recall_complete is false, never infer absence from omitted results;
+inspect notes.warnings and follow the documented retry or operator action for each code.
 ```
 
 This text grants no authority to attest or consolidate; those actions remain human and separate.

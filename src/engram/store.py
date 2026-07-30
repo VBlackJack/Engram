@@ -21,7 +21,7 @@ from threading import RLock
 from types import TracebackType
 from typing import Any, Literal, Self, cast, overload
 
-from .config import AppConfig
+from .config import MAX_FTS_TOP_K, MAX_HYBRID_CANDIDATES, AppConfig
 from .db import (
     FTS_TABLE_NAME,
     open_database,
@@ -31,6 +31,7 @@ from .db import (
     verify_database_integrity,
 )
 from .models import (
+    PROJECT_STATE_CLAIM_KEY,
     AuditAction,
     AuditRecord,
     CandidateWriteResult,
@@ -76,6 +77,7 @@ from .normalization import (
 from .normalization import (
     required_text as _required_text,
 )
+from .vectors import FLOAT32_MAX
 
 __all__ = [
     "EngramReader",
@@ -780,26 +782,27 @@ class EngramStore:
         *,
         scope: str | None,
         kinds: frozenset[EntryKind] | None,
+        writer_model: str | None = None,
+        limit: int = 64,
     ) -> tuple[Entry, ...]:
-        """Return active or quarantined FTS matches ordered by BM25 and recency."""
+        """Return a bounded visible FTS rank ordered by BM25 and recency."""
         normalized_query = _required_text(match_query, "match_query")
+        if isinstance(limit, bool) or not isinstance(limit, int):
+            raise StoreValidationError("limit must be an integer")
+        if not 1 <= limit <= MAX_FTS_TOP_K:
+            raise StoreValidationError(f"limit must be between 1 and {MAX_FTS_TOP_K}")
+        normalized_writer = (
+            None if writer_model is None else _required_text(writer_model, "writer_model")
+        )
         now = self._now()
         today = now.date().isoformat()
-        clauses = [
-            f"{FTS_TABLE_NAME} MATCH ?",
-            "entries.status IN (?, ?)",
-            "(entries.expires_at IS NULL OR entries.expires_at > ?)",
-            "(entries.valid_from IS NULL OR entries.valid_from <= ?)",
-            "(entries.valid_until IS NULL OR entries.valid_until >= ?)",
-        ]
-        parameters: list[object] = [
-            normalized_query,
-            EntryStatus.ACTIVE.value,
-            EntryStatus.QUARANTINED.value,
-            _format_datetime(now),
-            today,
-            today,
-        ]
+        visibility_clauses, visibility_parameters = _retrieval_visibility_sql(
+            now=now,
+            today=today,
+            writer_model=normalized_writer,
+        )
+        clauses = [f"{FTS_TABLE_NAME} MATCH ?", *visibility_clauses]
+        parameters: list[object] = [normalized_query, *visibility_parameters]
         if scope is not None:
             clauses.append("entries.scope = ?")
             parameters.append(scope)
@@ -813,12 +816,187 @@ class EngramStore:
             "SELECT entries.* FROM entries_fts "  # noqa: S608
             "JOIN entries ON entries.rowid = entries_fts.rowid "
             f"WHERE {where_clause} "
-            "ORDER BY bm25(entries_fts), entries.recorded_at DESC, entries.id DESC"
+            "ORDER BY bm25(entries_fts), entries.recorded_at DESC, entries.id DESC "
+            "LIMIT ?"
+        )
+        parameters.append(limit)
+        with self._write_lock:
+            self._ensure_open()
+            rows = self._connection.execute(query, parameters).fetchall()
+            return tuple(self._materialize_entry(row) for row in rows)
+
+    def list_retrieval_entries(
+        self,
+        *,
+        scope: str | None,
+        kinds: frozenset[EntryKind] | None,
+        writer_model: str,
+        limit: int,
+    ) -> tuple[Entry, ...]:
+        """Return a bounded recency window with recall visibility applied in SQL."""
+        normalized_writer = _required_text(writer_model, "writer_model")
+        normalized_limit = _retrieval_limit(limit)
+        now = self._now()
+        today = now.date().isoformat()
+        clauses, parameters = _retrieval_visibility_sql(
+            now=now,
+            today=today,
+            writer_model=normalized_writer,
+        )
+        if scope is not None:
+            clauses.append("entries.scope = ?")
+            parameters.append(scope)
+        if kinds:
+            ordered_kinds = sorted(kind.value for kind in kinds)
+            placeholders = ", ".join("?" for _ in ordered_kinds)
+            clauses.append(f"entries.kind IN ({placeholders})")
+            parameters.extend(ordered_kinds)
+        parameters.append(normalized_limit)
+        query = (
+            "SELECT entries.* FROM entries "  # noqa: S608
+            f"WHERE {' AND '.join(clauses)} "
+            "ORDER BY entries.recorded_at DESC, entries.id DESC "
+            "LIMIT ?"
         )
         with self._write_lock:
             self._ensure_open()
             rows = self._connection.execute(query, parameters).fetchall()
             return tuple(self._materialize_entry(row) for row in rows)
+
+    def list_retrieval_vectors(
+        self,
+        model: str,
+        *,
+        scope: str | None,
+        kinds: frozenset[EntryKind] | None,
+        writer_model: str,
+        limit: int,
+    ) -> tuple[tuple[Entry, tuple[float, ...] | None], ...]:
+        """Return all visible entries with optional vectors under one hard scan cap."""
+        normalized_model = _required_text(model, "model")
+        normalized_writer = _required_text(writer_model, "writer_model")
+        if isinstance(limit, bool) or not isinstance(limit, int):
+            raise StoreValidationError("limit must be an integer")
+        if not 1 <= limit <= MAX_HYBRID_CANDIDATES + 1:
+            raise StoreValidationError(f"limit must be between 1 and {MAX_HYBRID_CANDIDATES + 1}")
+        now = self._now()
+        today = now.date().isoformat()
+        clauses, visibility_parameters = _retrieval_visibility_sql(
+            now=now,
+            today=today,
+            writer_model=normalized_writer,
+        )
+        parameters: list[object] = [normalized_model, *visibility_parameters]
+        if scope is not None:
+            clauses.append("entries.scope = ?")
+            parameters.append(scope)
+        if kinds:
+            ordered_kinds = sorted(kind.value for kind in kinds)
+            placeholders = ", ".join("?" for _ in ordered_kinds)
+            clauses.append(f"entries.kind IN ({placeholders})")
+            parameters.extend(ordered_kinds)
+        parameters.append(limit)
+        query = (
+            "SELECT entries.*, entry_vectors.dim AS vector_dim, "  # noqa: S608
+            "entry_vectors.vector AS vector_blob "
+            "FROM entries "
+            "LEFT JOIN entry_vectors "
+            "ON entries.id = entry_vectors.entry_id AND entry_vectors.model = ? "
+            f"WHERE {' AND '.join(clauses)} "
+            "ORDER BY entries.id ASC "
+            "LIMIT ?"
+        )
+        with self._write_lock:
+            self._ensure_open()
+            rows = self._connection.execute(query, parameters).fetchall()
+            return tuple(
+                (
+                    self._materialize_entry(row),
+                    _decode_retrieval_vector(row),
+                )
+                for row in rows
+            )
+
+    def get_retrieval_entries(
+        self,
+        entry_ids: Sequence[str],
+        *,
+        writer_model: str,
+    ) -> tuple[Entry, ...]:
+        """Revalidate a bounded direct rank against current recall visibility."""
+        normalized_ids = _normalize_entry_ids(entry_ids, "entry_ids")
+        if not normalized_ids:
+            return ()
+        if len(normalized_ids) > MAX_FTS_TOP_K:
+            raise StoreValidationError(f"entry_ids must contain at most {MAX_FTS_TOP_K} values")
+        normalized_writer = _required_text(writer_model, "writer_model")
+        now = self._now()
+        today = now.date().isoformat()
+        clauses, parameters = _retrieval_visibility_sql(
+            now=now,
+            today=today,
+            writer_model=normalized_writer,
+        )
+        placeholders = ", ".join("?" for _ in normalized_ids)
+        clauses.append(f"entries.id IN ({placeholders})")
+        parameters.extend(normalized_ids)
+        query = f"SELECT entries.* FROM entries WHERE {' AND '.join(clauses)}"  # noqa: S608
+        with self._write_lock:
+            self._ensure_open()
+            rows = self._connection.execute(query, parameters).fetchall()
+            return tuple(self._materialize_entry(row) for row in rows)
+
+    def list_conflict_family(
+        self,
+        *,
+        kind: EntryKind,
+        scope: str,
+        claim_key: str | None,
+        limit: int,
+    ) -> tuple[Entry, ...]:
+        """Return one bounded trusted conflict family, including an overflow probe."""
+        normalized_limit = _retrieval_limit(limit, allow_overflow_probe=True)
+        normalized_scope = _normalize_scope(scope)
+        if kind is not EntryKind.PROJECT_STATE and claim_key is None:
+            return ()
+        normalized_claim_key = (
+            PROJECT_STATE_CLAIM_KEY
+            if kind is EntryKind.PROJECT_STATE
+            else _required_text(claim_key, "claim_key")
+        )
+        now = self._now()
+        today = now.date().isoformat()
+        clauses, parameters = _active_retrieval_visibility_sql(now=now, today=today)
+        clauses.extend(("entries.kind = ?", "entries.scope = ?"))
+        parameters.extend((kind.value, normalized_scope))
+        if kind is not EntryKind.PROJECT_STATE:
+            clauses.append("entries.claim_key = ?")
+            parameters.append(normalized_claim_key)
+        parameters.append(normalized_limit)
+        query = (
+            "SELECT entries.* FROM entries "  # noqa: S608
+            f"WHERE {' AND '.join(clauses)} "
+            "ORDER BY entries.recorded_at DESC, entries.id DESC "
+            "LIMIT ?"
+        )
+        with self._write_lock:
+            self._ensure_open()
+            rows = self._connection.execute(query, parameters).fetchall()
+            return tuple(self._materialize_entry(row) for row in rows)
+
+    def list_project_states(
+        self,
+        *,
+        scope: str,
+        limit: int,
+    ) -> tuple[Entry, ...]:
+        """Return bounded trusted project states for one exact scope."""
+        return self.list_conflict_family(
+            kind=EntryKind.PROJECT_STATE,
+            scope=scope,
+            claim_key=PROJECT_STATE_CLAIM_KEY,
+            limit=limit,
+        )
 
     def rebuild_fts(self) -> None:
         """Reconstruct the derived FTS table from canonical entry rows."""
@@ -882,15 +1060,28 @@ class EngramStore:
             with transaction(self._connection):
                 self._connection.execute("DELETE FROM entry_vectors")
 
-    def list_vectors(self, model: str) -> dict[str, tuple[float, ...]]:
-        """Return derived vectors for one model keyed by entry identifier."""
+    def list_vectors(
+        self,
+        model: str,
+        *,
+        entry_ids: Sequence[str] | None = None,
+    ) -> dict[str, tuple[float, ...]]:
+        """Return derived vectors for one model, optionally restricted by ID."""
         normalized_model = _required_text(model, "model")
+        normalized_ids = None if entry_ids is None else _normalize_entry_ids(entry_ids, "entry_ids")
+        if normalized_ids is not None and len(normalized_ids) > MAX_FTS_TOP_K:
+            raise StoreValidationError(f"entry_ids must contain at most {MAX_FTS_TOP_K} values")
+        if normalized_ids == ():
+            return {}
+        query = "SELECT entry_id, dim, vector FROM entry_vectors WHERE model = ?"
+        parameters: list[object] = [normalized_model]
+        if normalized_ids is not None:
+            placeholders = ", ".join("?" for _ in normalized_ids)
+            query += f" AND entry_id IN ({placeholders})"
+            parameters.extend(normalized_ids)
         with self._write_lock:
             self._ensure_open()
-            rows = self._connection.execute(
-                "SELECT entry_id, dim, vector FROM entry_vectors WHERE model = ?",
-                (normalized_model,),
-            ).fetchall()
+            rows = self._connection.execute(query, parameters).fetchall()
             return {
                 str(row["entry_id"]): _decode_vector(bytes(row["vector"]), int(row["dim"]))
                 for row in rows
@@ -1734,13 +1925,40 @@ def _encode_vector(vector: Sequence[float]) -> tuple[bytes, int]:
         raise StoreValidationError("vector must not be empty")
     if not all(math.isfinite(value) for value in values):
         raise StoreValidationError("vector values must be finite")
-    return struct.pack(f"<{len(values)}f", *values), len(values)
+    if any(abs(value) > FLOAT32_MAX for value in values):
+        raise StoreValidationError("vector values must fit in float32")
+    if not any(values):
+        raise StoreValidationError("vector must have a non-zero norm")
+    try:
+        encoded = struct.pack(f"<{len(values)}f", *values)
+    except (OverflowError, struct.error) as exc:
+        raise StoreValidationError("vector values must fit in float32") from exc
+    return encoded, len(values)
 
 
 def _decode_vector(vector_blob: bytes, dimension: int) -> tuple[float, ...]:
     if dimension <= 0 or len(vector_blob) != dimension * 4:
         raise StoreValidationError("stored vector has an invalid dimension")
-    return tuple(struct.unpack(f"<{dimension}f", vector_blob))
+    values = tuple(struct.unpack(f"<{dimension}f", vector_blob))
+    if not all(math.isfinite(value) for value in values):
+        raise StoreValidationError("stored vector contains a non-finite value")
+    if not any(values):
+        raise StoreValidationError("stored vector has a zero norm")
+    return values
+
+
+def _decode_retrieval_vector(row: sqlite3.Row) -> tuple[float, ...] | None:
+    """Treat one invalid derived vector as missing instead of failing recall."""
+    if row["vector_blob"] is None:
+        return None
+    try:
+        return _decode_vector(
+            bytes(row["vector_blob"]),
+            int(row["vector_dim"]),
+        )
+    except (StoreValidationError, TypeError, ValueError, OverflowError, struct.error):
+        LOGGER.warning("Stored hybrid vector is invalid; semantic coverage is incomplete")
+        return None
 
 
 def _enum_value[EnumType: StrEnum](
@@ -1832,6 +2050,51 @@ def _normalize_entry_ids(values: Sequence[str], field_name: str) -> tuple[str, .
         if normalized not in result:
             result.append(normalized)
     return tuple(result)
+
+
+def _retrieval_limit(limit: int, *, allow_overflow_probe: bool = False) -> int:
+    if isinstance(limit, bool) or not isinstance(limit, int):
+        raise StoreValidationError("limit must be an integer")
+    maximum = MAX_FTS_TOP_K + int(allow_overflow_probe)
+    if not 1 <= limit <= maximum:
+        raise StoreValidationError(f"limit must be between 1 and {maximum}")
+    return limit
+
+
+def _active_retrieval_visibility_sql(
+    *,
+    now: datetime,
+    today: str,
+) -> tuple[list[str], list[object]]:
+    return (
+        [
+            "entries.is_stale = 0",
+            "(entries.expires_at IS NULL OR entries.expires_at > ?)",
+            "(entries.valid_from IS NULL OR entries.valid_from <= ?)",
+            "(entries.valid_until IS NULL OR entries.valid_until >= ?)",
+            "entries.status = ?",
+        ],
+        [
+            _format_datetime(now),
+            today,
+            today,
+            EntryStatus.ACTIVE.value,
+        ],
+    )
+
+
+def _retrieval_visibility_sql(
+    *,
+    now: datetime,
+    today: str,
+    writer_model: str | None,
+) -> tuple[list[str], list[object]]:
+    clauses, parameters = _active_retrieval_visibility_sql(now=now, today=today)
+    if writer_model is None:
+        return clauses, parameters
+    clauses[-1] = "(entries.status = ? OR (entries.status = ? AND entries.writer_model = ?))"
+    parameters.extend((EntryStatus.QUARANTINED.value, writer_model))
+    return clauses, parameters
 
 
 def _new_ulid(recorded_at: datetime) -> str:

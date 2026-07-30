@@ -22,7 +22,9 @@ A quarantined candidate:
 - cannot be consolidated into Datacron.
 
 This policy limits cross-client propagation of injected instructions or false inference. Review
-and attestation remain explicit.
+and attestation remain explicit. The MCP client name/version pair is self-declared. It is a
+convenience namespace for pending observations, not authentication, authorization, or a
+confidentiality boundary. Any process that can reach the endpoint can claim the same pair.
 
 ## Single writer and SQLite
 
@@ -40,9 +42,10 @@ writer lock. Stop the daemon before an offline write, then restart it afterward.
 
 ## Network
 
-The `127.0.0.1` default is a security boundary. Engram implements no account, token, or TLS. Do not
-bind directly to `0.0.0.0`. For a remote client, place an authenticated HTTPS proxy in front of
-Engram, restrict origins and network access, and monitor requests.
+The listening address is a security boundary. Engram accepts only unambiguous loopback IP literals
+such as `127.0.0.1` or `::1`; hostnames, wildcard, LAN, and public addresses fail configuration.
+Engram implements no account, token, or TLS. For a remote client, place an authenticated HTTPS
+proxy in front of the loopback endpoint, restrict origins and network access, and monitor requests.
 
 ## Datacron confinement
 
@@ -64,9 +67,14 @@ inherited. A mutation requires the expected CAS hash and a reread before promoti
 
 ## Bounded capsule
 
-`token_budget` is constrained by server-side minimum and maximum values. The builder removes
-lower-priority sections before exceeding the budget and reports omissions. This bound limits
-accidental exfiltration and context flooding; it does not replace access control.
+`token_budget` is constrained by server-side minimum and maximum values. Engram interprets it
+conservatively as the maximum UTF-8 byte count of the complete serialized tool result: one byte per
+possible byte-level subword token. This is an absolute payload-size cap, not a promise of exact
+tokenization for every model. The builder measures fallback and structured content together,
+replaces oversized scope metadata with a bounded digest, removes lower-priority sections before
+the cap, and exposes fail-closed omissions through `notes.recall_complete` and bounded warning
+codes. This bound limits accidental exfiltration and context flooding; it does not replace access
+control.
 
 ## Backup and incident response
 

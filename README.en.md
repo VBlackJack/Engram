@@ -81,7 +81,7 @@ overridden as `ENGRAM_<SECTION>_<KEY>`; relative paths resolve from the TOML fil
 | `[attestation]` | `ENGRAM_ATTESTATION_DEFAULT_ACTOR` | Default actor for trusted local mutations |
 | `[server]` | `ENGRAM_SERVER_HOST`, `_PORT`, `_PATH`, `_WRITE_WAIT_TIMEOUT_MS`, `_TTL_SWEEP_INTERVAL_SECONDS` | HTTP endpoint, backpressure, and logical-expiry sweep |
 | `[capsule]` | `ENGRAM_CAPSULE_DEFAULT_TOKEN_BUDGET`, `_MIN_TOKEN_BUDGET`, `_MAX_TOKEN_BUDGET` | Recall budget |
-| `[retrieval]` | `ENGRAM_RETRIEVAL_MODE`, `_EMBEDDINGS_ENDPOINT`, `_EMBEDDINGS_MODEL`, `_EMBEDDINGS_TIMEOUT_MS`, `_RRF_K` | FTS or local hybrid |
+| `[retrieval]` | `ENGRAM_RETRIEVAL_MODE`, `_FTS_TOP_K`, `_FTS_MAX_QUERY_CHARS`, `_FTS_MAX_QUERY_TERMS`, `_FTS_MIN_PREFIX_CHARS`, `_HYBRID_MAX_CANDIDATES`, `_EMBEDDINGS_ENDPOINT`, `_EMBEDDINGS_MODEL`, `_EMBEDDINGS_TIMEOUT_MS`, `_RRF_K` | Bounded FTS or local hybrid |
 | `[datacron]` | `ENGRAM_DATACRON_COMMAND`, `_ARGS`, `_VAULT_ROOT`, `_READ_PATHS`, `_WRITE_PATHS`, `_NEW_NOTE_DIRECTORY`, `_NEIGHBOR_LIMIT`, `_STARTUP_TIMEOUT_MS`, `_REQUEST_TIMEOUT_MS`, `_SHUTDOWN_TIMEOUT_MS` | Gateway, timeouts, and Datacron confinement |
 
 For list variables, `ARGS` uses shell parsing and `READ_PATHS`/`WRITE_PATHS` use the OS path
@@ -94,7 +94,7 @@ disabled while `write_paths` is empty, even if the parent process defines
 | Tool | Essential inputs | Result and policy |
 | --- | --- | --- |
 | `remember` | `statement`, `kind`, `scope`, `subject_keys`, `observed_at`, `evidence` | Returns `created`, `retry`, `corroborated`, `existing_trusted`, or `renewed`; new/renewed content remains quarantined |
-| `recall` | `query`, `scope`, `kinds`, `include_conflicts`, `token_budget` | Returns a trust-aware capsule; only the current client's candidates appear in `own_pending` |
+| `recall` | `query`, `scope`, `kinds`, `include_conflicts`, `token_budget` | Returns a trust-aware capsule; always inspect `notes.recall_complete` and warning codes |
 
 Accepted kinds: `preference`, `decision`, `project_state`, `fact`, `episode`. The server assigns
 provenance; a client can never declare itself a `human` source.
@@ -104,10 +104,13 @@ provenance; a client can never declare itself a `human` source.
 - All data, lexical indexes, audit records, and logs remain local.
 - No cloud LLM call or telemetry is implemented.
 - Client candidates are quarantined so an unattested assertion cannot become shared truth.
+- The MCP client name/version is a self-declared namespace, not authentication or a confidentiality
+  boundary.
 - Hybrid mode contacts only the explicitly configured embeddings endpoint; FTS is the default.
 - Datacron writes use allowlists under `_memory/`, one deterministic canonical path, and an exact
   reread.
-- Do not bind to `0.0.0.0` without an authentication proxy and network controls.
+- Direct listening accepts only loopback IP literals. A remote proxy must connect locally and
+  provide authentication, TLS, and network controls itself.
 
 See the complete [security model](docs/en/security.md).
 
@@ -161,11 +164,13 @@ report contains failed or stale propositions. Use global `--debug` before the co
 - The transport is local HTTP. Claude Desktop remote connectors require a public HTTPS URL;
   Claude Code connects directly to localhost.
 - Hybrid mode is experimental and depends on a local OpenAI-compatible endpoint. It explicitly
-  falls back to FTS when unavailable.
+  falls back to FTS when unavailable or when the bounded exact vector scan exceeds its configured
+  candidate cap.
 - PyPI publication and MCP Registry submission are deferred. The manifest describes the package
   and its local HTTP endpoint.
-- Porter stemming and prefix search will only be evaluated if real use exposes morphological
-  misses.
+- FTS remains lexical: bounded fallbacks handle noise, term order, and controlled prefixes, but
+  cannot recover paraphrases with no shared vocabulary. The evaluation report keeps historical
+  semantic paraphrases separate from the lexical release contract.
 
 ## Documentation
 

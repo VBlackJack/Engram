@@ -26,6 +26,14 @@ class RecallSubset(StrEnum):
 
     GLOBAL = "global"
     DEGRADED = "degraded"
+    FTS_CONTRACT = "fts_contract"
+
+
+class DegradationClass(StrEnum):
+    """Versioned degraded-query families covered by the FTS contract."""
+
+    NATURAL = "natural"
+    ADVERSARIAL = "adversarial"
 
 
 class CapsuleSection(StrEnum):
@@ -83,6 +91,7 @@ class RecallTask:
     expected_section: CapsuleSection
     scope: str
     subset: RecallSubset
+    degradation: DegradationClass | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -158,11 +167,21 @@ class RecallFamilyMetrics(FamilyMetrics):
 
     global_tasks: int
     degraded_tasks: int
+    fts_contract_tasks: int
     gold_in_capsule_rate: float
     global_gold_in_capsule_rate: float
     degraded_gold_in_capsule_rate: float
+    fts_contract_gold_in_capsule_rate: float
+    natural_degraded_gold_in_capsule_rate: float
+    adversarial_degraded_gold_in_capsule_rate: float
     mean_gold_position: float | None
     budget_pass_rate: float
+    complete_recall_rate: float
+    global_complete_recall_rate: float
+    fts_contract_complete_recall_rate: float
+    incomplete_recall_count: int
+    warning_counts: dict[str, int]
+    fts_contract_warning_counts: dict[str, int]
 
 
 class PerClassMetrics(BaseModel):
@@ -230,14 +249,61 @@ class CorpusMetrics(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    version: str
+    semantic_benchmark_version: str
+    semantic_benchmark_sha256: str
+    fts_contract_version: str
+    fts_contract_sha256: str
     entries: int
     trusted_entries: int
     quarantined_entries: int
     recall_tasks: int
     global_tasks: int
     degraded_tasks: int
+    fts_contract_tasks: int
+    natural_degraded_tasks: int
+    adversarial_degraded_tasks: int
     scopes: int
     kinds: int
+
+
+class FtsContractThresholds(BaseModel):
+    """Minimum release-quality thresholds for the deterministic FTS baseline."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    minimum_global_gold_in_capsule_rate: float
+    minimum_lexical_degraded_gold_in_capsule_rate: float
+    minimum_budget_pass_rate: float
+    minimum_global_complete_recall_rate: float
+    minimum_lexical_complete_recall_rate: float
+    minimum_contradiction_pass_rate: float
+    minimum_poisoning_pass_rate: float
+    maximum_recall_p95_ms: float
+
+
+class FtsContractMetrics(BaseModel):
+    """Measured FTS release gate serialized beside every evaluation report."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    passed: bool
+    checks: dict[str, bool]
+    thresholds: FtsContractThresholds
+    capsule_byte_budget: int
+    capsule_budget_unit: str
+    capsule_estimator_version: str
+    call_result_byte_margin: int
+    retrieval_config: dict[str, str | int]
+    global_gold_in_capsule_rate: float
+    lexical_degraded_gold_in_capsule_rate: float
+    budget_pass_rate: float
+    global_complete_recall_rate: float
+    lexical_complete_recall_rate: float
+    contradiction_pass_rate: float
+    poisoning_pass_rate: float
+    warning_counts: dict[str, int]
+    recall_p95_ms: float
 
 
 class P2Measures(BaseModel):
@@ -265,11 +331,12 @@ class EvaluationMetrics(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    schema_version: int = 1
+    schema_version: int = 3
     requested_mode: EvalMode
     surface: str
     corpus: CorpusMetrics
     modes: dict[str, ModeMetrics]
+    fts_contract: FtsContractMetrics
     f3_consolidation: ConsolidationFamilyMetrics
     p2_verdict: P2Verdict
     p2_measures: P2Measures

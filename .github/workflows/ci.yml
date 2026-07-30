@@ -95,3 +95,20 @@ jobs:
 
       - name: Pytest
         run: uv run --frozen --extra dev --python 3.13 pytest
+
+      - name: FTS evaluation contract
+        env:
+          ENGRAM_CONFIG: ${{ github.workspace }}/engram.example.toml
+        run: >-
+          uv run --frozen --extra dev --python 3.13
+          engram eval --mode fts --out local/ci-eval
+
+      - name: Upload FTS evaluation artifacts
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f  # v6
+        with:
+          name: fts-eval-${{ runner.os }}
+          path: |
+            local/ci-eval/metrics.json
+            local/ci-eval/rapport-eval.md
+          if-no-files-found: warn

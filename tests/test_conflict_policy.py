@@ -7,7 +7,11 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-from engram.capsule import CapsuleBuilder
+from engram.capsule import (
+    CONFLICTS_HIDDEN_BY_REQUEST_NOTICE,
+    UNCLASSIFIED_CLAIM_OMITTED_NOTICE,
+    CapsuleBuilder,
+)
 from engram.config import AppConfig
 from engram.models import PROJECT_STATE_CLAIM_KEY, SourceType
 from engram.retrieval import FtsRetriever, RetrievalRequest, RetrievalResult
@@ -50,7 +54,7 @@ def test_shared_subject_does_not_conflict_when_claims_differ(
         retrieval,
         scope="project/engram",
         include_conflicts=True,
-        token_budget=1500,
+        token_budget=app_config.capsule.max_token_budget,
     )
 
     assert {item.id for item in capsule.current} == {engine.id, journal.id}
@@ -84,7 +88,7 @@ def test_exact_claim_match_expands_and_groups_conflict(
         retrieval,
         scope="project/engram",
         include_conflicts=True,
-        token_budget=1500,
+        token_budget=app_config.capsule.max_token_budget,
     )
 
     assert {entry.id for entry in retrieval.matches} == {light.id, dark.id}
@@ -117,7 +121,7 @@ def test_hidden_conflict_reports_exact_omitted_version_count(
         retrieval,
         scope="project/engram",
         include_conflicts=False,
-        token_budget=1500,
+        token_budget=app_config.capsule.max_token_budget,
     )
 
     assert capsule.current == []
@@ -126,6 +130,8 @@ def test_hidden_conflict_reports_exact_omitted_version_count(
         "2 unresolved conflict entries omitted; retry with include_conflicts=true"
         in capsule.notes.why_returned
     )
+    assert capsule.notes.recall_complete is False
+    assert capsule.notes.warnings == [CONFLICTS_HIDDEN_BY_REQUEST_NOTICE]
 
 
 def test_scoped_project_states_conflict_without_a_lexical_match(
@@ -153,7 +159,7 @@ def test_scoped_project_states_conflict_without_a_lexical_match(
         retrieval,
         scope="project/engram",
         include_conflicts=True,
-        token_budget=1500,
+        token_budget=app_config.capsule.max_token_budget,
     )
 
     assert retrieval.matches == ()
@@ -187,7 +193,7 @@ def test_unclassified_legacy_fact_is_omitted_fail_closed(
         retrieval,
         scope="project/engram",
         include_conflicts=True,
-        token_budget=1500,
+        token_budget=app_config.capsule.max_token_budget,
     )
 
     assert capsule.current == []
@@ -195,6 +201,8 @@ def test_unclassified_legacy_fact_is_omitted_fail_closed(
     assert (
         "1 trusted entry omitted: claim_key classification required" in capsule.notes.why_returned
     )
+    assert capsule.notes.recall_complete is False
+    assert capsule.notes.warnings == [UNCLASSIFIED_CLAIM_OMITTED_NOTICE]
 
 
 def test_claim_conflicts_are_partitioned_by_kind_and_scope(
@@ -232,7 +240,7 @@ def test_claim_conflicts_are_partitioned_by_kind_and_scope(
         retrieval,
         scope=None,
         include_conflicts=True,
-        token_budget=1500,
+        token_budget=app_config.capsule.max_token_budget,
     )
 
     assert {item.id for item in capsule.current} == {fact.id, decision.id, elsewhere.id}

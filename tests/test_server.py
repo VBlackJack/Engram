@@ -25,6 +25,7 @@ from starlette.applications import Starlette
 
 import engram.server as server_module
 from engram import __version__
+from engram.capsule import CapsuleResult, estimate_capsule_bytes
 from engram.config import (
     AppConfig,
     CapsuleConfig,
@@ -551,13 +552,13 @@ async def test_recall_does_not_merge_conflicts_across_scopes(
 async def test_recall_budget_omits_whole_entries_and_validates_bounds(
     app_config: AppConfig,
 ) -> None:
-    """Enforce the conservative character budget without truncating statements."""
+    """Enforce the serialized capsule budget without truncating statements."""
     config = replace(
         app_config,
         capsule=CapsuleConfig(
-            default_token_budget=150,
-            min_token_budget=100,
-            max_token_budget=300,
+            default_token_budget=1200,
+            min_token_budget=1200,
+            max_token_budget=2400,
         ),
     )
     statements = [
@@ -578,11 +579,11 @@ async def test_recall_budget_omits_whole_entries_and_validates_bounds(
         async with app.router.lifespan_context(app), _client(app) as session:
             result = await session.call_tool(
                 "recall",
-                {"query": "budget", "token_budget": 100},
+                {"query": "budget", "token_budget": 1200},
             )
             rejected = await session.call_tool(
                 "recall",
-                {"query": "budget", "token_budget": 99},
+                {"query": "budget", "token_budget": 1199},
             )
 
         assert result.isError is False
@@ -590,7 +591,8 @@ async def test_recall_budget_omits_whole_entries_and_validates_bounds(
         assert result.content
         fallback = result.content[0]
         assert isinstance(fallback, TextContent)
-        assert (len(fallback.text) + 3) // 4 <= 100
+        capsule = CapsuleResult.model_validate(_structured(result))
+        assert estimate_capsule_bytes(capsule, fallback.text) <= 1200
         assert "entries omitted, budget" in fallback.text
         for statement in statements:
             prefix = statement[: len(statement) // 2]

@@ -29,12 +29,18 @@ write_wait_timeout_ms = 2000
 ttl_sweep_interval_seconds = 60
 
 [capsule]
-default_token_budget = 600
-min_token_budget = 150
-max_token_budget = 1500
+default_token_budget = 4800
+min_token_budget = 1200
+max_token_budget = 6000
 
 [retrieval]
 mode = "fts"
+# Hard-bounded lexical query and SQL result limits.
+fts_top_k = 64
+fts_max_query_chars = 1024
+fts_max_query_terms = 24
+fts_min_prefix_chars = 4
+hybrid_max_candidates = 4096
 embeddings_endpoint = "http://127.0.0.1:1234/v1/embeddings"
 # Reference: nomic-embed-text-v1.5. Alternative: bge-m3.
 embeddings_model = ""

@@ -12,6 +12,7 @@ import tomllib
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
+from ipaddress import ip_address
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -23,10 +24,34 @@ DEFAULT_CONFIG_PATH = Path("engram.toml")
 SUPPORTED_LOG_LEVELS = frozenset({"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"})
 MAX_NETWORK_PORT = 65_535
 MAX_DATACRON_NEIGHBOR_LIMIT = 64
+MAX_FTS_TOP_K = 256
+MAX_FTS_QUERY_CHARS = 4096
+MAX_FTS_QUERY_TERMS = 64
+MIN_FTS_PREFIX_CHARS = 2
+MAX_FTS_MIN_PREFIX_CHARS = 32
+MAX_HYBRID_CANDIDATES = 16_384
+MIN_CAPSULE_BYTE_BUDGET = 1200
 
 
 class ConfigError(ValueError):
     """Raised when the configuration is missing or invalid."""
+
+
+def _is_plain_int(value: object) -> bool:
+    """Return true only for integers, excluding bool and coercible numerics."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def validate_loopback_host(host: str) -> None:
+    """Reject every server host that is not an unambiguous loopback IP literal."""
+    if not isinstance(host, str) or not host or host.strip() != host or "%" in host:
+        raise ConfigError("server.host must be a loopback IP literal")
+    try:
+        address = ip_address(host)
+    except ValueError as exc:
+        raise ConfigError("server.host must be a loopback IP literal") from exc
+    if not address.is_loopback:
+        raise ConfigError("server.host must be a loopback IP literal")
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,14 +118,52 @@ class ServerConfig:
     write_wait_timeout_ms: int = 2000
     ttl_sweep_interval_seconds: float = 60.0
 
+    def __post_init__(self) -> None:
+        """Make unsafe direct construction fail closed, including library use."""
+        validate_loopback_host(self.host)
+        if not _is_plain_int(self.port) or not 1 <= self.port <= MAX_NETWORK_PORT:
+            raise ConfigError("server.port must be between 1 and 65535")
+        if not isinstance(self.path, str) or not self.path.startswith("/"):
+            raise ConfigError("server.path must start with a slash")
+        if not _is_plain_int(self.write_wait_timeout_ms) or self.write_wait_timeout_ms <= 0:
+            raise ConfigError("server.write_wait_timeout_ms must be a positive integer")
+        if (
+            isinstance(self.ttl_sweep_interval_seconds, bool)
+            or not isinstance(self.ttl_sweep_interval_seconds, int | float)
+            or not math.isfinite(self.ttl_sweep_interval_seconds)
+            or self.ttl_sweep_interval_seconds <= 0
+        ):
+            raise ConfigError("server.ttl_sweep_interval_seconds must be a finite positive number")
+
 
 @dataclass(frozen=True, slots=True)
 class CapsuleConfig:
     """Recall capsule token budget settings."""
 
-    default_token_budget: int = 600
-    min_token_budget: int = 150
-    max_token_budget: int = 1500
+    default_token_budget: int = 4800
+    min_token_budget: int = 1200
+    max_token_budget: int = 6000
+
+    def __post_init__(self) -> None:
+        """Reject an impossible serialized MCP envelope in every construction path."""
+        if not all(
+            _is_plain_int(value)
+            for value in (
+                self.default_token_budget,
+                self.min_token_budget,
+                self.max_token_budget,
+            )
+        ):
+            raise ConfigError("capsule token budgets must be integers")
+        if self.min_token_budget < MIN_CAPSULE_BYTE_BUDGET:
+            raise ConfigError(
+                "capsule.min_token_budget must be at least "
+                f"{MIN_CAPSULE_BYTE_BUDGET} for the mandatory MCP envelope"
+            )
+        if self.max_token_budget < self.min_token_budget:
+            raise ConfigError("capsule.max_token_budget must be at least the minimum")
+        if not self.min_token_budget <= self.default_token_budget <= self.max_token_budget:
+            raise ConfigError("capsule.default_token_budget must be within the configured bounds")
 
 
 class RetrievalMode(StrEnum):
@@ -119,6 +182,85 @@ class RetrievalConfig:
     embeddings_model: str = ""
     embeddings_timeout_ms: int = 3000
     rrf_k: int = 60
+    fts_top_k: int = 64
+    fts_max_query_chars: int = 1024
+    fts_max_query_terms: int = 24
+    fts_min_prefix_chars: int = 4
+    hybrid_max_candidates: int = 4096
+
+    def __post_init__(self) -> None:
+        """Enforce retrieval bounds for configuration and direct library use."""
+        _validate_retrieval_values(self)
+
+
+def _validate_retrieval_values(config: RetrievalConfig) -> None:
+    """Validate one retrieval configuration without requiring an AppConfig."""
+    if not isinstance(config.mode, RetrievalMode):
+        raise ConfigError("retrieval.mode must be a RetrievalMode")
+    _validate_retrieval_integer_types(config)
+    _validate_fts_bounds(config)
+    _validate_hybrid_and_embedding_settings(config)
+
+
+def _validate_retrieval_integer_types(config: RetrievalConfig) -> None:
+    """Reject bool, float, and other late-coercion hazards in direct use."""
+    integer_values = {
+        "fts_top_k": config.fts_top_k,
+        "fts_max_query_chars": config.fts_max_query_chars,
+        "fts_max_query_terms": config.fts_max_query_terms,
+        "fts_min_prefix_chars": config.fts_min_prefix_chars,
+        "hybrid_max_candidates": config.hybrid_max_candidates,
+        "embeddings_timeout_ms": config.embeddings_timeout_ms,
+        "rrf_k": config.rrf_k,
+    }
+    for name, value in integer_values.items():
+        if not _is_plain_int(value):
+            raise ConfigError(f"retrieval.{name} must be an integer")
+
+
+def _validate_fts_bounds(config: RetrievalConfig) -> None:
+    """Enforce the hard lexical query and result limits."""
+    if not 1 <= config.fts_top_k <= MAX_FTS_TOP_K:
+        raise ConfigError(f"retrieval.fts_top_k must be between 1 and {MAX_FTS_TOP_K}")
+    if not 1 <= config.fts_max_query_chars <= MAX_FTS_QUERY_CHARS:
+        raise ConfigError(
+            f"retrieval.fts_max_query_chars must be between 1 and {MAX_FTS_QUERY_CHARS}"
+        )
+    if not 1 <= config.fts_max_query_terms <= MAX_FTS_QUERY_TERMS:
+        raise ConfigError(
+            f"retrieval.fts_max_query_terms must be between 1 and {MAX_FTS_QUERY_TERMS}"
+        )
+    if not MIN_FTS_PREFIX_CHARS <= config.fts_min_prefix_chars <= MAX_FTS_MIN_PREFIX_CHARS:
+        raise ConfigError(
+            "retrieval.fts_min_prefix_chars must be between "
+            f"{MIN_FTS_PREFIX_CHARS} and {MAX_FTS_MIN_PREFIX_CHARS}"
+        )
+    if config.fts_min_prefix_chars > config.fts_max_query_chars:
+        raise ConfigError("retrieval.fts_min_prefix_chars must not exceed fts_max_query_chars")
+
+
+def _validate_hybrid_and_embedding_settings(config: RetrievalConfig) -> None:
+    """Validate the bounded semantic scan and remote endpoint settings."""
+    if not 1 <= config.hybrid_max_candidates <= MAX_HYBRID_CANDIDATES:
+        raise ConfigError(
+            f"retrieval.hybrid_max_candidates must be between 1 and {MAX_HYBRID_CANDIDATES}"
+        )
+    if (
+        not isinstance(config.embeddings_endpoint, str)
+        or config.embeddings_endpoint.strip() != config.embeddings_endpoint
+    ):
+        raise ConfigError("retrieval.embeddings_endpoint must be an HTTP URL")
+    endpoint = urlparse(config.embeddings_endpoint)
+    if endpoint.scheme not in {"http", "https"} or not endpoint.netloc:
+        raise ConfigError("retrieval.embeddings_endpoint must be an HTTP URL")
+    if config.embeddings_timeout_ms <= 0:
+        raise ConfigError("retrieval.embeddings_timeout_ms must be greater than zero")
+    if config.rrf_k <= 0:
+        raise ConfigError("retrieval.rrf_k must be greater than zero")
+    if not isinstance(config.embeddings_model, str):
+        raise ConfigError("retrieval.embeddings_model must be a string")
+    if config.mode is RetrievalMode.HYBRID and not config.embeddings_model.strip():
+        raise ConfigError("retrieval.embeddings_model is required in hybrid mode")
 
 
 @dataclass(frozen=True, slots=True)
@@ -303,6 +445,36 @@ def load_config(
         retrieval=RetrievalConfig(
             mode=_retrieval_mode(
                 _string_value(retrieval, "mode", environment, DEFAULT_RETRIEVAL_CONFIG.mode)
+            ),
+            fts_top_k=_integer_value(
+                retrieval,
+                "fts_top_k",
+                environment,
+                DEFAULT_RETRIEVAL_CONFIG.fts_top_k,
+            ),
+            fts_max_query_chars=_integer_value(
+                retrieval,
+                "fts_max_query_chars",
+                environment,
+                DEFAULT_RETRIEVAL_CONFIG.fts_max_query_chars,
+            ),
+            fts_max_query_terms=_integer_value(
+                retrieval,
+                "fts_max_query_terms",
+                environment,
+                DEFAULT_RETRIEVAL_CONFIG.fts_max_query_terms,
+            ),
+            fts_min_prefix_chars=_integer_value(
+                retrieval,
+                "fts_min_prefix_chars",
+                environment,
+                DEFAULT_RETRIEVAL_CONFIG.fts_min_prefix_chars,
+            ),
+            hybrid_max_candidates=_integer_value(
+                retrieval,
+                "hybrid_max_candidates",
+                environment,
+                DEFAULT_RETRIEVAL_CONFIG.hybrid_max_candidates,
             ),
             embeddings_endpoint=_string_value(
                 retrieval,
@@ -582,6 +754,7 @@ def _validate_storage_config(config: AppConfig) -> None:
 
 
 def _validate_server_config(config: AppConfig) -> None:
+    validate_loopback_host(config.server.host)
     if not 1 <= config.server.port <= MAX_NETWORK_PORT:
         raise ConfigError("server.port must be between 1 and 65535")
     if not config.server.path.startswith("/"):
@@ -593,8 +766,11 @@ def _validate_server_config(config: AppConfig) -> None:
         or config.server.ttl_sweep_interval_seconds <= 0
     ):
         raise ConfigError("server.ttl_sweep_interval_seconds must be a finite positive number")
-    if config.capsule.min_token_budget <= 0:
-        raise ConfigError("capsule.min_token_budget must be greater than zero")
+    if config.capsule.min_token_budget < MIN_CAPSULE_BYTE_BUDGET:
+        raise ConfigError(
+            "capsule.min_token_budget must be at least "
+            f"{MIN_CAPSULE_BYTE_BUDGET} for the mandatory MCP envelope"
+        )
     if config.capsule.max_token_budget < config.capsule.min_token_budget:
         raise ConfigError("capsule.max_token_budget must be at least the minimum")
     if not (
@@ -606,15 +782,7 @@ def _validate_server_config(config: AppConfig) -> None:
 
 
 def _validate_retrieval_config(config: AppConfig) -> None:
-    endpoint = urlparse(config.retrieval.embeddings_endpoint)
-    if endpoint.scheme not in {"http", "https"} or not endpoint.netloc:
-        raise ConfigError("retrieval.embeddings_endpoint must be an HTTP URL")
-    if config.retrieval.embeddings_timeout_ms <= 0:
-        raise ConfigError("retrieval.embeddings_timeout_ms must be greater than zero")
-    if config.retrieval.rrf_k <= 0:
-        raise ConfigError("retrieval.rrf_k must be greater than zero")
-    if config.retrieval.mode is RetrievalMode.HYBRID and not config.retrieval.embeddings_model:
-        raise ConfigError("retrieval.embeddings_model is required in hybrid mode")
+    _validate_retrieval_values(config.retrieval)
 
 
 def _validate_datacron_config(config: AppConfig) -> None:

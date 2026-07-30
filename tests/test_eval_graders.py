@@ -3,7 +3,13 @@
 
 """Explicit pass and fail cases for every code grader."""
 
-from engram.capsule import CapsuleItem, CapsuleNotes, CapsuleResult, ConflictItem
+from engram.capsule import (
+    CapsuleItem,
+    CapsuleNotes,
+    CapsuleResult,
+    ConflictItem,
+    estimate_capsule_bytes,
+)
 from engram.eval.graders import (
     grade_classification,
     grade_complement_policy,
@@ -54,10 +60,20 @@ def test_gold_grader_has_manual_pass_and_fail_cases() -> None:
         "user",
         RecallSubset.GLOBAL,
     )
-    passed = grade_gold_capsule(task, "gold-id", _capsule(current=[_item("gold-id")]), "ok", 10)
+    passing_capsule = _capsule(current=[_item("gold-id")])
+    required_bytes = estimate_capsule_bytes(passing_capsule, "ok")
+    passed = grade_gold_capsule(
+        task,
+        "gold-id",
+        passing_capsule,
+        "ok",
+        required_bytes,
+    )
     failed = grade_gold_capsule(task, "gold-id", _capsule(), "text above budget", 1)
 
     assert passed.passed is True
+    assert passed.metrics["serialized_bytes"] == required_bytes
+    assert passed.metrics["capsule_byte_budget"] == required_bytes
     assert failed.passed is False
 
 

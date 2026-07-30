@@ -7,18 +7,25 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from engram.models import Entry, EntryKind
+from engram.models import Entry
 from engram.store import EngramStore
 from evalsets.engram_corpus import (
+    CORPUS_VERSION,
     DEGRADED_RECALL_TASKS,
+    FTS_CONTRACT_RECALL_TASKS,
+    FTS_CONTRACT_SHA256,
+    FTS_CONTRACT_VERSION,
     GLOBAL_RECALL_TASKS,
     RECALL_TASKS,
     SEED_ENTRIES,
+    SEMANTIC_BENCHMARK_SHA256,
+    SEMANTIC_BENCHMARK_VERSION,
     SUPERSEDE_LINKS,
+    trusted_claim_key,
     validate_corpus,
 )
 
-from .models import CorpusMetrics
+from .models import CorpusMetrics, DegradationClass
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,16 +48,7 @@ def seed_corpus(store: EngramStore) -> SeededCorpus:
                 source_type=seed.source_type,
                 subject_keys=seed.subject_keys,
                 actor="eval-seed",
-                claim_key=(
-                    seed.subject_keys[0]
-                    if seed.kind
-                    in {
-                        EntryKind.PREFERENCE,
-                        EntryKind.DECISION,
-                        EntryKind.FACT,
-                    }
-                    else None
-                ),
+                claim_key=trusted_claim_key(seed),
             )
         else:
             entry = store.add_candidate(
@@ -71,12 +69,24 @@ def corpus_metrics() -> CorpusMetrics:
     """Return stable corpus dimensions for metrics.json."""
     trusted = sum(entry.writer_model is None for entry in SEED_ENTRIES)
     return CorpusMetrics(
+        version=CORPUS_VERSION,
+        semantic_benchmark_version=SEMANTIC_BENCHMARK_VERSION,
+        semantic_benchmark_sha256=SEMANTIC_BENCHMARK_SHA256,
+        fts_contract_version=FTS_CONTRACT_VERSION,
+        fts_contract_sha256=FTS_CONTRACT_SHA256,
         entries=len(SEED_ENTRIES),
         trusted_entries=trusted,
         quarantined_entries=len(SEED_ENTRIES) - trusted,
         recall_tasks=len(RECALL_TASKS),
         global_tasks=len(GLOBAL_RECALL_TASKS),
         degraded_tasks=len(DEGRADED_RECALL_TASKS),
+        fts_contract_tasks=len(FTS_CONTRACT_RECALL_TASKS),
+        natural_degraded_tasks=sum(
+            task.degradation is DegradationClass.NATURAL for task in FTS_CONTRACT_RECALL_TASKS
+        ),
+        adversarial_degraded_tasks=sum(
+            task.degradation is DegradationClass.ADVERSARIAL for task in FTS_CONTRACT_RECALL_TASKS
+        ),
         scopes=len({entry.scope for entry in SEED_ENTRIES}),
         kinds=len({entry.kind for entry in SEED_ENTRIES}),
     )

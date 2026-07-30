@@ -28,6 +28,7 @@ from .consolidation.report import (
 )
 from .consolidation.service import ConsolidationService
 from .db import DatabaseError, SQLiteVersionError, latest_schema_version
+from .eval.gate import EvaluationGateError
 from .eval.models import EvalMode
 from .eval.runner import run_evaluation
 from .logging_setup import FileLogger
@@ -81,6 +82,7 @@ def main() -> None:
         DatabaseLockError,
         DatacronGatewayError,
         ConsolidationApplyError,
+        EvaluationGateError,
         OSError,
         SQLiteVersionError,
         StoreBusyError,
@@ -400,6 +402,8 @@ def _error_exit_code(error: BaseException) -> int:
     if isinstance(error, StoreBusyError):
         return EXIT_TRANSIENT_BUSY
     if isinstance(error, ConsolidationApplyError):
+        return EXIT_PARTIAL_RESULT
+    if isinstance(error, EvaluationGateError):
         return EXIT_PARTIAL_RESULT
     return EXIT_LOCAL_RESOURCE
 

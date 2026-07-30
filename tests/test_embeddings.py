@@ -6,9 +6,10 @@
 from __future__ import annotations
 
 import httpx
+import pytest
 
 from engram.config import RetrievalConfig, RetrievalMode
-from engram.embeddings import HttpEmbeddingProvider
+from engram.embeddings import EmbeddingError, HttpEmbeddingProvider
 
 
 def test_http_embedding_provider_uses_openai_compatible_batch_contract() -> None:
@@ -34,3 +35,41 @@ def test_http_embedding_provider_uses_openai_compatible_batch_contract() -> None
     vectors = provider.embed(("first", "second"))
 
     assert vectors == ((1.0, 0.0), (0.0, 1.0))
+
+
+def test_http_embedding_provider_rejects_zero_norm_vectors() -> None:
+    transport = httpx.MockTransport(
+        lambda _request: httpx.Response(
+            200,
+            json={"data": [{"index": 0, "embedding": [0.0, 0.0]}]},
+        )
+    )
+    provider = HttpEmbeddingProvider(
+        RetrievalConfig(
+            mode=RetrievalMode.HYBRID,
+            embeddings_model="mock-model",
+        ),
+        transport=transport,
+    )
+
+    with pytest.raises(EmbeddingError, match="non-zero norm"):
+        provider.embed(("zero",))
+
+
+def test_http_embedding_provider_rejects_values_outside_float32() -> None:
+    transport = httpx.MockTransport(
+        lambda _request: httpx.Response(
+            200,
+            json={"data": [{"index": 0, "embedding": [1e300, 1.0]}]},
+        )
+    )
+    provider = HttpEmbeddingProvider(
+        RetrievalConfig(
+            mode=RetrievalMode.HYBRID,
+            embeddings_model="mock-model",
+        ),
+        transport=transport,
+    )
+
+    with pytest.raises(EmbeddingError, match="fit in float32"):
+        provider.embed(("oversized",))

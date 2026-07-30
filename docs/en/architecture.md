@@ -30,8 +30,9 @@ to avoid inode replacement races. Pure `list` reads use SQLite `mode=ro` without
 
 SQLite opens in WAL mode with foreign keys, a busy timeout, and transactional migrations. The
 3.51.3 floor avoids the WAL-reset bug. The `entries` table is canonical; FTS and vector tables are
-derived and reconstructible with `engram reindex`. `consolidation_plans` anchors immutable plan
-snapshots and their single-use state outside the editable review artifact.
+derived and reconstructible with `engram reindex`. Startup compares the external-content FTS index
+with canonical rows and rebuilds it when it is missing or inconsistent. `consolidation_plans`
+anchors immutable plan snapshots and their single-use state outside the editable review artifact.
 
 `audit_log` is append-only. It stores actor, action, entry identifier, and a detail fingerprint,
 never the statement or conversation payload.
@@ -47,10 +48,14 @@ MCP receives tool calls only. It does not observe the client conversation, which
 
 ## Retrieval
 
-`fts` mode queries FTS5 with BM25 and uses recency as a tie-breaker. A bounded substring search is
-the fallback when FTS returns nothing. The configured `hybrid` mode combines FTS and embeddings
-through reciprocal rank fusion (`rrf_k`). The embeddings endpoint is local and OpenAI-compatible;
-when it is unavailable, recall explicitly falls back to FTS.
+`fts` mode derives operator-neutral terms from bounded NFKC input. It ranks an exact phrase and an
+all-term query first, then fills every remaining top-K slot from fairly interleaved disjunction and
+controlled-prefix rankings. Strict hits keep priority without suppressing morphological matches.
+Every stage applies visibility filters and a hard top-K in SQL, with BM25 followed by recency and
+identifier tie-breaks. The configured `hybrid` mode combines FTS and embeddings through reciprocal
+rank fusion (`rrf_k`). It computes an exact semantic top-K only while all visible vectors fit under
+`hybrid_max_candidates`; an overflow or unavailable embedding endpoint degrades explicitly to FTS
+and marks the capsule incomplete.
 
 ## Recall capsule
 
@@ -61,10 +66,14 @@ The D6/D7 policy separates ranking from trust. The capsule is filled in this ord
 3. `relevant`: relevant episodes;
 4. `conflicts`: unresolved symmetric versions, only when requested;
 5. `own_pending`: quarantined candidates belonging to the calling client only;
-6. `sources` and `notes`: identifiers and selection rationale.
+6. `sources` and `notes`: identifiers, selection rationale, `recall_complete`, and bounded warning
+   codes for any fail-closed omission.
 
-The budget is bounded by `[capsule]`. Lower-priority items are omitted first with an explicit note;
-a stale, superseded, expired, or other-client quarantined entry cannot enter `current`.
+The budget is bounded by `[capsule]` against the serialized fallback plus structured payload. The
+serialized UTF-8 byte count is used as a one-byte-per-token conservative ceiling and an absolute
+payload-size cap. Lower-priority items are omitted first with an explicit note, and oversized scope
+metadata is represented by a bounded digest; a stale, superseded, expired, or other-client
+quarantined entry cannot enter `current`.
 
 ## Datacron consolidation
 

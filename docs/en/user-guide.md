@@ -33,7 +33,8 @@ store secrets, transcripts, hypotheses, duplicates, or ephemeral detail.
 - `relevant` contains recent episodes.
 - `conflicts` stays empty unless `include_conflicts=true`.
 - `own_pending` contains only quarantined candidates written by this MCP client.
-- `sources` lists cited identifiers; `notes` explains selection and budget omissions.
+- `sources` lists cited identifiers; `notes` explains selection, budget omissions, and whether
+  recall was complete. Never infer absence when `notes.recall_complete` is false.
 
 Treat `own_pending` as unconfirmed. A candidate must not guide irreversible action.
 
@@ -132,9 +133,11 @@ uv run --python 3.14.3 engram eval --mode fts --out local/eval
 uv run --python 3.14.3 engram eval --mode both --out local/eval
 ```
 
-The seeded corpus loads 72 entries and grades 64 queries with deterministic graders. `both` also
-measures hybrid retrieval when the endpoint responds. `metrics.json` and `rapport-eval.md` stay
-under `local/` and are not published.
+The seeded corpus loads 72 entries and grades 88 queries with deterministic graders. The FTS
+release contract always uses its checked-in retrieval settings and a conservative 4800-byte UTF-8
+capsule cap, independently from runtime retrieval and capsule defaults. `both` also measures
+hybrid retrieval when the endpoint responds. `metrics.json` and `rapport-eval.md` stay under
+`local/` and are not published.
 
 ## Consolidate into Datacron
 

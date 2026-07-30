@@ -51,9 +51,10 @@ exploitation sans embeddings.
 
 ## La recherche FTS rate une variante morphologique
 
-Essayer des termes du statement ou des `subject_keys`. Le filet substring ne remplace pas un
-stemmer. Porter et les prefixes sont differes jusqu'a preuve d'un besoin reel ; le mode hybride est
-la voie d'extension actuelle.
+Essayer des termes du statement ou des `subject_keys`. Engram applique des prefixes controles apres
+les etages phrase exacte, tous les termes et au moins un terme, mais ce n'est ni un stemmer ni un
+correcteur orthographique flou. Utiliser le mode hybride pour les paraphrases sans vocabulaire
+commun.
 
 ## La consolidation dit `stale`
 

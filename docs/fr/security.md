@@ -22,7 +22,10 @@ Un candidat quarantined :
 - ne peut pas etre consolide vers Datacron.
 
 Cette politique limite la propagation entre clients d'une instruction injectee ou d'une inference
-fausse. La revue et l'attestation restent explicites.
+fausse. La revue et l'attestation restent explicites. Le couple nom/version MCP est declare par le
+client lui-meme. Il sert seulement d'espace de noms pratique pour les observations en attente :
+ce n'est ni une authentification, ni une autorisation, ni une frontiere de confidentialite. Tout
+processus capable de joindre l'endpoint peut declarer le meme couple.
 
 ## Writer unique et SQLite
 
@@ -42,9 +45,11 @@ ecriture offline, puis le redemarrer ensuite.
 
 ## Reseau
 
-Le defaut `127.0.0.1` est une frontiere de securite. Engram n'implemente ni compte, ni jeton, ni
-TLS. Ne pas utiliser `0.0.0.0` directement. Pour un client distant, placer un proxy HTTPS
-authentifie devant Engram, restreindre les origines et le reseau, et surveiller les acces.
+L'adresse d'ecoute est une frontiere de securite. Engram accepte uniquement des literals IP
+loopback non ambigus comme `127.0.0.1` ou `::1` ; les hostnames, wildcards, adresses LAN et adresses
+publiques echouent a la configuration. Engram n'implemente ni compte, ni jeton, ni TLS. Pour un
+client distant, placer un proxy HTTPS authentifie devant l'endpoint loopback, restreindre les
+origines et le reseau, et surveiller les acces.
 
 ## Confinement Datacron
 
@@ -69,9 +74,14 @@ marquer la promotion.
 
 ## Capsule bornee
 
-`token_budget` est contraint par un minimum et un maximum serveur. Le builder retire les sections
-de plus faible priorite avant de depasser le budget et signale les omissions. Cette borne limite
-l'exfiltration accidentelle et l'envahissement du contexte, sans remplacer le controle d'acces.
+`token_budget` est contraint par un minimum et un maximum serveur. Engram l'interprete de facon
+conservatrice comme le nombre maximal d'octets UTF-8 du resultat d'outil complet serialise : un
+octet par token subword byte-level possible. C'est une limite absolue de taille du payload, pas une
+promesse de tokenisation exacte pour chaque modele. Le builder mesure ensemble fallback et contenu
+structure, remplace un scope surdimensionne par une empreinte bornee, retire les sections de plus
+faible priorite avant la limite et expose les omissions fail-closed via
+`notes.recall_complete` et des codes d'avertissement bornes. Cette borne limite l'exfiltration
+accidentelle et l'envahissement du contexte, sans remplacer le controle d'acces.
 
 ## Sauvegarde et incident
 

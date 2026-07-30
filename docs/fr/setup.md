@@ -21,8 +21,23 @@ Si la version affichee est inferieure a `3.51.3`, suivre
 
 ## 2. Configurer et lancer
 
-Editer `engram.toml`. Les valeurs par defaut ecoutent uniquement loopback, conservent la base dans
-`engram.db`, utilisent FTS et desactivent les ecritures Datacron.
+Editer `engram.toml`. Le serveur accepte uniquement des literals IP loopback (`127.0.0.1` ou
+`::1`), conserve la base dans `engram.db`, utilise FTS et desactive les ecritures Datacron par
+defaut.
+
+Pour mettre a niveau une configuration existante, ajuster les limites capsule avant de
+redemarrer :
+
+```toml
+[capsule]
+default_token_budget = 4800
+min_token_budget = 1200
+max_token_budget = 6000
+```
+
+Le minimum doit valoir au moins 1200 et le maximum doit etre superieur ou egal au budget par
+defaut. Engram refuse au demarrage les anciennes limites plus petites, car elles ne peuvent pas
+contenir l'enveloppe de reponse bornee obligatoire.
 
 ```powershell
 uv run --python 3.14.3 engram serve

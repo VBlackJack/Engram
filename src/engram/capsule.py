@@ -5,8 +5,11 @@
 
 from __future__ import annotations
 
+import json
+import re
 from collections.abc import Iterable, Sequence
 from datetime import UTC, datetime
+from hashlib import sha256
 from typing import Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -22,6 +25,16 @@ CURRENT_KINDS = frozenset(
         EntryKind.FACT,
     }
 )
+SAFE_SCOPE_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,39}\Z")
+RANK_REASON = "retrieval rank with recency tie-break"
+SCOPE_REASON = "scope filter applied"
+BUDGET_NOTE_SUFFIX = " entries omitted, budget"
+CAPSULE_BUDGET_UNIT = "serialized_utf8_bytes"
+CAPSULE_ESTIMATOR_VERSION = "utf8-bytes-v1"
+CALL_RESULT_BYTE_MARGIN = 8
+CAPSULE_BUDGET_OVERFLOW_NOTICE = "capsule_budget_overflow"
+UNCLASSIFIED_CLAIM_OMITTED_NOTICE = "unclassified_claim_omitted"
+CONFLICTS_HIDDEN_BY_REQUEST_NOTICE = "conflicts_hidden_by_request"
 
 
 class CapsuleItem(BaseModel):
@@ -61,6 +74,8 @@ class CapsuleNotes(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     scope_used: str | None
+    recall_complete: bool = True
+    warnings: list[str] = Field(default_factory=list)
     why_returned: list[str]
 
 
@@ -131,9 +146,9 @@ class CapsuleBuilder:
         ]
         conflicts = conflict_groups if include_conflicts else []
         own_pending = [_pending_item(entry) for entry in retrieval.own_pending]
-        reasons = ["retrieval rank with recency tie-break"]
+        reasons = [RANK_REASON]
         if scope is not None:
-            reasons.append(f"scope filter: {scope}")
+            reasons.append(SCOPE_REASON)
         if unclassified_ids:
             reasons.append(_unclassified_omission_note(len(unclassified_ids)))
         if conflict_ids and not include_conflicts:
@@ -149,29 +164,78 @@ class CapsuleBuilder:
         candidates.extend(("conflicts", item) for item in conflicts)
         candidates.extend(("own_pending", item) for item in own_pending)
 
-        capsule = _empty_capsule(scope, reasons)
-        omitted = 0
+        capsule = _empty_capsule(
+            _safe_scope_representation(scope),
+            reasons,
+            (
+                *retrieval.notices,
+                *((UNCLASSIFIED_CLAIM_OMITTED_NOTICE,) if unclassified_ids else ()),
+                *(
+                    (CONFLICTS_HIDDEN_BY_REQUEST_NOTICE,)
+                    if conflict_ids and not include_conflicts
+                    else ()
+                ),
+            ),
+        )
         for section, item in candidates:
             _append_item(capsule, section, item)
-            _refresh_sources(capsule)
-            if _estimated_tokens(render_capsule_text(capsule)) > token_budget:
-                _pop_item(capsule, section)
-                omitted += _item_count(item)
-                _refresh_sources(capsule)
+        _refresh_sources(capsule)
 
-        if omitted:
-            omission_note = f"{omitted} entries omitted, budget"
-            capsule.notes.why_returned.append(omission_note)
-            while _estimated_tokens(render_capsule_text(capsule)) > token_budget:
-                removed = _remove_lowest_priority(capsule)
-                if removed == 0:
-                    break
-                omitted += removed
-                capsule.notes.why_returned[-1] = f"{omitted} entries omitted, budget"
-                _refresh_sources(capsule)
+        omitted = 0
+        if estimate_capsule_bytes(capsule) > token_budget:
+            _compact_notes(capsule)
+        while estimate_capsule_bytes(capsule) > token_budget:
+            removed = _remove_lowest_priority(capsule)
+            if removed == 0:
+                break
+            omitted += removed
+            _refresh_sources(capsule)
+            _set_budget_note(capsule, omitted)
+            _mark_incomplete(capsule, CAPSULE_BUDGET_OVERFLOW_NOTICE)
 
         text = render_capsule_text(capsule)
+        serialized_bytes = estimate_capsule_bytes(capsule, text)
+        if serialized_bytes > token_budget:
+            _minimize_notes(capsule)
+            text = render_capsule_text(capsule)
+            serialized_bytes = estimate_capsule_bytes(capsule, text)
+        if serialized_bytes > token_budget:
+            raise ValueError(
+                "token_budget is too small for mandatory capsule metadata: "
+                f"requires {serialized_bytes} serialized bytes, received {token_budget}"
+            )
         return capsule, text
+
+
+def estimate_payload_bytes(payload: str) -> int:
+    """Upper-bound byte-level subword tokens by serialized UTF-8 bytes."""
+    return len(payload.encode("utf-8"))
+
+
+def estimate_capsule_bytes(
+    capsule: CapsuleResult,
+    rendered_text: str | None = None,
+) -> int:
+    """Measure the serialized tool result, including both representations."""
+    text = render_capsule_text(capsule) if rendered_text is None else rendered_text
+    serialized = json.dumps(
+        {
+            "meta": None,
+            "content": [
+                {
+                    "type": "text",
+                    "text": text,
+                    "annotations": None,
+                    "meta": None,
+                }
+            ],
+            "structuredContent": capsule.model_dump(mode="json"),
+            "isError": False,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return estimate_payload_bytes(serialized) + CALL_RESULT_BYTE_MARGIN
 
 
 def render_capsule_text(capsule: CapsuleResult) -> str:
@@ -194,6 +258,8 @@ def render_capsule_text(capsule: CapsuleResult) -> str:
         lines.append("- none")
     lines.append("NOTES")
     lines.append(f"- scope_used: {capsule.notes.scope_used or 'all'}")
+    lines.append(f"- recall_complete: {str(capsule.notes.recall_complete).lower()}")
+    lines.extend(f"- warning: {warning}" for warning in capsule.notes.warnings)
     lines.extend(f"- {reason}" for reason in capsule.notes.why_returned)
     return "\n".join(lines)
 
@@ -262,10 +328,95 @@ def _format_datetime(value: datetime) -> str:
     return value.astimezone(UTC).isoformat(timespec="microseconds").replace("+00:00", "Z")
 
 
-def _empty_capsule(scope: str | None, reasons: list[str]) -> CapsuleResult:
+def _empty_capsule(
+    scope: str | None,
+    reasons: list[str],
+    notices: Sequence[str],
+) -> CapsuleResult:
+    unique_notices = list(dict.fromkeys(notices))
     return CapsuleResult(
-        notes=CapsuleNotes(scope_used=scope, why_returned=reasons.copy()),
+        notes=CapsuleNotes(
+            scope_used=scope,
+            recall_complete=not unique_notices,
+            warnings=unique_notices,
+            why_returned=reasons.copy(),
+        ),
     )
+
+
+def _safe_scope_representation(scope: str | None) -> str | None:
+    if scope is None:
+        return None
+    if SAFE_SCOPE_PATTERN.fullmatch(scope):
+        return scope
+    encoded = scope.encode("utf-8", errors="surrogatepass")
+    digest = sha256(encoded).hexdigest()[:16]
+    return f"<scope#{digest}>"
+
+
+def _compact_notes(capsule: CapsuleResult) -> None:
+    compacted: list[str] = []
+    for reason in capsule.notes.why_returned:
+        compact = _compact_reason(reason)
+        if compact not in compacted:
+            compacted.append(compact)
+    capsule.notes.why_returned = compacted
+
+
+def _minimize_notes(capsule: CapsuleResult) -> None:
+    reasons = capsule.notes.why_returned
+    parts = ["ranked"]
+    unclassified = _reason_count(reasons, "unclassified")
+    conflicts = _reason_count(reasons, "conflict")
+    budget = _reason_count(reasons, "budget")
+    if unclassified is not None:
+        parts.append(f"unclassified={unclassified}")
+    if conflicts is not None:
+        parts.append(f"conflicts={conflicts}")
+    if budget is not None:
+        parts.append(f"budget={budget}")
+    capsule.notes.why_returned = ["; ".join(parts)]
+
+
+def _reason_count(reasons: Sequence[str], marker: str) -> str | None:
+    for reason in reasons:
+        if marker in reason:
+            match = re.search(r"\d+", reason)
+            return None if match is None else match.group()
+    return None
+
+
+def _compact_reason(reason: str) -> str:
+    if reason == RANK_REASON:
+        return "ranked retrieval"
+    if reason == SCOPE_REASON or reason.startswith("scope filter:"):
+        return "scope filtered"
+    if "claim_key classification required" in reason:
+        return f"unclassified omitted: {_leading_count(reason)}"
+    if "unresolved conflict entries omitted" in reason:
+        return f"conflicts omitted: {_leading_count(reason)}"
+    return reason
+
+
+def _leading_count(reason: str) -> str:
+    count, separator, _ = reason.partition(" ")
+    return count if separator and count.isdecimal() else "unknown"
+
+
+def _set_budget_note(capsule: CapsuleResult, omitted: int) -> None:
+    note = f"{omitted}{BUDGET_NOTE_SUFFIX}"
+    for index, reason in enumerate(capsule.notes.why_returned):
+        if reason.endswith(BUDGET_NOTE_SUFFIX):
+            capsule.notes.why_returned[index] = note
+            return
+    capsule.notes.why_returned.append(note)
+
+
+def _mark_incomplete(capsule: CapsuleResult, notice: str) -> None:
+    """Persist one bounded completeness warning through later compaction."""
+    capsule.notes.recall_complete = False
+    if notice not in capsule.notes.warnings:
+        capsule.notes.warnings.append(notice)
 
 
 def _append_item(
@@ -283,21 +434,6 @@ def _append_item(
         capsule.conflicts.append(cast("ConflictItem", item))
     elif name == "own_pending":
         capsule.own_pending.append(cast("PendingItem", item))
-    else:
-        raise ValueError(f"Unknown capsule section: {name}")
-
-
-def _pop_item(capsule: CapsuleResult, name: str) -> None:
-    if name == "current":
-        capsule.current.pop()
-    elif name == "next_action":
-        capsule.next_action.pop()
-    elif name == "relevant":
-        capsule.relevant.pop()
-    elif name == "conflicts":
-        capsule.conflicts.pop()
-    elif name == "own_pending":
-        capsule.own_pending.pop()
     else:
         raise ValueError(f"Unknown capsule section: {name}")
 
@@ -323,10 +459,10 @@ def _refresh_sources(capsule: CapsuleResult) -> None:
 def _remove_lowest_priority(capsule: CapsuleResult) -> int:
     for section in (
         capsule.own_pending,
-        capsule.conflicts,
         capsule.relevant,
         capsule.next_action,
         capsule.current,
+        capsule.conflicts,
     ):
         if section:
             return _item_count(section.pop())
@@ -335,10 +471,6 @@ def _remove_lowest_priority(capsule: CapsuleResult) -> int:
 
 def _item_count(item: CapsuleItem | ConflictItem | PendingItem) -> int:
     return len(item.versions) if isinstance(item, ConflictItem) else 1
-
-
-def _estimated_tokens(text: str) -> int:
-    return (len(text) + 3) // 4
 
 
 def _render_items(

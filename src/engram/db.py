@@ -797,28 +797,108 @@ def apply_migrations(
 
 
 def ensure_derived_indexes(connection: sqlite3.Connection) -> None:
-    """Recreate missing derived index tables from canonical entries."""
-    if not _table_exists(connection, FTS_TABLE_NAME):
+    """Recreate missing or inconsistent derived indexes from canonical entries."""
+    if not _fts_schema_matches(connection):
+        if _table_exists(connection, FTS_TABLE_NAME):
+            LOGGER.warning("FTS table schema is unexpected; rebuilding the derived index")
         rebuild_fts_index(connection)
-    if not _table_exists(connection, "entry_vectors"):
-        with transaction(connection):
-            connection.execute(CREATE_VECTOR_TABLE_SQL)
+    else:
+        try:
+            _verify_fts_index(connection)
+        except sqlite3.DatabaseError:
+            LOGGER.warning("FTS index is inconsistent with canonical entries; rebuilding it")
+            rebuild_fts_index(connection)
+            try:
+                _verify_fts_index(connection)
+            except sqlite3.DatabaseError as exc:
+                raise DatabaseError("FTS index remains inconsistent after rebuild") from exc
+    if not _vector_schema_matches(connection):
+        if _schema_object_type(connection, "entry_vectors") is not None:
+            LOGGER.warning("Vector table schema is unexpected; rebuilding the empty derived index")
+        _rebuild_vector_table(connection)
+
+
+def _verify_fts_index(connection: sqlite3.Connection) -> None:
+    """Compare the FTS5 index with its external canonical content table."""
+    connection.execute("INSERT INTO entries_fts(entries_fts, rank) VALUES ('integrity-check', 1)")
+
+
+def _fts_schema_matches(connection: sqlite3.Connection) -> bool:
+    """Require the exact checked-in FTS5 external-content table definition."""
+    return _table_schema_matches(connection, FTS_TABLE_NAME, CREATE_FTS_TABLE_SQL)
+
+
+def _vector_schema_matches(connection: sqlite3.Connection) -> bool:
+    """Require the exact checked-in derived vector table definition."""
+    return _table_schema_matches(connection, "entry_vectors", CREATE_VECTOR_TABLE_SQL)
+
+
+def _table_schema_matches(
+    connection: sqlite3.Connection,
+    name: str,
+    expected_sql: str,
+) -> bool:
+    """Compare one table with a normalized checked-in schema definition."""
+    row = connection.execute(
+        "SELECT type, sql FROM sqlite_schema WHERE name = ?",
+        (name,),
+    ).fetchone()
+    if row is None:
+        return False
+    object_type = row["type"] if isinstance(row, sqlite3.Row) else row[0]
+    schema_sql = row["sql"] if isinstance(row, sqlite3.Row) else row[1]
+    if str(object_type) != "table" or not isinstance(schema_sql, str):
+        return False
+    actual = " ".join(schema_sql.split()).casefold()
+    expected = " ".join(expected_sql.split()).casefold()
+    return actual == expected
 
 
 def rebuild_fts_index(connection: sqlite3.Connection) -> None:
     """Drop and rebuild the external-content FTS table transactionally."""
+    object_type = _schema_object_type(connection, FTS_TABLE_NAME)
     with transaction(connection):
-        connection.execute("DROP TABLE IF EXISTS entries_fts")
+        if object_type == "table":
+            connection.execute("DROP TABLE entries_fts")
+        elif object_type == "view":
+            connection.execute("DROP VIEW entries_fts")
+        elif object_type is not None:
+            raise DatabaseError(
+                f"Cannot rebuild FTS index over unexpected SQLite object type: {object_type}"
+            )
         connection.execute(CREATE_FTS_TABLE_SQL)
         connection.execute("INSERT INTO entries_fts(entries_fts) VALUES ('rebuild')")
 
 
+def _rebuild_vector_table(connection: sqlite3.Connection) -> None:
+    """Recreate malformed derived vector storage as an empty valid table."""
+    object_type = _schema_object_type(connection, "entry_vectors")
+    with transaction(connection):
+        if object_type == "table":
+            connection.execute("DROP TABLE entry_vectors")
+        elif object_type == "view":
+            connection.execute("DROP VIEW entry_vectors")
+        elif object_type is not None:
+            raise DatabaseError(
+                f"Cannot rebuild vector index over unexpected SQLite object type: {object_type}"
+            )
+        connection.execute(CREATE_VECTOR_TABLE_SQL)
+
+
 def _table_exists(connection: sqlite3.Connection, name: str) -> bool:
+    return _schema_object_type(connection, name) == "table"
+
+
+def _schema_object_type(connection: sqlite3.Connection, name: str) -> str | None:
+    """Return one SQLite schema object type without interpolating its name."""
     row = connection.execute(
-        "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?",
+        "SELECT type FROM sqlite_schema WHERE name = ?",
         (name,),
     ).fetchone()
-    return row is not None
+    if row is None:
+        return None
+    value = row["type"] if isinstance(row, sqlite3.Row) else row[0]
+    return str(value)
 
 
 @contextmanager

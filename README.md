@@ -62,8 +62,8 @@ les artefacts wheel/sdist attaches a la release GitHub.
 uv run --python 3.14.3 engram serve
 ```
 
-Le point MCP par defaut est `http://127.0.0.1:8377/mcp`. Conserver cette adresse loopback : le
-serveur n'implemente pas d'authentification reseau.
+Le point MCP par defaut est `http://127.0.0.1:8377/mcp`. Engram refuse toute adresse d'ecoute qui
+n'est pas un literal IP loopback : le serveur n'implemente pas d'authentification reseau.
 
 Ajoutez ensuite ce serveur a Claude Code, Codex ou Gemini, puis installez le
 [protocole client](docs/fr/client-protocol.md). Les blocs de configuration exacts sont dans le
@@ -84,7 +84,7 @@ dossier du fichier TOML.
 | `[attestation]` | `ENGRAM_ATTESTATION_DEFAULT_ACTOR` | Acteur par defaut des mutations locales de confiance |
 | `[server]` | `ENGRAM_SERVER_HOST`, `_PORT`, `_PATH`, `_WRITE_WAIT_TIMEOUT_MS`, `_TTL_SWEEP_INTERVAL_SECONDS` | Endpoint HTTP, backpressure et balayage d'expiration logique |
 | `[capsule]` | `ENGRAM_CAPSULE_DEFAULT_TOKEN_BUDGET`, `_MIN_TOKEN_BUDGET`, `_MAX_TOKEN_BUDGET` | Budget du rappel |
-| `[retrieval]` | `ENGRAM_RETRIEVAL_MODE`, `_EMBEDDINGS_ENDPOINT`, `_EMBEDDINGS_MODEL`, `_EMBEDDINGS_TIMEOUT_MS`, `_RRF_K` | FTS ou hybride local |
+| `[retrieval]` | `ENGRAM_RETRIEVAL_MODE`, `_FTS_TOP_K`, `_FTS_MAX_QUERY_CHARS`, `_FTS_MAX_QUERY_TERMS`, `_FTS_MIN_PREFIX_CHARS`, `_HYBRID_MAX_CANDIDATES`, `_EMBEDDINGS_ENDPOINT`, `_EMBEDDINGS_MODEL`, `_EMBEDDINGS_TIMEOUT_MS`, `_RRF_K` | FTS borne ou hybride local |
 | `[datacron]` | `ENGRAM_DATACRON_COMMAND`, `_ARGS`, `_VAULT_ROOT`, `_READ_PATHS`, `_WRITE_PATHS`, `_NEW_NOTE_DIRECTORY`, `_NEIGHBOR_LIMIT`, `_STARTUP_TIMEOUT_MS`, `_REQUEST_TIMEOUT_MS`, `_SHUTDOWN_TIMEOUT_MS` | Gateway, timeouts et confinement Datacron |
 
 Pour une variable de liste, `ARGS` suit le decoupage shell et `READ_PATHS`/`WRITE_PATHS` utilisent
@@ -98,7 +98,7 @@ local par defaut lance `datacron mcp serve`.
 | Outil | Entrees essentielles | Resultat et politique |
 | --- | --- | --- |
 | `remember` | `statement`, `kind`, `scope`, `subject_keys`, `observed_at`, `evidence` | Retourne `created`, `retry`, `corroborated`, `existing_trusted` ou `renewed` ; les contenus nouveaux/renouveles restent quarantaines |
-| `recall` | `query`, `scope`, `kinds`, `include_conflicts`, `token_budget` | Retourne une capsule trust-aware ; seuls les candidats du client courant figurent dans `own_pending` |
+| `recall` | `query`, `scope`, `kinds`, `include_conflicts`, `token_budget` | Retourne une capsule trust-aware ; toujours inspecter `notes.recall_complete` et ses codes |
 
 Kinds acceptes : `preference`, `decision`, `project_state`, `fact`, `episode`. Le serveur attribue
 la provenance ; un client ne peut jamais declarer lui-meme une source `human`.
@@ -109,11 +109,14 @@ la provenance ; un client ne peut jamais declarer lui-meme une source `human`.
 - Aucun appel a un LLM cloud ni aucune telemetrie n'est implemente.
 - Les candidats d'un client sont quarantaines pour eviter qu'une affirmation non attestee ne
   devienne la verite partagee.
+- Le nom/version MCP est un espace de noms auto-declare, pas une authentification ni une frontiere
+  de confidentialite.
 - Le mode hybride contacte uniquement l'endpoint d'embeddings explicitement configure ; FTS est
   le mode par defaut.
 - Les ecritures Datacron passent par des allowlists sous `_memory/`, un chemin canonique
   deterministe et une relecture exacte.
-- Ne pas exposer le serveur sur `0.0.0.0` sans proxy d'authentification et controle reseau.
+- L'ecoute directe est limitee aux literals IP loopback. Un proxy distant eventuel doit joindre
+  Engram localement et fournir lui-meme authentification, TLS et controle reseau.
 
 Voir le [modele de securite complet](docs/fr/security.md).
 
@@ -168,11 +171,13 @@ avant la commande, ou `ENGRAM_DEBUG=1`, uniquement pour obtenir un traceback.
 - Le transport est HTTP local. Le connecteur distant Claude Desktop exige une URL HTTPS publique ;
   Claude Code se connecte directement a localhost.
 - Le mode hybride est experimental et depend d'un endpoint compatible OpenAI local. Il se degrade
-  explicitement vers FTS en cas de panne.
+  explicitement vers FTS en cas de panne ou si son scan vectoriel exact depasse le plafond de
+  candidats configure.
 - La publication PyPI et la soumission au MCP Registry sont differees. Le manifeste est pret pour
   le paquet et son endpoint HTTP local.
-- Porter et les recherches par prefixe ne seront evalues que si l'usage reel montre des ratages
-  morphologiques.
+- Le FTS reste lexical : ses fallbacks bornes gerent le bruit, l'ordre des termes et les prefixes,
+  mais pas les paraphrases sans vocabulaire commun. Le rapport d'evaluation mesure separement ces
+  paraphrases pour eviter de confondre rappel lexical et rappel semantique.
 
 ## Documentation
 

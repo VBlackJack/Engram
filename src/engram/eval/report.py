@@ -10,33 +10,135 @@ from .models import EvaluationMetrics, FamilyMetrics, ModeMetrics, ModeStatus
 
 def render_report(metrics: EvaluationMetrics) -> str:
     """Render a two-minute, ASCII-punctuation French evaluation report."""
+    lexical_threshold = _percent(
+        metrics.fts_contract.thresholds.minimum_lexical_degraded_gold_in_capsule_rate
+    )
+    lexical_check = _check(
+        passed=metrics.fts_contract.checks["lexical_degraded_gold_in_capsule_rate"]
+    )
     lines = [
         "# Rapport d'evaluation Engram",
+        "",
+        (
+            f"Corpus: `{metrics.corpus.version}`; semantique: "
+            f"`{metrics.corpus.semantic_benchmark_version}`; contrat FTS: "
+            f"`{metrics.corpus.fts_contract_version}`"
+        ),
+        "",
+        "## Gate FTS",
+        "",
+        f"**{'PASS' if metrics.fts_contract.passed else 'FAIL'}**",
+        "",
+        (
+            "Plafond capsule contractuel: "
+            f"{metrics.fts_contract.capsule_byte_budget} octets UTF-8 conservateurs "
+            f"({metrics.fts_contract.capsule_budget_unit}, "
+            f"estimateur {metrics.fts_contract.capsule_estimator_version}, "
+            f"marge {metrics.fts_contract.call_result_byte_margin} octets)."
+        ),
+        (
+            "Retrieval contractuel: "
+            f"top-K {metrics.fts_contract.retrieval_config['fts_top_k']}, "
+            f"{metrics.fts_contract.retrieval_config['fts_max_query_terms']} termes maximum."
+        ),
+        "",
+        "| Mesure | Observe | Seuil | Passe |",
+        "|---|---:|---:|:---:|",
+        (
+            "| Gold global | "
+            f"{_percent(metrics.fts_contract.global_gold_in_capsule_rate)} | "
+            f">= {_percent(metrics.fts_contract.thresholds.minimum_global_gold_in_capsule_rate)} "
+            "| "
+            f"{_check(passed=metrics.fts_contract.checks['global_gold_in_capsule_rate'])} |"
+        ),
+        (
+            "| Degrade lexical/adversarial | "
+            f"{_percent(metrics.fts_contract.lexical_degraded_gold_in_capsule_rate)} | "
+            f">= {lexical_threshold} "
+            f"| {lexical_check} |"
+        ),
+        (
+            "| Budget | "
+            f"{_percent(metrics.fts_contract.budget_pass_rate)} | "
+            f">= {_percent(metrics.fts_contract.thresholds.minimum_budget_pass_rate)} "
+            f"| {_check(passed=metrics.fts_contract.checks['budget_pass_rate'])} |"
+        ),
+        (
+            "| Rappel global complet | "
+            f"{_percent(metrics.fts_contract.global_complete_recall_rate)} | "
+            f">= "
+            f"{_percent(metrics.fts_contract.thresholds.minimum_global_complete_recall_rate)} "
+            f"| {_check(passed=metrics.fts_contract.checks['global_complete_recall_rate'])} |"
+        ),
+        (
+            "| Rappel lexical complet | "
+            f"{_percent(metrics.fts_contract.lexical_complete_recall_rate)} | "
+            f">= "
+            f"{_percent(metrics.fts_contract.thresholds.minimum_lexical_complete_recall_rate)} "
+            f"| {_check(passed=metrics.fts_contract.checks['lexical_complete_recall_rate'])} |"
+        ),
+        (
+            "| Politique de contradiction | "
+            f"{_percent(metrics.fts_contract.contradiction_pass_rate)} | "
+            f">= "
+            f"{_percent(metrics.fts_contract.thresholds.minimum_contradiction_pass_rate)} "
+            f"| {_check(passed=metrics.fts_contract.checks['contradiction_pass_rate'])} |"
+        ),
+        (
+            "| Resistance au poisoning | "
+            f"{_percent(metrics.fts_contract.poisoning_pass_rate)} | "
+            f">= {_percent(metrics.fts_contract.thresholds.minimum_poisoning_pass_rate)} "
+            f"| {_check(passed=metrics.fts_contract.checks['poisoning_pass_rate'])} |"
+        ),
+        (
+            "| Recall p95 | "
+            f"{_milliseconds(metrics.fts_contract.recall_p95_ms)} | "
+            f"<= {_milliseconds(metrics.fts_contract.thresholds.maximum_recall_p95_ms)} "
+            f"| {_check(passed=metrics.fts_contract.checks['recall_p95_ms'])} |"
+        ),
+        "",
+        f"Warnings du contrat FTS: {_warning_summary(metrics.fts_contract.warning_counts)}.",
+        "",
+        (
+            "Le gate FTS couvre le rappel global et les degradations lexicales/adversariales "
+            "versionnees. Le benchmark semantique historique reste diagnostique et n'est pas "
+            "compte comme robustesse FTS."
+        ),
         "",
         "## Verdict P2",
         "",
         f"**{metrics.p2_verdict.value}**",
         "",
-        f"- Gain degrade hybride: {_points(metrics.p2_measures.degraded_gain_points)}",
+        f"- Gain semantique hybride: {_points(metrics.p2_measures.degraded_gain_points)}",
         f"- Delta global hybride: {_points(metrics.p2_measures.global_delta_points)}",
         f"- Recall p95 hybride: {_milliseconds(metrics.p2_measures.hybrid_recall_p95_ms)}",
         "",
         "## F1 - Rappel utile",
         "",
-        "| Mode | Gold global | Gold degrade | Budget | Position moyenne |",
-        "|---|---:|---:|---:|---:|",
+        "| Mode | Gold global | Lexical naturel | Lexical adversarial | "
+        "Lexical total | Semantique historique | Budget | Complet | "
+        "Warnings | Position moyenne |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---|---:|",
     ]
     for name, mode in metrics.modes.items():
         if mode.status is ModeStatus.MEASURED and mode.f1_recall is not None:
             family = mode.f1_recall
             lines.append(
                 f"| {name} | {_percent(family.global_gold_in_capsule_rate)} | "
+                f"{_percent(family.natural_degraded_gold_in_capsule_rate)} | "
+                f"{_percent(family.adversarial_degraded_gold_in_capsule_rate)} | "
+                f"{_percent(family.fts_contract_gold_in_capsule_rate)} | "
                 f"{_percent(family.degraded_gold_in_capsule_rate)} | "
                 f"{_percent(family.budget_pass_rate)} | "
+                f"{_percent(family.complete_recall_rate)} | "
+                f"{_warning_summary(family.warning_counts)} | "
                 f"{_number(family.mean_gold_position)} |"
             )
         else:
-            lines.append(f"| {name} | non mesure | non mesure | non mesure | non mesure |")
+            lines.append(
+                f"| {name} | non mesure | non mesure | non mesure | non mesure | "
+                "non mesure | non mesure | non mesure | non mesure | non mesure |"
+            )
 
     lines.extend(
         [
@@ -157,3 +259,13 @@ def _milliseconds(value: float | None) -> str:
 
 def _number(value: float | None) -> str:
     return "-" if value is None else f"{value:.2f}"
+
+
+def _check(*, passed: bool) -> str:
+    return "oui" if passed else "non"
+
+
+def _warning_summary(counts: dict[str, int]) -> str:
+    if not counts:
+        return "aucun"
+    return ", ".join(f"{code}={count}" for code, count in sorted(counts.items()))

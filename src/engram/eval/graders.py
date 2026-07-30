@@ -5,16 +5,18 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Mapping, Sequence
 from statistics import fmean
 
-from engram.capsule import CapsuleItem, CapsuleResult
+from engram.capsule import CapsuleItem, CapsuleResult, estimate_capsule_bytes
 
 from .models import (
     ComplementTask,
     ConflictTask,
     ConsolidationClass,
     ConsolidationFamilyMetrics,
+    DegradationClass,
     FamilyMetrics,
     GraderOutcome,
     PerClassMetrics,
@@ -29,16 +31,17 @@ def grade_gold_capsule(
     gold_id: str,
     capsule: CapsuleResult,
     rendered_text: str,
-    token_budget: int,
+    capsule_byte_budget: int,
 ) -> GraderOutcome:
     """Pass only when the gold entry is in its rendered section under budget."""
     section = _section_items(capsule, task)
     identifiers = [item.id for item in section]
     position = identifiers.index(gold_id) + 1 if gold_id in identifiers else None
-    estimated_tokens = (len(rendered_text) + 3) // 4
+    serialized_bytes = estimate_capsule_bytes(capsule, rendered_text)
     checks = {
         "gold_in_expected_section": position is not None,
-        "within_token_budget": estimated_tokens <= token_budget,
+        "within_capsule_byte_budget": serialized_bytes <= capsule_byte_budget,
+        "recall_complete": capsule.notes.recall_complete,
     }
     return GraderOutcome(
         task_id=task.task_id,
@@ -48,8 +51,9 @@ def grade_gold_capsule(
             "subset": task.subset.value,
             "expected_section": task.expected_section.value,
             "position": position,
-            "estimated_tokens": estimated_tokens,
-            "token_budget": token_budget,
+            "serialized_bytes": serialized_bytes,
+            "capsule_byte_budget": capsule_byte_budget,
+            "warning_codes": ",".join(capsule.notes.warnings),
         },
     )
 
@@ -178,6 +182,17 @@ def aggregate_recall(
     degraded_indexes = [
         index for index, task in enumerate(tasks) if task.subset is RecallSubset.DEGRADED
     ]
+    fts_contract_indexes = [
+        index for index, task in enumerate(tasks) if task.subset is RecallSubset.FTS_CONTRACT
+    ]
+    natural_degraded_indexes = [
+        index for index, task in enumerate(tasks) if task.degradation is DegradationClass.NATURAL
+    ]
+    adversarial_degraded_indexes = [
+        index
+        for index, task in enumerate(tasks)
+        if task.degradation is DegradationClass.ADVERSARIAL
+    ]
     positions = [
         int(position)
         for outcome in outcomes
@@ -185,16 +200,51 @@ def aggregate_recall(
         and not isinstance(position, bool)
     ]
     gold_passes = sum(outcome.checks.get("gold_in_expected_section", False) for outcome in outcomes)
-    budget_passes = sum(outcome.checks.get("within_token_budget", False) for outcome in outcomes)
+    budget_passes = sum(
+        outcome.checks.get("within_capsule_byte_budget", False) for outcome in outcomes
+    )
+    complete_passes = sum(outcome.checks.get("recall_complete", False) for outcome in outcomes)
+    warning_counts: Counter[str] = Counter()
+    for outcome in outcomes:
+        encoded = outcome.metrics.get("warning_codes")
+        if isinstance(encoded, str) and encoded:
+            warning_counts.update(encoded.split(","))
     return RecallFamilyMetrics(
         **base.model_dump(),
         global_tasks=len(global_indexes),
         degraded_tasks=len(degraded_indexes),
+        fts_contract_tasks=len(fts_contract_indexes),
         gold_in_capsule_rate=_rate(gold_passes, len(outcomes)),
         global_gold_in_capsule_rate=_indexed_rate(outcomes, global_indexes),
         degraded_gold_in_capsule_rate=_indexed_rate(outcomes, degraded_indexes),
+        fts_contract_gold_in_capsule_rate=_indexed_rate(
+            outcomes,
+            fts_contract_indexes,
+        ),
+        natural_degraded_gold_in_capsule_rate=_indexed_rate(
+            outcomes,
+            natural_degraded_indexes,
+        ),
+        adversarial_degraded_gold_in_capsule_rate=_indexed_rate(
+            outcomes,
+            adversarial_degraded_indexes,
+        ),
         mean_gold_position=None if not positions else _rounded(fmean(positions)),
         budget_pass_rate=_rate(budget_passes, len(outcomes)),
+        complete_recall_rate=_rate(complete_passes, len(outcomes)),
+        global_complete_recall_rate=_indexed_check_rate(
+            outcomes,
+            global_indexes,
+            "recall_complete",
+        ),
+        fts_contract_complete_recall_rate=_indexed_check_rate(
+            outcomes,
+            fts_contract_indexes,
+            "recall_complete",
+        ),
+        incomplete_recall_count=len(outcomes) - complete_passes,
+        warning_counts=dict(sorted(warning_counts.items())),
+        fts_contract_warning_counts=_warning_counts(outcomes, fts_contract_indexes),
     )
 
 
@@ -237,6 +287,27 @@ def _section_items(capsule: CapsuleResult, task: RecallTask) -> list[CapsuleItem
 def _indexed_rate(outcomes: Sequence[GraderOutcome], indexes: Sequence[int]) -> float:
     passes = sum(outcomes[index].checks.get("gold_in_expected_section", False) for index in indexes)
     return _rate(passes, len(indexes))
+
+
+def _indexed_check_rate(
+    outcomes: Sequence[GraderOutcome],
+    indexes: Sequence[int],
+    check: str,
+) -> float:
+    passes = sum(outcomes[index].checks.get(check, False) for index in indexes)
+    return _rate(passes, len(indexes))
+
+
+def _warning_counts(
+    outcomes: Sequence[GraderOutcome],
+    indexes: Sequence[int],
+) -> dict[str, int]:
+    counts: Counter[str] = Counter()
+    for index in indexes:
+        encoded = outcomes[index].metrics.get("warning_codes")
+        if isinstance(encoded, str) and encoded:
+            counts.update(encoded.split(","))
+    return dict(sorted(counts.items()))
 
 
 def _rate(numerator: int, denominator: int) -> float:

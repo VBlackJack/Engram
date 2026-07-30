@@ -12,6 +12,7 @@ from typing import Protocol
 import httpx
 
 from .config import RetrievalConfig
+from .vectors import FLOAT32_MAX
 
 
 class EmbeddingError(RuntimeError):
@@ -101,5 +102,9 @@ def _finite_vector(values: list[object]) -> tuple[float, ...]:
         converted = float(value)
         if not math.isfinite(converted):
             raise EmbeddingError("embedding vector values must be finite")
+        if abs(converted) > FLOAT32_MAX:
+            raise EmbeddingError("embedding vector values must fit in float32")
         vector.append(converted)
+    if not any(vector):
+        raise EmbeddingError("embedding vector must have a non-zero norm")
     return tuple(vector)

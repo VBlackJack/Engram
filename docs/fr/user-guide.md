@@ -33,7 +33,8 @@ Utiliser des `subject_keys` stables et peu nombreux, par exemple `engram:storage
 - `relevant` contient les episodes recents.
 - `conflicts` reste vide sauf si `include_conflicts=true`.
 - `own_pending` contient uniquement les candidats quarantaines ecrits par ce client MCP.
-- `sources` donne les identifiants cites ; `notes` explique la selection et les omissions budget.
+- `sources` donne les identifiants cites ; `notes` explique la selection, les omissions budget et
+  si le rappel est complet. Ne jamais conclure a une absence si `notes.recall_complete` vaut false.
 
 Traiter `own_pending` comme non confirme. Un candidat ne doit pas guider une action irreversible.
 
@@ -137,9 +138,11 @@ uv run --python 3.14.3 engram eval --mode fts --out local/eval
 uv run --python 3.14.3 engram eval --mode both --out local/eval
 ```
 
-Le corpus seede charge 72 entrees et note 64 requetes avec des graders deterministes. `both`
-mesure aussi l'hybride si l'endpoint repond. Les artefacts `metrics.json` et `rapport-eval.md`
-restent sous `local/` et ne sont pas publies.
+Le corpus seede charge 72 entrees et note 88 requetes avec des graders deterministes. Le contrat
+de release FTS utilise toujours ses reglages de retrieval et son budget capsule versionnes de 4800
+octets UTF-8 conservateurs, independamment des valeurs par defaut du runtime. `both` mesure aussi
+l'hybride si l'endpoint repond. Les artefacts `metrics.json` et `rapport-eval.md` restent sous
+`local/` et ne sont pas publies.
 
 ## Consolider vers Datacron
 

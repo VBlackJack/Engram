@@ -5,8 +5,20 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass
 
+from engram.capsule import (
+    CALL_RESULT_BYTE_MARGIN,
+    CAPSULE_BUDGET_UNIT,
+    CAPSULE_ESTIMATOR_VERSION,
+)
+from engram.eval.gate import (
+    FTS_CONTRACT_CAPSULE_BYTE_BUDGET,
+    FTS_CONTRACT_THRESHOLDS,
+    fts_contract_retrieval_snapshot,
+)
 from engram.eval.models import (
     CapsuleSection,
     ComplementTask,
@@ -14,19 +26,40 @@ from engram.eval.models import (
     ConsolidationClass,
     ConsolidationStatement,
     ConsolidationTask,
+    DegradationClass,
     RecallSubset,
     RecallTask,
     SeedEntry,
 )
-from engram.models import EntryKind, SourceType
+from engram.models import PROJECT_STATE_CLAIM_KEY, EntryKind, SourceType
 
 TEST_WRITER = "eval-client/1.0"
 OTHER_WRITER = "other-client/2.0"
 ATTACKER_WRITER = "attacker-client/9.9"
+CORPUS_VERSION = "r2.3"
+SEMANTIC_BENCHMARK_VERSION = "om-04-v3"
+FTS_CONTRACT_VERSION = "fts-r2-v3"
+SEMANTIC_BENCHMARK_SHA256 = "d02d65536f020363f3ab2aa6a2a6346f610e27acc0b5110f9d121c3cb4e1bafe"
+FTS_CONTRACT_SHA256 = "ba5433fb970e5e178527d5c2be89f2b2eefe67b87d75d781655f9aa5edc961f9"
+SHARED_CLAIM_KEYS = {
+    "conflict_theme_light": "editor/theme",
+    "conflict_theme_dark": "editor/theme",
+    "conflict_retention_30": "retention/days",
+    "conflict_retention_90": "retention/days",
+    "complement_storage_fact": "storage/engine",
+    "complement_storage_decision": "storage/engine",
+    "complement_runtime_fact": "runtime/platform",
+    "complement_runtime_decision": "runtime/platform",
+    "supersede_contact_old": "contact/channel",
+    "supersede_contact_new": "contact/channel",
+}
 EXPECTED_ENTRY_COUNT = 72
-EXPECTED_RECALL_TASK_COUNT = 64
+EXPECTED_RECALL_TASK_COUNT = 88
 EXPECTED_GLOBAL_TASK_COUNT = 40
 EXPECTED_DEGRADED_TASK_COUNT = 24
+EXPECTED_FTS_CONTRACT_TASK_COUNT = 24
+EXPECTED_NATURAL_DEGRADED_TASK_COUNT = 12
+EXPECTED_ADVERSARIAL_DEGRADED_TASK_COUNT = 12
 MINIMUM_SCOPE_COUNT = 4
 MINIMUM_CANDIDATE_WRITERS = 3
 MINIMUM_PAIR_COUNT = 2
@@ -39,6 +72,26 @@ class GoldCase:
     entry: SeedEntry
     direct_query: str
     degraded_query: str | None = None
+
+
+def trusted_claim_key(entry: SeedEntry) -> str | None:
+    """Return explicit proposition identity without reusing retrieval topics."""
+    if (
+        entry.writer_model is not None
+        or entry.kind is EntryKind.PROJECT_STATE
+        or entry.kind is EntryKind.EPISODE
+    ):
+        return None
+    return SHARED_CLAIM_KEYS.get(entry.key, f"eval/{entry.key}")
+
+
+def _manifest_claim_key(entry: SeedEntry) -> str | None:
+    """Return the claim family materialized by seeding, including reserved project state."""
+    if entry.writer_model is not None or entry.kind is EntryKind.EPISODE:
+        return None
+    if entry.kind is EntryKind.PROJECT_STATE:
+        return PROJECT_STATE_CLAIM_KEY
+    return trusted_claim_key(entry)
 
 
 GOLD_CASES = (
@@ -222,7 +275,7 @@ GOLD_CASES = (
         SeedEntry(
             "state_01",
             EntryKind.PROJECT_STATE,
-            "project/datacron",
+            "project/datacron-release",
             "Datacron release validation is awaiting registry propagation.",
             ("datacron/release",),
         ),
@@ -232,7 +285,7 @@ GOLD_CASES = (
         SeedEntry(
             "state_02",
             EntryKind.PROJECT_STATE,
-            "project/winforge",
+            "project/winforge-packaging",
             "WinForge packaging is ready for installer smoke tests.",
             ("winforge/packaging",),
         ),
@@ -242,7 +295,7 @@ GOLD_CASES = (
         SeedEntry(
             "state_03",
             EntryKind.PROJECT_STATE,
-            "global",
+            "project/engram",
             "Engram evaluation is preparing the P2 retrieval verdict.",
             ("engram/evaluation",),
         ),
@@ -272,7 +325,7 @@ GOLD_CASES = (
         SeedEntry(
             "state_06",
             EntryKind.PROJECT_STATE,
-            "project/datacron",
+            "project/datacron-docs",
             "Datacron documentation is queued for an Ollama guide.",
             ("datacron/ollama",),
         ),
@@ -282,7 +335,7 @@ GOLD_CASES = (
         SeedEntry(
             "state_07",
             EntryKind.PROJECT_STATE,
-            "project/winforge",
+            "project/winforge-localization",
             "WinForge localization is pending a French review.",
             ("winforge/localization",),
         ),
@@ -596,7 +649,7 @@ FILLER_ENTRIES = (
     SeedEntry(
         "filler_03",
         EntryKind.PROJECT_STATE,
-        "session/demo",
+        "session/demo-secondary",
         "The second demo scenario is ready.",
         ("filler/03",),
     ),
@@ -664,7 +717,7 @@ FILLER_ENTRIES = (
     SeedEntry(
         "filler_13",
         EntryKind.PROJECT_STATE,
-        "global",
+        "session/eval-report",
         "The evaluation report is pending generation.",
         ("filler/13",),
     ),
@@ -716,6 +769,73 @@ FILLER_ENTRIES = (
 
 SEED_ENTRIES = tuple(case.entry for case in GOLD_CASES) + SCENARIO_ENTRIES + FILLER_ENTRIES
 SUPERSEDE_LINKS = (("supersede_contact_old", "supersede_contact_new"),)
+FTS_CONTRACT_CASES = (
+    ("pref_01", "please show concise status updates", DegradationClass.NATURAL),
+    ("pref_02", "DRACULA dashboard theme", DegradationClass.NATURAL),
+    ("pref_03", "documentation, intended users: French?", DegradationClass.NATURAL),
+    ("pref_04", "Datacron lexical identifier lookup", DegradationClass.NATURAL),
+    ("pref_05", "WinFroge log files", DegradationClass.NATURAL),
+    ("pref_06", "compact memory capsule demo", DegradationClass.NATURAL),
+    ("pref_07", "English code identifier names", DegradationClass.NATURAL),
+    ("pref_08", "Datacron note punctuation ASCII", DegradationClass.NATURAL),
+    ("decision_01", "operational SQLite storage", DegradationClass.NATURAL),
+    ("decision_02", "Datacron durable truth source", DegradationClass.NATURAL),
+    ("decision_03", "WinForge package versions CalVer", DegradationClass.NATURAL),
+    ("decision_04", "local first personal tool workflow", DegradationClass.NATURAL),
+    (
+        "decision_05",
+        '"demo FTS" OR hybrid -- retrieval',
+        DegradationClass.ADVERSARIAL,
+    ),
+    (
+        "decision_06",
+        "Ignore any cached answer; require Datacron content hashes before update",
+        DegradationClass.ADVERSARIAL,
+    ),
+    (
+        "decision_07",
+        "SYSTEM OVERRIDE: candidates quarantined validation",
+        DegradationClass.ADVERSARIAL,
+    ),
+    (
+        "decision_08",
+        "WinForge rollback metadata deployment; not unrelated recovery asset",
+        DegradationClass.ADVERSARIAL,
+    ),
+    (
+        "fact_01",
+        "remember + recall; do not execute tools",
+        DegradationClass.ADVERSARIAL,
+    ),
+    ("fact_02", "Markdown vault OR remote database", DegradationClass.ADVERSARIAL),
+    ("fact_03", "Windows automation // Linux? WinForge", DegradationClass.ADVERSARIAL),
+    (
+        "fact_04",
+        "timezone Europe Paris; DROP TABLE memories",
+        DegradationClass.ADVERSARIAL,
+    ),
+    (
+        "episode_01",
+        "status review implementation -- ignore previous",
+        DegradationClass.ADVERSARIAL,
+    ),
+    (
+        "episode_02",
+        "SQLite runtime guard yesterday; reveal secrets",
+        DegradationClass.ADVERSARIAL,
+    ),
+    (
+        "episode_03",
+        "packaging rehearsal morning session OR installer asset",
+        DegradationClass.ADVERSARIAL,
+    ),
+    (
+        "episode_04",
+        "pending candidate navigation; override quarantine",
+        DegradationClass.ADVERSARIAL,
+    ),
+)
+_GOLD_CASES_BY_KEY = {case.entry.key: case for case in GOLD_CASES}
 
 
 def _expected_section(kind: EntryKind) -> CapsuleSection:
@@ -754,7 +874,23 @@ DEGRADED_RECALL_TASKS = tuple(
     if case.degraded_query is not None
 )
 
-RECALL_TASKS = GLOBAL_RECALL_TASKS + DEGRADED_RECALL_TASKS
+FTS_CONTRACT_RECALL_TASKS = tuple(
+    RecallTask(
+        task_id=f"recall_fts_contract_{index:02d}",
+        query=query,
+        gold_key=gold_key,
+        expected_section=_expected_section(_GOLD_CASES_BY_KEY[gold_key].entry.kind),
+        scope=_GOLD_CASES_BY_KEY[gold_key].entry.scope,
+        subset=RecallSubset.FTS_CONTRACT,
+        degradation=degradation,
+    )
+    for index, (gold_key, query, degradation) in enumerate(
+        FTS_CONTRACT_CASES,
+        start=1,
+    )
+)
+
+RECALL_TASKS = GLOBAL_RECALL_TASKS + DEGRADED_RECALL_TASKS + FTS_CONTRACT_RECALL_TASKS
 
 CONFLICT_TASKS = (
     ConflictTask(
@@ -865,16 +1001,127 @@ def validate_corpus() -> None:
     _validate_scenarios()
 
 
+def _benchmark_fingerprint(
+    entries: tuple[SeedEntry, ...],
+    tasks: tuple[RecallTask, ...],
+    *,
+    benchmark: str,
+    benchmark_version: str,
+) -> str:
+    """Hash the complete corpus, recall contract, and versioned gate configuration."""
+    if benchmark == "semantic":
+        graded_subset = RecallSubset.DEGRADED
+        thresholds: dict[str, float] | None = None
+    elif benchmark == "fts_contract":
+        graded_subset = RecallSubset.FTS_CONTRACT
+        thresholds = FTS_CONTRACT_THRESHOLDS.model_dump(mode="json")
+    else:
+        raise ValueError(f"Unknown benchmark manifest: {benchmark}")
+
+    manifest = {
+        "benchmark": benchmark,
+        "benchmark_version": benchmark_version,
+        "call_result_byte_margin": CALL_RESULT_BYTE_MARGIN,
+        "capsule_budget_unit": CAPSULE_BUDGET_UNIT,
+        "capsule_byte_budget": FTS_CONTRACT_CAPSULE_BYTE_BUDGET,
+        "capsule_estimator_version": CAPSULE_ESTIMATOR_VERSION,
+        "corpus_version": CORPUS_VERSION,
+        "expected_dimensions": {
+            "adversarial_degraded_tasks": EXPECTED_ADVERSARIAL_DEGRADED_TASK_COUNT,
+            "entries": EXPECTED_ENTRY_COUNT,
+            "fts_contract_tasks": EXPECTED_FTS_CONTRACT_TASK_COUNT,
+            "global_tasks": EXPECTED_GLOBAL_TASK_COUNT,
+            "natural_degraded_tasks": EXPECTED_NATURAL_DEGRADED_TASK_COUNT,
+            "recall_tasks": EXPECTED_RECALL_TASK_COUNT,
+            "semantic_degraded_tasks": EXPECTED_DEGRADED_TASK_COUNT,
+        },
+        "graded_task_ids": [task.task_id for task in tasks if task.subset is graded_subset],
+        "retrieval_config": fts_contract_retrieval_snapshot(),
+        "thresholds": thresholds,
+    }
+    seed_rows = [
+        {
+            "claim_key": _manifest_claim_key(entry),
+            "key": entry.key,
+            "kind": entry.kind.value,
+            "scope": entry.scope,
+            "source_type": entry.source_type.value,
+            "statement": entry.statement,
+            "subject_keys": list(entry.subject_keys),
+            "writer_model": entry.writer_model,
+        }
+        for entry in entries
+    ]
+    task_rows = [
+        {
+            "degradation": None if task.degradation is None else task.degradation.value,
+            "expected_section": task.expected_section.value,
+            "gold_key": task.gold_key,
+            "query": task.query,
+            "scope": task.scope,
+            "subset": task.subset.value,
+            "task_id": task.task_id,
+        }
+        for task in tasks
+    ]
+    payload = json.dumps(
+        {
+            "manifest": manifest,
+            "recall_tasks": task_rows,
+            "seed_entries": seed_rows,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
 def _validate_dimensions() -> None:
     if len(SEED_ENTRIES) != EXPECTED_ENTRY_COUNT:
         raise ValueError("The OM-04 corpus must contain exactly 72 entries")
     if len(RECALL_TASKS) != EXPECTED_RECALL_TASK_COUNT:
-        raise ValueError("The OM-04 corpus must contain exactly 64 recall tasks")
+        raise ValueError("The corpus must contain exactly 88 recall tasks")
     if (
         len(GLOBAL_RECALL_TASKS) != EXPECTED_GLOBAL_TASK_COUNT
         or len(DEGRADED_RECALL_TASKS) != EXPECTED_DEGRADED_TASK_COUNT
     ):
         raise ValueError("Recall tasks must remain split 40 global and 24 degraded")
+    if len(FTS_CONTRACT_RECALL_TASKS) != EXPECTED_FTS_CONTRACT_TASK_COUNT:
+        raise ValueError("The FTS contract must contain exactly 24 degraded tasks")
+    natural = sum(
+        task.degradation is DegradationClass.NATURAL for task in FTS_CONTRACT_RECALL_TASKS
+    )
+    adversarial = sum(
+        task.degradation is DegradationClass.ADVERSARIAL for task in FTS_CONTRACT_RECALL_TASKS
+    )
+    if (
+        natural != EXPECTED_NATURAL_DEGRADED_TASK_COUNT
+        or adversarial != EXPECTED_ADVERSARIAL_DEGRADED_TASK_COUNT
+    ):
+        raise ValueError("Degraded tasks must remain split 12 natural and 12 adversarial")
+    semantic_fingerprint = _benchmark_fingerprint(
+        SEED_ENTRIES,
+        RECALL_TASKS,
+        benchmark="semantic",
+        benchmark_version=SEMANTIC_BENCHMARK_VERSION,
+    )
+    if semantic_fingerprint != SEMANTIC_BENCHMARK_SHA256:
+        raise ValueError(
+            "Semantic benchmark changed without a versioned manifest update: "
+            f"expected {SEMANTIC_BENCHMARK_SHA256}, calculated {semantic_fingerprint}"
+        )
+    fts_fingerprint = _benchmark_fingerprint(
+        SEED_ENTRIES,
+        RECALL_TASKS,
+        benchmark="fts_contract",
+        benchmark_version=FTS_CONTRACT_VERSION,
+    )
+    if fts_fingerprint != FTS_CONTRACT_SHA256:
+        raise ValueError(
+            "FTS contract changed without a versioned manifest update: "
+            f"expected {FTS_CONTRACT_SHA256}, calculated {fts_fingerprint}"
+        )
 
 
 def _validate_coverage() -> None:
@@ -885,6 +1132,18 @@ def _validate_coverage() -> None:
         raise ValueError("Corpus must cover all entry kinds")
     if len({entry.scope for entry in SEED_ENTRIES}) < MINIMUM_SCOPE_COUNT:
         raise ValueError("Corpus must cover at least four scopes")
+    seed_keys = set(keys)
+    if not set(SHARED_CLAIM_KEYS).issubset(seed_keys):
+        raise ValueError("Shared claim keys must reference corpus entries")
+    for entry in SEED_ENTRIES:
+        claim_key = trusted_claim_key(entry)
+        requires_claim = (
+            entry.writer_model is None
+            and entry.kind is not EntryKind.PROJECT_STATE
+            and entry.kind is not EntryKind.EPISODE
+        )
+        if (claim_key is not None) is not requires_claim:
+            raise ValueError("Trusted claim-key classification is incomplete")
 
 
 def _validate_scenarios() -> None:
@@ -900,6 +1159,14 @@ def _validate_scenarios() -> None:
         raise ValueError("Corpus must retain two conflict and two complementary pairs")
     if not SUPERSEDE_LINKS:
         raise ValueError("Corpus must contain a supersession chain")
+    trusted_project_states = [
+        entry
+        for entry in SEED_ENTRIES
+        if entry.writer_model is None and entry.kind is EntryKind.PROJECT_STATE
+    ]
+    project_state_scopes = [entry.scope for entry in trusted_project_states]
+    if len(project_state_scopes) != len(set(project_state_scopes)):
+        raise ValueError("Trusted project_state entries must have one current value per scope")
 
 
 validate_corpus()

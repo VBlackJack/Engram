@@ -16,6 +16,10 @@ project uses date-derived CalVer releases in the form `YYYY.MMDD.NN`.
 - Add trusted local `attest`, `supersede`, and status-filtered `list` commands with configurable
   audit identity and stable JSON output.
 - Anchor consolidation plans as immutable SQLite snapshots with generated single-use identifiers.
+- Add a versioned lexical/adversarial recall contract while preserving the historical semantic
+  paraphrase benchmark as a separate measurement.
+- Add progressive, operator-neutral FTS queries with configurable query, term, prefix, and SQL
+  top-K bounds.
 
 ### Changed
 
@@ -25,6 +29,16 @@ project uses date-derived CalVer releases in the form `YYYY.MMDD.NN`.
   Equivalent retries share one generation while independent writers retain separate observations.
 - The public `Entry` constructor remains source compatible: new `canonical_key` and `claim_key`
   fields are trailing optional fields. This release still changes persisted and CLI contracts.
+- `engram eval` now writes its artifacts and exits nonzero when the checked-in FTS quality,
+  latency, or capsule-budget contract fails; CI runs that contract on Linux and Windows.
+- Pin the FTS gate to versioned retrieval settings and a 4800-byte conservative capsule cap,
+  fingerprint every seed and recall-task field with that configuration, and retain CI
+  metrics/reports even when the gate fails.
+- Upgrade note: before restarting an existing installation, set `[capsule]`
+  `default_token_budget = 4800`, `min_token_budget = 1200`, and
+  `max_token_budget = 6000` (or another maximum at least as large as the default). Older
+  `min_token_budget` values below 1200 are rejected at startup because they cannot contain the
+  mandatory bounded response envelope.
 
 ### Fixed
 
@@ -55,11 +69,22 @@ project uses date-derived CalVer releases in the form `YYYY.MMDD.NN`.
   explicit debug opt-in.
 - Check HTTP port availability before opening storage, close startup resources on every path, and
   wrap Datacron stdio startup failures at the gateway boundary.
+- Bound recall ranking in SQL, neutralize FTS control syntax, and keep deterministic progressive
+  fallback ordering across exact, conjunction, disjunction, and controlled-prefix stages.
+- Preserve strict FTS hits as the highest-priority results while still filling unused top-K
+  capacity from fairly interleaved disjunction and prefix stages.
+- Verify the external-content FTS index against canonical rows at startup and rebuild derived state
+  automatically when it is missing, partial, or inconsistent.
+- Enforce the capsule budget against the combined structured and fallback payload, including
+  adversarial scope metadata, using the complete serialized UTF-8 size as both a conservative
+  one-byte-per-token ceiling and an absolute payload cap.
+- Reject every wildcard, hostname, LAN, or public listening address at configuration construction;
+  the unauthenticated MCP daemon now accepts only loopback IP literals.
 
 ### Backlog
 
-- Evaluate Porter stemming and prefix search only if real usage with weaker clients exposes
-  morphological misses. Hybrid retrieval remains the existing opt-in extension path.
+- Evaluate stemming only if real usage with weaker clients exposes morphological misses. Hybrid
+  retrieval remains the existing opt-in extension path for semantic paraphrases.
 
 ## [2026.0721.04] - 2026-07-21
 

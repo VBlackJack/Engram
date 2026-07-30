@@ -31,8 +31,10 @@ d'inode. Les lectures pures de `list` utilisent SQLite `mode=ro` sans ce verrou 
 
 SQLite est ouvert en WAL, avec foreign keys, busy timeout et migrations transactionnelles. Le
 plancher 3.51.3 evite le bug WAL-reset. La table `entries` est canonique ; les tables FTS et
-vectorielles sont derivees et reconstructibles par `engram reindex`. `consolidation_plans` ancre les
-snapshots immuables des plans et leur etat d'usage unique hors de l'artefact de revue editable.
+vectorielles sont derivees et reconstructibles par `engram reindex`. Au demarrage, Engram compare
+l'index FTS external-content aux lignes canoniques et le reconstruit s'il manque ou diverge.
+`consolidation_plans` ancre les snapshots immuables des plans et leur etat d'usage unique hors de
+l'artefact de revue editable.
 
 `audit_log` est append-only. Il conserve l'acteur, l'action, l'identifiant d'entree et une empreinte
 de detail, jamais le statement ni un payload de conversation.
@@ -48,10 +50,15 @@ laquelle le [protocole client](client-protocol.md) fait partie du produit.
 
 ## Retrieval
 
-Le mode `fts` interroge FTS5 avec BM25, puis departage par recence. Une recherche substring bornee
-sert de filet si la requete FTS ne renvoie rien. Le mode `hybrid`, derriere configuration, combine
-FTS et embeddings par reciprocal rank fusion (`rrf_k`). L'endpoint d'embeddings est local et
-compatible avec l'API OpenAI ; une indisponibilite degrade explicitement le rappel vers FTS.
+Le mode `fts` derive des termes sans operateurs depuis une entree NFKC bornee. Il classe d'abord la
+phrase exacte et la conjonction de tous les termes, puis remplit chaque place restante du top-K
+avec les rankings disjonctif et prefixe fusionnes equitablement. Les hits stricts gardent leur
+priorite sans masquer les correspondances morphologiques. Chaque etage applique les filtres de
+visibilite et un top-K dur dans SQL, avec BM25 puis recence et identifiant pour departager. Le mode
+`hybrid`, derriere configuration, combine FTS et embeddings par reciprocal rank fusion (`rrf_k`).
+Il calcule un top-K semantique exact uniquement si tous les vecteurs visibles tiennent sous
+`hybrid_max_candidates` ; un depassement ou une indisponibilite degrade le rappel vers FTS et
+marque la capsule incomplete.
 
 ## Capsule recall
 
@@ -62,11 +69,14 @@ La politique D6/D7 separe le ranking de la confiance. La capsule est remplie dan
 3. `relevant` : episodes pertinents ;
 4. `conflicts` : versions non resolues, symetriques et sur demande ;
 5. `own_pending` : candidats quarantaines du client appelant uniquement ;
-6. `sources` et `notes` : identifiants et raison de selection.
+6. `sources` et `notes` : identifiants, raison de selection, `recall_complete` et codes
+   d'avertissement bornes en cas d'omission fail-closed.
 
-Le budget est borne par `[capsule]`. Les elements de priorite la plus faible sont omis en premier,
-avec une note explicite ; une entree stale, superseded, expired ou quarantined d'un autre client ne
-peut pas se glisser dans `current`.
+Le budget est borne par `[capsule]` sur le payload fallback et structure serialise. Le nombre
+d'octets UTF-8 serialises sert de plafond conservateur a un octet par token et de limite absolue de
+taille du payload. Les elements de priorite la plus faible sont omis en premier avec une note
+explicite, et un scope surdimensionne est represente par une empreinte bornee ; une entree stale,
+superseded, expired ou quarantined d'un autre client ne peut pas se glisser dans `current`.
 
 ## Consolidation Datacron
 
