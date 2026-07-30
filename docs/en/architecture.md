@@ -24,7 +24,9 @@ A database-adjacent coordination file carries an OS-level exclusive lock. The da
 its lifetime; each offline writer owns it for the whole command. Windows uses a locked byte through
 the CRT, while POSIX uses `flock`. PID and command metadata are diagnostic only, so a file left by a
 dead process is safely reclaimed when the kernel lock is absent. The file is not unlinked on release
-to avoid inode replacement races. Pure `list` reads use SQLite `mode=ro` without this writer lock.
+to avoid inode replacement races. The public `EngramStore` owns the same lease for its lifetime;
+multiple connections in that one process share the lease, while another writer process is rejected.
+Pure `list` reads use SQLite `mode=ro` without this writer lock.
 
 ## SQLite storage
 
@@ -33,9 +35,19 @@ SQLite opens in WAL mode with foreign keys, a busy timeout, and transactional mi
 derived and reconstructible with `engram reindex`. Startup compares the external-content FTS index
 with canonical rows and rebuilds it when it is missing or inconsistent. `consolidation_plans`
 anchors immutable plan snapshots and their single-use state outside the editable review artifact.
+Every connection first loads `sqlite_schema` under a temporary 256 KiB ceiling, then applies a
+permanent 8 MiB ceiling to SQLite values and rows. Consolidation snapshots are rejected before
+mutation above 4 MiB of UTF-8.
+Upgrade preflight holds the writer lease, reads one source snapshot, and proves the full migration
+on a disposable on-disk copy. Canonical table definitions are checked exactly; derived objects may
+be absent or rebuildable tables, but a colliding index, trigger, or view is rejected.
 
 `audit_log` is append-only. It stores actor, action, entry identifier, and a detail fingerprint,
 never the statement or conversation payload.
+
+The configured log rotates at 10 MiB with five backups. Every Engram process closes the file between
+records and serializes write/rollover through a separate OS lock, including on Windows where an open
+handle would otherwise make rename-based rotation fail.
 
 ## HTTP MCP server
 
@@ -52,10 +64,17 @@ MCP receives tool calls only. It does not observe the client conversation, which
 all-term query first, then fills every remaining top-K slot from fairly interleaved disjunction and
 controlled-prefix rankings. Strict hits keep priority without suppressing morphological matches.
 Every stage applies visibility filters and a hard top-K in SQL, with BM25 followed by recency and
-identifier tie-breaks. The configured `hybrid` mode combines FTS and embeddings through reciprocal
+identifier tie-breaks. One absolute monotonic `fts_query_timeout_ms` deadline covers lock wait and
+all progressive SQLite stages. SQLite's progress handler interrupts an over-budget scan; only
+fully completed stages exist in the internal rank, but the public result is empty and marked
+incomplete to avoid partial revalidation after expiry. The configured `hybrid` mode
+combines FTS and embeddings through reciprocal
 rank fusion (`rrf_k`). It computes an exact semantic top-K only while all visible vectors fit under
-`hybrid_max_candidates`; an overflow or unavailable embedding endpoint degrades explicitly to FTS
-and marks the capsule incomplete.
+`hybrid_max_candidates` and fixed dimension/byte budgets. The scan returns IDs and vectors only;
+at most the fused top-K payloads are materialized and revalidated. An overflow, malformed provider
+result, or unavailable embedding endpoint degrades explicitly to FTS and marks the capsule
+incomplete. Vector rebuilds use bounded pages and a temporary stage, preserve the live index until
+the atomic swap, and compare SQLite `data_version` before that swap to reject an intervening commit.
 
 ## Recall capsule
 

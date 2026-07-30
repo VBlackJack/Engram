@@ -24,6 +24,34 @@ from engram.store import EngramStore, StoreValidationError
 from tests.conftest import MutableClock
 
 
+@pytest.mark.parametrize(
+    "actor",
+    [
+        "operator\nforged",
+        "operator\x1b[31m",
+        "operator\u2028forged",
+        "operator\u2029forged",
+        "operator\u202eforged",
+    ],
+)
+def test_trusted_mutation_rejects_control_bearing_actor(
+    store: EngramStore,
+    actor: str,
+) -> None:
+    with pytest.raises(StoreValidationError, match="control characters"):
+        store.add_attested(
+            kind="fact",
+            scope="user",
+            statement="Audit lines cannot be forged.",
+            source_type=SourceType.HUMAN,
+            claim_key="audit/control-actor",
+            actor=actor,
+        )
+
+    assert store.count_entries() == 0
+    assert store.list_audit() == ()
+
+
 def test_model_confidence_is_capped_and_audited(store: EngramStore) -> None:
     entry = store.add_candidate(
         kind=EntryKind.FACT,

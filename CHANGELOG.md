@@ -7,6 +7,8 @@ project uses date-derived CalVer releases in the form `YYYY.MMDD.NN`.
 
 ## [Unreleased]
 
+## [2026.0730.02] - 2026-07-30
+
 ### Added
 
 - Add schema-v5 claim families, canonical content identities, retained observation evidence,
@@ -20,6 +22,12 @@ project uses date-derived CalVer releases in the form `YYYY.MMDD.NN`.
   paraphrase benchmark as a separate measurement.
 - Add progressive, operator-neutral FTS queries with configurable query, term, prefix, and SQL
   top-K bounds.
+- Add a pre-parser HTTP request-body ceiling, an absolute SQLite FTS deadline, and stable
+  incomplete-recall signalling when that deadline expires.
+- Add a deterministic hybrid retrieval contract covering semantic-only wins, lexical preservation,
+  provider ordering, and repeatable fused ranks without approving a production embedding model.
+- Add a source-read-only upgrade preflight that proves schemas 3-5 on a disposable snapshot and
+  reports required FTS/vector reconstruction before production migration.
 
 ### Changed
 
@@ -34,11 +42,18 @@ project uses date-derived CalVer releases in the form `YYYY.MMDD.NN`.
 - Pin the FTS gate to versioned retrieval settings and a 4800-byte conservative capsule cap,
   fingerprint every seed and recall-task field with that configuration, and retain CI
   metrics/reports even when the gate fails.
+- Version the R3 evaluation corpus and schema, and require the FTS gate to prove that no evaluated
+  recall exceeded its absolute query deadline.
 - Upgrade note: before restarting an existing installation, set `[capsule]`
   `default_token_budget = 4800`, `min_token_budget = 1200`, and
   `max_token_budget = 6000` (or another maximum at least as large as the default). Older
   `min_token_budget` values below 1200 are rejected at startup because they cannot contain the
   mandatory bounded response envelope.
+- Upgrade note: take a SQLite-consistent backup and run read-only `engram preflight` before
+  restarting 2026.0730.02. New fixed content ceilings and domain-separated SHA-256 `mcp-v2:`
+  identities for reserved `%`/`/` components are never applied by truncation or guessed ownership
+  aliases. Inventory pending R2 owners that violate the new component policy. A failed preflight
+  names the first row to review or export with 2026.0730.01 before retrying.
 
 ### Fixed
 
@@ -60,7 +75,7 @@ project uses date-derived CalVer releases in the form `YYYY.MMDD.NN`.
 - Enforce TTL at recall time and run a configurable logical-expiry sweep for the HTTP daemon.
 - Promote canonically identical quarantined content in place when it receives trusted attestation.
 - Enforce one cross-process database writer with an OS lock, stale-owner recovery, and a truly
-  read-only status listing path.
+  read-only status listing path; the exported Store API now holds the same writer lease.
 - Preserve Datacron search rank while selecting consolidation targets and bind redundant
   propositions to their exact normalized neighbor.
 - Launch the installed Datacron CLI shape by default and prevent an empty write allowlist from
@@ -80,6 +95,20 @@ project uses date-derived CalVer releases in the form `YYYY.MMDD.NN`.
   one-byte-per-token ceiling and an absolute payload cap.
 - Reject every wildcard, hostname, LAN, or public listening address at configuration construction;
   the unauthenticated MCP daemon now accepts only loopback IP literals.
+- Reject missing, empty, oversized, control-bearing, or non-UTF-8 MCP client identities; preserve
+  safe legacy owners and map reserved separators into a collision-resistant `mcp-v2:` namespace.
+- Apply fixed ceilings to persisted text, evidence, audit identities, vector dimensions, embedding
+  batches, inputs, and streamed response bodies, including startup validation of existing data.
+- Preserve only fully completed lexical stages on timeout, bound lock wait and SQLite execution
+  under one deadline, and retain the previous vector index when a batched rebuild is incomplete.
+- Stream upgrade/integrity scans, precheck persisted allocation bounds, validate canonical table
+  definitions, and prove full migrations without modifying the source database.
+- Load SQLite schemas under a 256 KiB bootstrap ceiling, retain an 8 MiB value/row ceiling, and
+  reject consolidation snapshots above 4 MiB before mutation or upgrade.
+- Reject malformed embedding URLs and model identifiers during configuration and normalize every
+  defensive HTTPX URL failure into the documented hybrid fallback path.
+- Serialize rotating-log writes across processes and reject a staged vector swap after any
+  intervening SQLite commit.
 
 ### Backlog
 
@@ -102,5 +131,6 @@ project uses date-derived CalVer releases in the form `YYYY.MMDD.NN`.
 - Mirrored French and English product documentation, CI gates, release artifacts, and MCP Registry
   metadata.
 
-[Unreleased]: https://github.com/VBlackJack/Engram/compare/v2026.0721.04...HEAD
+[Unreleased]: https://github.com/VBlackJack/Engram/compare/v2026.0730.02...HEAD
+[2026.0730.02]: https://github.com/VBlackJack/Engram/compare/v2026.0721.04...v2026.0730.02
 [2026.0721.04]: https://github.com/VBlackJack/Engram/releases/tag/v2026.0721.04

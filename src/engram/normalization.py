@@ -20,6 +20,17 @@ ULID_ALPHABET = frozenset("0123456789ABCDEFGHJKMNPQRSTVWXYZ")
 ULID_LENGTH = 26
 MAX_CLAIM_KEY_CHARS = 200
 CANONICAL_KEY_HEX_LENGTH = 64
+HARD_MAX_STATEMENT_CHARS = 16_384
+HARD_MAX_SUBJECT_KEYS = 64
+MAX_SCOPE_CHARS = 200
+MAX_SUBJECT_KEY_CHARS = 200
+MAX_EVIDENCE_ITEMS = 16
+MAX_EVIDENCE_REF_CHARS = 2048
+MAX_WRITER_MODEL_CHARS = 257
+MAX_ACTOR_CHARS = MAX_WRITER_MODEL_CHARS
+MAX_DATACRON_REF_CHARS = 2048
+MAX_EMBEDDING_MODEL_CHARS = 200
+MAX_MCP_CLIENT_COMPONENT_CHARS = 128
 
 
 class StoreValidationError(ValueError):
@@ -33,12 +44,23 @@ def required_text(value: object, field_name: str) -> str:
     normalized = value.strip()
     if not normalized:
         raise StoreValidationError(f"{field_name} must not be empty")
+    _reject_unsupported_code_points(normalized, field_name)
+    return normalized
+
+
+def bounded_text(value: object, field_name: str, maximum_chars: int) -> str:
+    """Return normalized required text under one fixed character ceiling."""
+    normalized = required_text(value, field_name)
+    if len(normalized) > maximum_chars:
+        raise StoreValidationError(f"{field_name} exceeds limit of {maximum_chars} characters")
     return normalized
 
 
 def normalize_scope(scope: str) -> str:
     """Normalize and validate one supported recall scope."""
     normalized = required_text(scope, "scope").casefold()
+    if len(normalized) > MAX_SCOPE_CHARS:
+        raise StoreValidationError(f"scope exceeds limit of {MAX_SCOPE_CHARS} characters")
     if SCOPE_PATTERN.fullmatch(normalized) is None:
         raise StoreValidationError(f"Invalid scope: {scope}")
     return normalized
@@ -46,12 +68,20 @@ def normalize_scope(scope: str) -> str:
 
 def normalize_statement(statement: str, maximum_chars: int | None) -> str:
     """Normalize statement Unicode and whitespace with an optional size bound."""
+    if not isinstance(statement, str):
+        raise StoreValidationError("statement must be a string")
     normalized = " ".join(unicodedata.normalize("NFKC", statement).split())
     if not normalized:
         raise StoreValidationError("statement must not be empty")
-    if maximum_chars is not None and len(normalized) > maximum_chars:
+    _reject_unsupported_code_points(normalized, "statement")
+    effective_maximum = (
+        HARD_MAX_STATEMENT_CHARS
+        if maximum_chars is None
+        else min(maximum_chars, HARD_MAX_STATEMENT_CHARS)
+    )
+    if len(normalized) > effective_maximum:
         raise StoreValidationError(
-            f"statement exceeds configured limit of {maximum_chars} characters"
+            f"statement exceeds configured limit of {effective_maximum} characters"
         )
     return normalized
 
@@ -61,16 +91,75 @@ def normalize_subject_keys(
     maximum_keys: int | None,
 ) -> tuple[str, ...]:
     """Normalize, de-duplicate, and optionally bound subject keys."""
-    if isinstance(values, str):
+    if isinstance(values, str) or not isinstance(values, Sequence):
         raise StoreValidationError("subject_keys must be a sequence of strings")
+    effective_maximum = (
+        HARD_MAX_SUBJECT_KEYS if maximum_keys is None else min(maximum_keys, HARD_MAX_SUBJECT_KEYS)
+    )
+    if len(values) > effective_maximum:
+        raise StoreValidationError(
+            f"subject_keys exceeds configured limit of {effective_maximum} items"
+        )
     normalized: list[str] = []
+    seen: set[str] = set()
     for value in values:
         item = required_text(value, "subject key").casefold()
-        if item not in normalized:
+        if len(item) > MAX_SUBJECT_KEY_CHARS:
+            raise StoreValidationError(
+                f"subject key exceeds limit of {MAX_SUBJECT_KEY_CHARS} characters"
+            )
+        if item not in seen:
+            seen.add(item)
             normalized.append(item)
-    if maximum_keys is not None and len(normalized) > maximum_keys:
-        raise StoreValidationError(f"subject_keys exceeds configured limit of {maximum_keys} items")
     return tuple(normalized)
+
+
+def normalize_writer_model(value: str) -> str:
+    """Bound one server-derived client identity before storage or lookup."""
+    return bounded_text(value, "writer_model", MAX_WRITER_MODEL_CHARS)
+
+
+def normalize_actor(value: str) -> str:
+    """Bound one local audit actor before it reaches SQLite."""
+    normalized = bounded_text(value, "actor", MAX_ACTOR_CHARS)
+    if any(unicodedata.category(character) in {"Cc", "Cf", "Zl", "Zp"} for character in normalized):
+        raise StoreValidationError("actor must not contain control characters or line separators")
+    return normalized
+
+
+def _reject_unsupported_code_points(value: str, field_name: str) -> None:
+    """Reject code points that cannot safely round-trip through SQLite text."""
+    if "\0" in value:
+        raise StoreValidationError(f"{field_name} must not contain U+0000")
+    if any(unicodedata.category(character) == "Cs" for character in value):
+        raise StoreValidationError(f"{field_name} must not contain Unicode surrogate characters")
+
+
+def normalize_evidence_ref(value: str) -> str:
+    """Bound one opaque evidence reference without changing its content."""
+    return bounded_text(value, "evidence ref", MAX_EVIDENCE_REF_CHARS)
+
+
+def normalize_datacron_ref(value: str) -> str:
+    """Bound one durable Datacron reference before storage."""
+    return bounded_text(value, "datacron_ref", MAX_DATACRON_REF_CHARS)
+
+
+def normalize_embedding_model(value: str) -> str:
+    """Bound one derived-vector model identifier."""
+    return bounded_text(value, "model", MAX_EMBEDDING_MODEL_CHARS)
+
+
+def normalize_mcp_client_component(value: str, field_name: str) -> str:
+    """Validate one self-declared MCP identity component without rewriting it."""
+    normalized = bounded_text(value, field_name, MAX_MCP_CLIENT_COMPONENT_CHARS)
+    if normalized != value:
+        raise StoreValidationError(f"{field_name} must not contain surrounding whitespace")
+    if any(unicodedata.category(character) in {"Cc", "Cf", "Zl", "Zp"} for character in normalized):
+        raise StoreValidationError(
+            f"{field_name} must not contain control or line-separator characters"
+        )
+    return normalized
 
 
 def canonical_key(kind: EntryKind, scope: str, statement: str) -> str:

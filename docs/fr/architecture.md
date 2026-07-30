@@ -25,7 +25,9 @@ pendant sa duree de vie ; chaque writer offline le garde pendant toute sa comman
 un octet verrouille via le CRT, tandis que POSIX utilise `flock`. Le PID et la commande ne sont que
 des metadonnees de diagnostic : un fichier laisse par un processus mort est repris des que le verrou
 kernel a disparu. Le fichier n'est pas unlink a la liberation afin d'eviter les races de remplacement
-d'inode. Les lectures pures de `list` utilisent SQLite `mode=ro` sans ce verrou writer.
+d'inode. La classe publique `EngramStore` garde le meme lease pendant sa duree de vie ; plusieurs
+connexions de ce seul processus le partagent, tandis qu'un autre processus writer est refuse. Les
+lectures pures de `list` utilisent SQLite `mode=ro` sans ce verrou writer.
 
 ## Stockage SQLite
 
@@ -34,10 +36,20 @@ plancher 3.51.3 evite le bug WAL-reset. La table `entries` est canonique ; les t
 vectorielles sont derivees et reconstructibles par `engram reindex`. Au demarrage, Engram compare
 l'index FTS external-content aux lignes canoniques et le reconstruit s'il manque ou diverge.
 `consolidation_plans` ancre les snapshots immuables des plans et leur etat d'usage unique hors de
-l'artefact de revue editable.
+l'artefact de revue editable. Chaque connexion charge d'abord `sqlite_schema` sous un plafond
+temporaire de 256 Kio, puis applique un plafond permanent de 8 Mio aux valeurs et lignes SQLite.
+Un snapshot de consolidation est refuse avant mutation au-dela de 4 Mio UTF-8.
+Le preflight d'upgrade garde le lease writer, lit un snapshot source unique et prouve la migration
+complete sur une copie disque jetable. Les definitions des tables canoniques sont controlees
+exactement ; un objet derive peut manquer ou etre une table reconstruisible, mais un index, trigger
+ou view homonyme est refuse.
 
 `audit_log` est append-only. Il conserve l'acteur, l'action, l'identifiant d'entree et une empreinte
 de detail, jamais le statement ni un payload de conversation.
+
+Le log configure tourne a 10 Mio avec cinq backups. Chaque processus Engram ferme le fichier entre
+deux records et serialise ecriture/rotation par un verrou OS separe, y compris sous Windows ou un
+handle ouvert ferait echouer la rotation fondee sur rename.
 
 ## Serveur MCP HTTP
 
@@ -54,11 +66,19 @@ Le mode `fts` derive des termes sans operateurs depuis une entree NFKC bornee. I
 phrase exacte et la conjonction de tous les termes, puis remplit chaque place restante du top-K
 avec les rankings disjonctif et prefixe fusionnes equitablement. Les hits stricts gardent leur
 priorite sans masquer les correspondances morphologiques. Chaque etage applique les filtres de
-visibilite et un top-K dur dans SQL, avec BM25 puis recence et identifiant pour departager. Le mode
-`hybrid`, derriere configuration, combine FTS et embeddings par reciprocal rank fusion (`rrf_k`).
+visibilite et un top-K dur dans SQL, avec BM25 puis recence et identifiant pour departager.
+Une deadline monotone absolue `fts_query_timeout_ms` couvre l'attente du verrou et tous les etages
+SQLite progressifs. Le progress handler SQLite interrompt un scan hors budget ; seuls les etages
+termines existent dans le ranking interne, mais le resultat public est vide et marque incomplet
+pour eviter une revalidation partielle apres expiration. Le mode `hybrid`, derriere
+configuration, combine FTS et embeddings par reciprocal rank fusion (`rrf_k`).
 Il calcule un top-K semantique exact uniquement si tous les vecteurs visibles tiennent sous
-`hybrid_max_candidates` ; un depassement ou une indisponibilite degrade le rappel vers FTS et
-marque la capsule incomplete.
+`hybrid_max_candidates` et les budgets fixes de dimensions/octets. Le scan ne renvoie que les IDs et
+vecteurs ; au plus les payloads du top-K fusionne sont materialises puis revalides. Un depassement,
+un resultat provider mal forme ou une indisponibilite degrade le rappel vers FTS et marque la
+capsule incomplete. Les rebuilds vectoriels utilisent des pages bornees et un stage temporaire,
+preservent l'index live jusqu'au swap atomique et comparent `data_version` SQLite avant ce swap pour
+refuser un commit intervenu entre-temps.
 
 ## Capsule recall
 

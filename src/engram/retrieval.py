@@ -14,9 +14,19 @@ from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
 from .config import AppConfig, RetrievalConfig, RetrievalMode
-from .embeddings import EmbeddingError, EmbeddingProvider, HttpEmbeddingProvider
+from .embeddings import (
+    MAX_EMBEDDING_BATCH_ITEMS,
+    EmbeddingError,
+    EmbeddingProvider,
+    HttpEmbeddingProvider,
+)
 from .models import PROJECT_STATE_CLAIM_KEY, Entry, EntryKind, EntryStatus
-from .store import EngramStore
+from .store import (
+    EngramStore,
+    FtsQueryDeadline,
+    StoreQueryTimeoutError,
+    StoreVectorBudgetError,
+)
 from .vectors import is_usable_float32_vector
 
 LOGGER = logging.getLogger(__name__)
@@ -27,10 +37,16 @@ NOTICE_PROJECT_STATE_OVERFLOW = "project_state_overflow"
 NOTICE_HYBRID_PROVIDER_UNAVAILABLE = "hybrid_provider_unavailable"
 NOTICE_HYBRID_PROVIDER_INVALID_VECTOR = "hybrid_provider_invalid_vector"
 NOTICE_HYBRID_CANDIDATE_OVERFLOW = "hybrid_candidate_overflow"
+NOTICE_HYBRID_VECTOR_BUDGET_EXCEEDED = "hybrid_vector_budget_exceeded"
 NOTICE_HYBRID_VECTOR_COVERAGE_INCOMPLETE = "hybrid_vector_coverage_incomplete"
 NOTICE_QUERY_TOO_LONG = "query_too_long"
 NOTICE_QUERY_TOO_MANY_TERMS = "query_too_many_terms"
 NOTICE_QUERY_HAS_NO_SEARCH_TERMS = "query_has_no_search_terms"
+NOTICE_FTS_QUERY_TIMEOUT = "fts_query_timeout"
+
+
+class VectorRebuildError(RuntimeError):
+    """Raised when an explicit vector reindex could not produce a complete index."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,6 +75,14 @@ class _FtsQueryPlan:
 
     strict: tuple[str, ...]
     fallback: tuple[str, ...]
+    notices: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class _RankOutcome:
+    """Completed lexical stages plus any runtime completeness notice."""
+
+    entries: tuple[Entry, ...]
     notices: tuple[str, ...] = ()
 
 
@@ -94,41 +118,80 @@ class FtsRetriever:
     def retrieve(self, request: RetrievalRequest) -> RetrievalResult:
         """Rank direct matches and apply shared lifecycle visibility rules."""
         plan = self.query_plan(request.query)
+        outcome = self._rank_plan(request, plan)
+        if NOTICE_FTS_QUERY_TIMEOUT in outcome.notices:
+            return _timed_out_result((*plan.notices, *outcome.notices))
         return self.assemble(
             request,
-            self._rank_plan(request, plan),
-            notices=plan.notices,
+            outcome.entries,
+            notices=(*plan.notices, *outcome.notices),
         )
 
     def rank(self, request: RetrievalRequest) -> tuple[Entry, ...]:
         """Return direct visible matches in lexical rank order."""
         plan = self.query_plan(request.query)
-        return self._rank_plan(request, plan)
+        outcome = self._rank_plan(request, plan)
+        if NOTICE_FTS_QUERY_TIMEOUT in outcome.notices:
+            raise StoreQueryTimeoutError("FTS rank deadline expired")
+        return outcome.entries
+
+    def rank_with_notices(
+        self,
+        request: RetrievalRequest,
+    ) -> tuple[tuple[Entry, ...], tuple[str, ...]]:
+        """Return lexical rank plus every query/runtime completeness notice."""
+        plan = self.query_plan(request.query)
+        outcome = self._rank_plan(request, plan)
+        notices = tuple(dict.fromkeys((*plan.notices, *outcome.notices)))
+        return outcome.entries, notices
 
     def _rank_plan(
         self,
         request: RetrievalRequest,
         plan: _FtsQueryPlan,
-    ) -> tuple[Entry, ...]:
+    ) -> _RankOutcome:
         """Execute a prevalidated progressive plan."""
         if not plan.strict and not plan.fallback:
-            return ()
+            return _RankOutcome(())
+        deadline = self._store.begin_fts_query(self._config.fts_query_timeout_ms)
         strict_ranked: list[Entry] = []
         strict_seen: set[str] = set()
-        for expression in plan.strict:
-            ranked = self._search(request, expression)
+        for stage_index, expression in enumerate(plan.strict, start=1):
+            try:
+                ranked = self._search(request, expression, deadline=deadline)
+            except StoreQueryTimeoutError:
+                self._log_timeout("strict", stage_index)
+                return _RankOutcome(
+                    tuple(strict_ranked),
+                    (NOTICE_FTS_QUERY_TIMEOUT,),
+                )
             for entry in ranked:
                 if entry.id not in strict_seen:
                     strict_ranked.append(entry)
                     strict_seen.add(entry.id)
                     if len(strict_ranked) == self._config.fts_top_k:
-                        return tuple(strict_ranked)
+                        return _RankOutcome(tuple(strict_ranked))
 
-        fallback_rankings = tuple(self._search(request, expression) for expression in plan.fallback)
-        return _interleave_entries(
-            fallback_rankings,
-            self._config.fts_top_k,
-            initial=strict_ranked,
+        fallback_rankings: list[tuple[Entry, ...]] = []
+        for stage_index, expression in enumerate(plan.fallback, start=1):
+            try:
+                fallback_rankings.append(self._search(request, expression, deadline=deadline))
+            except StoreQueryTimeoutError:
+                self._log_timeout("fallback", stage_index)
+                return _RankOutcome(
+                    _interleave_entries(
+                        fallback_rankings,
+                        self._config.fts_top_k,
+                        initial=strict_ranked,
+                    ),
+                    (NOTICE_FTS_QUERY_TIMEOUT,),
+                )
+        return _RankOutcome(
+            _interleave_entries(
+                fallback_rankings,
+                self._config.fts_top_k,
+                initial=strict_ranked,
+            )
         )
 
     def query_plan(self, query: str) -> _FtsQueryPlan:
@@ -139,6 +202,8 @@ class FtsRetriever:
         self,
         request: RetrievalRequest,
         expression: str,
+        *,
+        deadline: FtsQueryDeadline,
     ) -> tuple[Entry, ...]:
         """Execute one already-sanitized stage with all SQL visibility filters."""
         return self._store.search_fts(
@@ -147,6 +212,15 @@ class FtsRetriever:
             kinds=request.kinds,
             writer_model=request.writer_model,
             limit=self._config.fts_top_k,
+            deadline=deadline,
+        )
+
+    def _log_timeout(self, phase: str, stage_index: int) -> None:
+        LOGGER.warning(
+            "FTS plan deadline expired phase=%s stage=%d timeout_ms=%d",
+            phase,
+            stage_index,
+            self._config.fts_query_timeout_ms,
         )
 
     def eligible_entries(self, request: RetrievalRequest) -> tuple[Entry, ...]:
@@ -299,40 +373,60 @@ class HybridRetriever:
         plan = self._fts.query_plan(request.query)
         if not plan.strict:
             return self._fts.assemble(request, (), notices=plan.notices)
-        lexical = self._fts.rank(request)
+        lexical, lexical_notices = self._fts.rank_with_notices(request)
+        if NOTICE_FTS_QUERY_TIMEOUT in lexical_notices:
+            return _timed_out_result(lexical_notices)
         try:
-            query_vector = self._provider.embed((request.query,))[0]
-        except EmbeddingError as exc:
+            query_vectors = self._provider.embed((request.query,))
+        except Exception as exc:  # noqa: BLE001
             LOGGER.warning("Embedding endpoint unavailable; degrading to FTS: %s", exc)
             return self._fts.assemble(
                 request,
                 lexical,
-                notices=(NOTICE_HYBRID_PROVIDER_UNAVAILABLE,),
+                notices=(*lexical_notices, NOTICE_HYBRID_PROVIDER_UNAVAILABLE),
             )
-        if not _is_usable_vector(query_vector):
+        try:
+            query_vector = query_vectors[0] if len(query_vectors) == 1 else None
+            provider_result_is_valid = query_vector is not None and _is_usable_vector(query_vector)
+        except Exception:  # noqa: BLE001
+            query_vector = None
+            provider_result_is_valid = False
+        if not provider_result_is_valid or query_vector is None:
             LOGGER.warning("Embedding endpoint returned an unusable query vector; degrading to FTS")
             return self._fts.assemble(
                 request,
                 lexical,
-                notices=(NOTICE_HYBRID_PROVIDER_INVALID_VECTOR,),
+                notices=(*lexical_notices, NOTICE_HYBRID_PROVIDER_INVALID_VECTOR),
             )
-
-        eligible = self._store.list_retrieval_vectors(
-            self._config.embeddings_model,
-            scope=_normalized_scope(request.scope),
-            kinds=request.kinds,
-            writer_model=request.writer_model,
-            limit=self._config.hybrid_max_candidates + 1,
-        )
-        if len(eligible) > self._config.hybrid_max_candidates:
+        try:
+            eligible = self._store.list_retrieval_vectors(
+                self._config.embeddings_model,
+                scope=_normalized_scope(request.scope),
+                kinds=request.kinds,
+                writer_model=request.writer_model,
+                limit=self._config.hybrid_max_candidates,
+            )
+        except StoreVectorBudgetError as exc:
+            notice = (
+                NOTICE_HYBRID_CANDIDATE_OVERFLOW
+                if exc.reason == "candidate_count"
+                else NOTICE_HYBRID_VECTOR_BUDGET_EXCEEDED
+            )
+            description = (
+                "candidate cap exceeded"
+                if exc.reason == "candidate_count"
+                else "fixed vector budget exceeded"
+            )
             LOGGER.warning(
-                "Hybrid semantic scan omitted: candidate cap exceeded limit=%d",
+                "Hybrid semantic scan omitted: %s reason=%s candidate_limit=%d",
+                description,
+                exc.reason,
                 self._config.hybrid_max_candidates,
             )
             return self._fts.assemble(
                 request,
                 lexical,
-                notices=(NOTICE_HYBRID_CANDIDATE_OVERFLOW,),
+                notices=(*lexical_notices, notice),
             )
         missing_vectors = any(
             vector is None or len(vector) != len(query_vector) for _, vector in eligible
@@ -343,15 +437,22 @@ class HybridRetriever:
             limit=self._config.fts_top_k,
         )
         fused_ids = reciprocal_rank_fusion(
-            ([entry.id for entry in lexical], [entry.id for entry in semantic]),
+            ([entry.id for entry in lexical], semantic),
             self._config.rrf_k,
+        )[: self._config.fts_top_k]
+        revalidated = self._store.get_retrieval_entries(
+            fused_ids,
+            writer_model=request.writer_model,
         )
-        entries_by_id = {entry.id: entry for entry in lexical}
-        entries_by_id.update((entry.id, entry) for entry, _ in eligible)
+        entries_by_id = {entry.id: entry for entry in revalidated}
         fused = tuple(
             entries_by_id[entry_id] for entry_id in fused_ids if entry_id in entries_by_id
         )
-        notices = (NOTICE_HYBRID_VECTOR_COVERAGE_INCOMPLETE,) if missing_vectors else ()
+        notices = (
+            (*lexical_notices, NOTICE_HYBRID_VECTOR_COVERAGE_INCOMPLETE)
+            if missing_vectors
+            else lexical_notices
+        )
         return self._fts.assemble(request, fused, notices=notices)
 
     def index_entry(self, entry: Entry) -> None:
@@ -363,31 +464,48 @@ class HybridRetriever:
             LOGGER.warning("Entry %s stored without a vector: %s", entry.id, exc)
 
     def rebuild_vectors(self) -> int:
-        """Replace one model atomically only after every new vector is usable."""
-        entries = self._store.list_entries()
-        if not entries:
-            self._store.replace_vectors(self._config.embeddings_model, {})
-            return 0
-        try:
-            vectors = self._provider.embed(tuple(_embedding_text(entry) for entry in entries))
-        except EmbeddingError as exc:
-            LOGGER.warning(
-                "Embedding endpoint unavailable; existing vector index retained: %s", exc
-            )
-            return 0
-        if (
-            len(vectors) != len(entries)
-            or len({len(vector) for vector in vectors}) != 1
-            or any(not _is_usable_vector(vector) for vector in vectors)
-        ):
-            LOGGER.warning("Embedding endpoint returned unusable vectors; existing index retained")
-            return 0
-        self._store.replace_vectors(
-            self._config.embeddings_model,
-            {entry.id: vector for entry, vector in zip(entries, vectors, strict=True)},
-        )
-        LOGGER.info("Rebuilt %d vectors for model %s", len(entries), self._config.embeddings_model)
-        return len(entries)
+        """Stage bounded pages and swap one complete model atomically."""
+        model = self._config.embeddings_model
+        with self._store.write_access():
+            self._store.begin_vector_rebuild(model)
+            after_id: str | None = None
+            rebuilt = 0
+            expected_dimension: int | None = None
+            try:
+                while entries := self._store.list_entries_page(
+                    after_id=after_id,
+                    limit=MAX_EMBEDDING_BATCH_ITEMS,
+                ):
+                    try:
+                        vectors = self._provider.embed(
+                            tuple(_embedding_text(entry) for entry in entries)
+                        )
+                        expected_dimension = _validate_rebuild_batch(
+                            entries,
+                            vectors,
+                            expected_dimension=expected_dimension,
+                        )
+                    except Exception as exc:
+                        raise EmbeddingError(
+                            "embedding provider failed during vector rebuild"
+                        ) from exc
+                    self._store.stage_vector_rebuild(
+                        model,
+                        {entry.id: vector for entry, vector in zip(entries, vectors, strict=True)},
+                    )
+                    rebuilt += len(entries)
+                    after_id = entries[-1].id
+                self._store.finish_vector_rebuild(model, expected_count=rebuilt)
+            except EmbeddingError as exc:
+                self._store.abort_vector_rebuild()
+                raise VectorRebuildError(
+                    "Vector rebuild failed; the existing vector index was retained"
+                ) from exc
+            except Exception:
+                self._store.abort_vector_rebuild()
+                raise
+        LOGGER.info("Rebuilt %d vectors for model %s", rebuilt, model)
+        return rebuilt
 
 
 def build_retriever(
@@ -428,19 +546,19 @@ def reciprocal_rank_fusion(
 
 
 def _semantic_rank(
-    eligible: Sequence[tuple[Entry, tuple[float, ...] | None]],
+    eligible: Sequence[tuple[str, tuple[float, ...] | None]],
     query_vector: Sequence[float],
     *,
     limit: int,
-) -> tuple[Entry, ...]:
-    scored: list[tuple[float, int, Entry]] = []
-    for order_index, (entry, vector) in enumerate(eligible):
+) -> tuple[str, ...]:
+    scored: list[tuple[float, int, str]] = []
+    for order_index, (entry_id, vector) in enumerate(eligible):
         if vector is None or len(vector) != len(query_vector):
             continue
         similarity = _cosine_similarity(vector, query_vector)
         if similarity is not None and similarity > 0.0:
-            scored.append((similarity, order_index, entry))
-    scored.sort(key=lambda item: (-item[0], item[1], item[2].id))
+            scored.append((similarity, order_index, entry_id))
+    scored.sort(key=lambda item: (-item[0], item[1], item[2]))
     return tuple(item[2] for item in scored[:limit])
 
 
@@ -455,6 +573,16 @@ def _cosine_similarity(left: Sequence[float], right: Sequence[float]) -> float |
 def _is_usable_vector(vector: Sequence[float]) -> bool:
     """Require a finite, float32-safe vector with a non-zero cosine norm."""
     return is_usable_float32_vector(vector)
+
+
+def _timed_out_result(notices: Sequence[str]) -> RetrievalResult:
+    """Fail closed without any post-timeout database read or provider call."""
+    return RetrievalResult(
+        matches=(),
+        next_actions=(),
+        own_pending=(),
+        notices=tuple(dict.fromkeys((*notices, NOTICE_FTS_QUERY_TIMEOUT))),
+    )
 
 
 def _conflict_family_key(entry: Entry) -> tuple[EntryKind, str, str] | None:
@@ -473,6 +601,24 @@ def effective_claim_key(entry: Entry) -> str | None:
 
 def _embedding_text(entry: Entry) -> str:
     return " ".join((entry.statement, *entry.subject_keys))
+
+
+def _validate_rebuild_batch(
+    entries: Sequence[Entry],
+    vectors: Sequence[Sequence[float]],
+    *,
+    expected_dimension: int | None,
+) -> int:
+    """Validate one provider batch and return its stable model dimension."""
+    if len(vectors) != len(entries):
+        raise EmbeddingError("embedding response count does not match the request")
+    dimensions = {len(vector) for vector in vectors}
+    if len(dimensions) != 1 or any(not _is_usable_vector(vector) for vector in vectors):
+        raise EmbeddingError("embedding endpoint returned unusable vectors")
+    batch_dimension = next(iter(dimensions))
+    if expected_dimension is not None and batch_dimension != expected_dimension:
+        raise EmbeddingError("embedding response dimensions are inconsistent")
+    return batch_dimension
 
 
 def _normalized_scope(scope: str | None) -> str | None:

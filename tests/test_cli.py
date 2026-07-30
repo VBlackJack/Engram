@@ -29,12 +29,14 @@ from engram.cli import (
     EXIT_USAGE_OR_CONFIG,
     ConsolidationApplyError,
     ServerBindError,
+    UpgradePreflightError,
     _attest,
     _classify,
     _consolidate,
     _ensure_server_bind_available,
     _list_entries,
     _migrate,
+    _preflight,
     _reindex,
     _serve,
     _supersede,
@@ -42,7 +44,7 @@ from engram.cli import (
 )
 from engram.config import AppConfig, ConfigError
 from engram.consolidation.gateway import DatacronGatewayError
-from engram.db import SQLiteVersionError
+from engram.db import MAX_SQLITE_VALUE_BYTES, DatabaseError, SQLiteVersionError
 from engram.logging_setup import FileLogger
 from engram.models import (
     AuditAction,
@@ -55,7 +57,7 @@ from engram.models import (
 )
 from engram.normalization import canonical_key
 from engram.process_lock import DatabaseLockError, DatabaseLockRole, DatabaseProcessLock
-from engram.retrieval import FtsRetriever, RetrievalRequest
+from engram.retrieval import FtsRetriever, RetrievalRequest, VectorRebuildError
 from engram.store import (
     EngramStore,
     StoreBusyError,
@@ -146,8 +148,10 @@ def test_main_formats_configuration_error_without_traceback(
             DatabaseLockError(Path("engram.db.lock"), None),
             EXIT_LOCAL_RESOURCE,
         ),
+        (sqlite3.OperationalError("database disk image is malformed"), EXIT_LOCAL_RESOURCE),
         (SQLiteVersionError("SQLite runtime is too old"), EXIT_LOCAL_RESOURCE),
         (DatacronGatewayError("Datacron is unavailable"), EXIT_EXTERNAL_DEPENDENCY),
+        (VectorRebuildError("Vector rebuild failed"), EXIT_EXTERNAL_DEPENDENCY),
         (StoreBusyError("server busy, retry"), EXIT_TRANSIENT_BUSY),
         (
             ConsolidationApplyError("apply completed with stale propositions"),
@@ -478,6 +482,301 @@ def test_daemon_lock_blocks_migrate_without_advancing_schema(
     finally:
         connection.close()
     assert version == (4,)
+
+
+def test_preflight_validates_compatible_database_without_writing(
+    app_config: AppConfig,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with EngramStore(app_config) as store:
+        store.add_attested(
+            kind="fact",
+            scope="user",
+            statement="The upgrade preflight is read-only.",
+            source_type=SourceType.HUMAN,
+            claim_key="upgrade/preflight",
+        )
+    before = app_config.database.path.read_bytes()
+
+    _preflight(
+        config=app_config,
+        logger=logging.getLogger("engram.test.preflight"),
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["compatible"] is True
+    assert payload["schema_version"] == 5
+    assert app_config.database.path.read_bytes() == before
+
+
+def test_preflight_wraps_database_open_failure(
+    app_config: AppConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with EngramStore(app_config):
+        pass
+
+    def refused_open(*args: object, **kwargs: object) -> sqlite3.Connection:
+        del args, kwargs
+        raise sqlite3.OperationalError("unable to open database file")
+
+    monkeypatch.setattr(sqlite3, "connect", refused_open)
+
+    with pytest.raises(DatabaseError, match="upgrade preflight failed"):
+        db_module.preflight_database(
+            app_config.database,
+            limits=app_config.limits,
+        )
+
+
+def test_preflight_rejects_oversized_non_integer_schema_version(
+    app_config: AppConfig,
+) -> None:
+    connection = sqlite3.connect(app_config.database.path)
+    try:
+        connection.execute("CREATE TABLE schema_version (version INTEGER NOT NULL)")
+        connection.execute(
+            "INSERT INTO schema_version(version) VALUES (zeroblob(?))",
+            (8 * 1024 * 1024,),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(DatabaseError, match="one non-negative integer"):
+        db_module.preflight_database(
+            app_config.database,
+            limits=app_config.limits,
+        )
+
+
+def test_preflight_applies_resource_limits_before_loading_oversized_schema(
+    app_config: AppConfig,
+) -> None:
+    oversized_comment = "x" * (MAX_SQLITE_VALUE_BYTES + 1)
+    connection = sqlite3.connect(app_config.database.path)
+    try:
+        connection.execute(
+            f"CREATE TABLE schema_version (version /* {oversized_comment} */ INTEGER NOT NULL)"
+        )
+        connection.execute("INSERT INTO schema_version(version) VALUES (5)")
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(DatabaseError, match="upgrade preflight failed"):
+        db_module.preflight_database(
+            app_config.database,
+            limits=app_config.limits,
+        )
+
+
+def test_preflight_accepts_v4_with_missing_derived_indexes(
+    app_config: AppConfig,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _initialize_version_four(app_config, monkeypatch, seed_fact=False)
+    connection = sqlite3.connect(app_config.database.path)
+    try:
+        connection.execute("DROP TABLE entries_fts")
+        connection.execute("DROP TABLE entry_vectors")
+        connection.commit()
+    finally:
+        connection.close()
+    before = app_config.database.path.read_bytes()
+
+    _preflight(
+        config=app_config,
+        logger=logging.getLogger("engram.test.preflight"),
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {
+        "compatible": True,
+        "database": str(app_config.database.path),
+        "schema_version": 4,
+        "target_schema_version": 5,
+        "fts_rebuild_required": True,
+        "vector_rebuild_required": True,
+    }
+    assert app_config.database.path.read_bytes() == before
+
+
+def test_preflight_rejects_legacy_schema_collision_without_writing(
+    app_config: AppConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _initialize_version_four(app_config, monkeypatch, seed_fact=False)
+    connection = sqlite3.connect(app_config.database.path)
+    try:
+        connection.execute("ALTER TABLE entries ADD COLUMN canonical_key TEXT")
+        connection.commit()
+    finally:
+        connection.close()
+    before = app_config.database.path.read_bytes()
+
+    with pytest.raises(UpgradePreflightError, match="duplicate column name: canonical_key"):
+        _preflight(
+            config=app_config,
+            logger=logging.getLogger("engram.test.preflight"),
+        )
+
+    assert app_config.database.path.read_bytes() == before
+
+
+def test_preflight_rejects_unrebuildable_derived_object_without_writing(
+    app_config: AppConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _initialize_version_four(app_config, monkeypatch, seed_fact=False)
+    connection = sqlite3.connect(app_config.database.path)
+    try:
+        connection.execute("DROP TABLE entries_fts")
+        connection.execute("CREATE INDEX entries_fts ON entries(id)")
+        connection.commit()
+    finally:
+        connection.close()
+    before = app_config.database.path.read_bytes()
+
+    with pytest.raises(UpgradePreflightError, match="unexpected SQLite object"):
+        _preflight(
+            config=app_config,
+            logger=logging.getLogger("engram.test.preflight"),
+        )
+
+    assert app_config.database.path.read_bytes() == before
+
+
+def test_migrate_rejects_unrebuildable_derived_object_before_schema_commit(
+    app_config: AppConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _initialize_version_four(app_config, monkeypatch, seed_fact=False)
+    connection = sqlite3.connect(app_config.database.path)
+    try:
+        connection.execute("DROP TABLE entries_fts")
+        connection.execute("CREATE INDEX entries_fts ON entries(id)")
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(DatabaseError, match="unexpected SQLite object"):
+        _migrate(
+            config=app_config,
+            logger=logging.getLogger("engram.test.migrate"),
+        )
+
+    connection = sqlite3.connect(app_config.database.path)
+    try:
+        version = connection.execute("SELECT version FROM schema_version").fetchone()
+    finally:
+        connection.close()
+    assert version == (4,)
+
+
+def test_preflight_rejects_unrebuildable_v5_derived_object_without_writing(
+    app_config: AppConfig,
+) -> None:
+    with EngramStore(app_config):
+        pass
+    connection = sqlite3.connect(app_config.database.path)
+    try:
+        connection.execute("DROP TABLE entries_fts")
+        connection.execute("CREATE INDEX entries_fts ON entries(id)")
+        connection.commit()
+    finally:
+        connection.close()
+    before = app_config.database.path.read_bytes()
+
+    with pytest.raises(UpgradePreflightError, match="unexpected SQLite object"):
+        _preflight(
+            config=app_config,
+            logger=logging.getLogger("engram.test.preflight"),
+        )
+
+    assert app_config.database.path.read_bytes() == before
+
+
+def test_preflight_rejects_v5_canonical_schema_drift_without_writing(
+    app_config: AppConfig,
+) -> None:
+    with EngramStore(app_config):
+        pass
+    connection = sqlite3.connect(app_config.database.path)
+    try:
+        connection.execute("ALTER TABLE entries ADD COLUMN required_extra TEXT NOT NULL")
+        connection.commit()
+    finally:
+        connection.close()
+    before = app_config.database.path.read_bytes()
+
+    with pytest.raises(UpgradePreflightError, match="canonical table definition is invalid"):
+        _preflight(
+            config=app_config,
+            logger=logging.getLogger("engram.test.preflight"),
+        )
+
+    assert app_config.database.path.read_bytes() == before
+
+
+def test_daemon_lock_blocks_preflight_without_writing(
+    app_config: AppConfig,
+) -> None:
+    with EngramStore(app_config):
+        pass
+    before = app_config.database.path.read_bytes()
+
+    with (
+        DatabaseProcessLock(
+            app_config.database.path,
+            role=DatabaseLockRole.DAEMON,
+            command="serve",
+        ),
+        pytest.raises(DatabaseLockError),
+    ):
+        _preflight(
+            config=app_config,
+            logger=logging.getLogger("engram.test.preflight"),
+        )
+
+    assert app_config.database.path.read_bytes() == before
+
+
+def test_preflight_reports_legacy_oversize_without_mutating(
+    app_config: AppConfig,
+) -> None:
+    with EngramStore(app_config) as store:
+        entry = store.add_attested(
+            kind="fact",
+            scope="user",
+            statement="Legacy oversized metadata needs human review.",
+            source_type=SourceType.HUMAN,
+            claim_key="upgrade/legacy-bound",
+        )
+    connection = sqlite3.connect(app_config.database.path)
+    try:
+        connection.execute(
+            "UPDATE entries SET subject_keys = ? WHERE id = ?",
+            (json.dumps(["k" * 201]), entry.id),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    before = app_config.database.path.read_bytes()
+
+    with pytest.raises(
+        UpgradePreflightError,
+        match=r"No data was changed.*2026\.0730\.01",
+    ) as error:
+        _preflight(
+            config=app_config,
+            logger=logging.getLogger("engram.test.preflight"),
+        )
+
+    assert entry.id in str(error.value)
+    assert "subject key exceeds" in str(error.value)
+    assert app_config.database.path.read_bytes() == before
 
 
 def test_missing_supersession_ids_exit_without_traceback(

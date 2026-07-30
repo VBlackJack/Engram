@@ -24,6 +24,7 @@ from mcp.types import CallToolResult, Implementation, TextContent
 from starlette.applications import Starlette
 
 import engram.server as server_module
+import engram.store as store_module
 from engram import __version__
 from engram.capsule import CapsuleResult, estimate_capsule_bytes
 from engram.config import (
@@ -36,7 +37,7 @@ from engram.config import (
 from engram.db import MINIMUM_SQLITE_VERSION
 from engram.embeddings import EmbeddingError
 from engram.models import EntryStatus, PromotionState, SourceType
-from engram.retrieval import HybridRetriever
+from engram.retrieval import NOTICE_FTS_QUERY_TIMEOUT, HybridRetriever
 from engram.server import create_mcp_server
 from engram.store import EngramStore
 from tests.conftest import MutableClock
@@ -50,6 +51,18 @@ class FailingEmbeddingProvider:
     def embed(self, texts: Sequence[str]) -> tuple[tuple[float, ...], ...]:
         del texts
         raise EmbeddingError("mock endpoint unavailable")
+
+
+class ProgressTimeoutClock:
+    """Cross an FTS deadline only when SQLite invokes its progress callback."""
+
+    def __init__(self) -> None:
+        """Start before the synthetic deadline."""
+        self.calls = 0
+
+    def __call__(self) -> float:
+        self.calls += 1
+        return 0.0 if self.calls <= 2 else 1.0
 
 
 @pytest.fixture
@@ -283,6 +296,43 @@ async def test_writer_quarantine_is_visible_only_to_the_same_client(
                 assert other_capsule["current"] == []
                 assert other_capsule["relevant"] == []
                 assert other_capsule["own_pending"] == []
+
+
+@pytest.mark.anyio
+async def test_recall_timeout_returns_structured_incomplete_success(
+    app_config: AppConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    progress_clock = ProgressTimeoutClock()
+    monkeypatch.setattr(store_module, "SQLITE_PROGRESS_HANDLER_STEPS", 1)
+    with EngramStore(app_config, monotonic_clock=progress_clock) as store:
+        store.add_attested(
+            kind="episode",
+            scope="user",
+            statement="Timeout capsule remains explicit.",
+            source_type=SourceType.HUMAN,
+        )
+        server = create_mcp_server(app_config, store)
+        app = server.streamable_http_app()
+        async with app.router.lifespan_context(app), _client(app) as session:
+            result = await session.call_tool(
+                "recall",
+                {"query": "timeout capsule"},
+            )
+
+        assert result.isError is False
+        capsule = _structured(result)
+        assert capsule["current"] == []
+        assert capsule["relevant"] == []
+        assert capsule["notes"]["recall_complete"] is False
+        assert capsule["notes"]["warnings"] == [NOTICE_FTS_QUERY_TIMEOUT]
+        assert NOTICE_FTS_QUERY_TIMEOUT in _fallback_text(result)
+        store.add_attested(
+            kind="episode",
+            scope="user",
+            statement="Connection remains writable after timeout.",
+            source_type=SourceType.HUMAN,
+        )
 
 
 @pytest.mark.anyio

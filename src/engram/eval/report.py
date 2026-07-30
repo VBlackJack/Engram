@@ -5,7 +5,13 @@
 
 from __future__ import annotations
 
-from .models import EvaluationMetrics, FamilyMetrics, ModeMetrics, ModeStatus
+from .models import (
+    ConsolidationClass,
+    EvaluationMetrics,
+    FamilyMetrics,
+    ModeMetrics,
+    ModeStatus,
+)
 
 
 def render_report(metrics: EvaluationMetrics) -> str:
@@ -98,6 +104,7 @@ def render_report(metrics: EvaluationMetrics) -> str:
         ),
         "",
         f"Warnings du contrat FTS: {_warning_summary(metrics.fts_contract.warning_counts)}.",
+        f"Warnings FTS globaux: {_warning_summary(metrics.fts_contract.global_warning_counts)}.",
         "",
         (
             "Le gate FTS couvre le rappel global et les degradations lexicales/adversariales "
@@ -164,7 +171,8 @@ def render_report(metrics: EvaluationMetrics) -> str:
             "|---|---:|---:|---:|",
         ]
     )
-    for classification, values in metrics.f3_consolidation.per_class.items():
+    for classification in ConsolidationClass:
+        values = metrics.f3_consolidation.per_class[classification]
         lines.append(
             f"| {classification.value} | {_percent(values.precision)} | "
             f"{_percent(values.recall)} | {values.support} |"

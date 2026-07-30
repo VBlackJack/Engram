@@ -5,14 +5,21 @@
 
 from __future__ import annotations
 
+import json
 import math
+import time
 from collections.abc import Sequence
 from typing import Protocol
 
 import httpx
 
 from .config import RetrievalConfig
-from .vectors import FLOAT32_MAX
+from .vectors import FLOAT32_MAX, MAX_VECTOR_DIMENSIONS
+
+MAX_EMBEDDING_BATCH_ITEMS = 64
+MAX_EMBEDDING_INPUT_CHARS = 32_768
+MAX_EMBEDDING_RESPONSE_BYTES = 8 * 1024 * 1024
+MAX_EMBEDDING_VECTOR_DIMENSIONS = MAX_VECTOR_DIMENSIONS
 
 
 class EmbeddingError(RuntimeError):
@@ -44,26 +51,98 @@ class HttpEmbeddingProvider:
 
     def embed(self, texts: Sequence[str]) -> tuple[tuple[float, ...], ...]:
         """Embed a batch or raise one normalized provider error."""
-        inputs = tuple(texts)
+        inputs = _validated_inputs(texts)
         if not inputs:
             return ()
+        deadline = time.monotonic() + self._timeout_seconds
+        payload = self._request_payload(inputs, deadline=deadline)
+        vectors = _parse_embeddings(payload, len(inputs))
+        if time.monotonic() >= deadline:
+            raise EmbeddingError("embedding endpoint deadline expired")
+        return vectors
+
+    def _request_payload(
+        self,
+        inputs: tuple[str, ...],
+        *,
+        deadline: float,
+    ) -> object:
+        """Read and decode one bounded uncompressed provider response."""
         try:
-            with httpx.Client(
-                transport=self._transport,
-                timeout=self._timeout_seconds,
-            ) as client:
-                response = client.post(
+            with (
+                httpx.Client(
+                    transport=self._transport,
+                    timeout=self._timeout_seconds,
+                ) as client,
+                client.stream(
+                    "POST",
                     self._endpoint,
+                    headers={"accept-encoding": "identity"},
                     json={"model": self._model, "input": list(inputs)},
-                )
+                ) as response,
+            ):
                 response.raise_for_status()
-                payload = response.json()
-        except (httpx.HTTPError, ValueError) as exc:
+                _reject_compressed_response(response)
+                _reject_oversized_content_length(response)
+                body = bytearray()
+                chunks = (response.content,) if response.is_stream_consumed else response.iter_raw()
+                for chunk in chunks:
+                    if time.monotonic() >= deadline:
+                        raise EmbeddingError("embedding endpoint deadline expired")
+                    if len(chunk) > MAX_EMBEDDING_RESPONSE_BYTES - len(body):
+                        raise EmbeddingError("embedding response body is too large")
+                    body.extend(chunk)
+            if time.monotonic() >= deadline:
+                raise EmbeddingError("embedding endpoint deadline expired")
+            payload: object = json.loads(body)
+            if time.monotonic() >= deadline:
+                raise EmbeddingError("embedding endpoint deadline expired")
+        except (
+            httpx.HTTPError,
+            httpx.InvalidURL,
+            RecursionError,
+            UnicodeError,
+            ValueError,
+        ) as exc:
             raise EmbeddingError("embedding endpoint request failed") from exc
-        return _parse_embeddings(payload, len(inputs))
+        return payload
 
 
-def _parse_embeddings(payload: object, expected_count: int) -> tuple[tuple[float, ...], ...]:
+def _validated_inputs(texts: Sequence[str]) -> tuple[str, ...]:
+    inputs = tuple(texts)
+    if len(inputs) > MAX_EMBEDDING_BATCH_ITEMS:
+        raise EmbeddingError(f"embedding batch exceeds {MAX_EMBEDDING_BATCH_ITEMS} items")
+    if any(
+        not isinstance(text, str) or not text or len(text) > MAX_EMBEDDING_INPUT_CHARS
+        for text in inputs
+    ):
+        raise EmbeddingError(
+            f"embedding input must be non-empty text under {MAX_EMBEDDING_INPUT_CHARS} characters"
+        )
+    return inputs
+
+
+def _reject_compressed_response(response: httpx.Response) -> None:
+    encoding = response.headers.get("content-encoding", "").strip().casefold()
+    if encoding not in {"", "identity"}:
+        raise EmbeddingError("compressed embedding responses are not accepted")
+
+
+def _reject_oversized_content_length(response: httpx.Response) -> None:
+    raw_length = response.headers.get("content-length")
+    if raw_length is None or not raw_length.isdecimal():
+        return
+    if (
+        len(raw_length) > len(str(MAX_EMBEDDING_RESPONSE_BYTES))
+        or int(raw_length) > MAX_EMBEDDING_RESPONSE_BYTES
+    ):
+        raise EmbeddingError("embedding response body is too large")
+
+
+def _parse_embeddings(  # noqa: C901
+    payload: object,
+    expected_count: int,
+) -> tuple[tuple[float, ...], ...]:
     if not isinstance(payload, dict):
         raise EmbeddingError("embedding response must be an object")
     data = payload.get("data")
@@ -80,6 +159,10 @@ def _parse_embeddings(payload: object, expected_count: int) -> tuple[tuple[float
             raise EmbeddingError("embedding response index must be an integer")
         if not isinstance(values, list) or not values:
             raise EmbeddingError("embedding vector must not be empty")
+        if len(values) > MAX_EMBEDDING_VECTOR_DIMENSIONS:
+            raise EmbeddingError(
+                f"embedding vector exceeds {MAX_EMBEDDING_VECTOR_DIMENSIONS} dimensions"
+            )
         vector = _finite_vector(values)
         if index in indexed:
             raise EmbeddingError("embedding response contains a duplicate index")
@@ -99,7 +182,10 @@ def _finite_vector(values: list[object]) -> tuple[float, ...]:
     for value in values:
         if isinstance(value, bool) or not isinstance(value, int | float):
             raise EmbeddingError("embedding vector values must be numbers")
-        converted = float(value)
+        try:
+            converted = float(value)
+        except OverflowError as exc:
+            raise EmbeddingError("embedding vector values must fit in float32") from exc
         if not math.isfinite(converted):
             raise EmbeddingError("embedding vector values must be finite")
         if abs(converted) > FLOAT32_MAX:

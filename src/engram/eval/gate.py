@@ -14,6 +14,7 @@ from engram.capsule import (
     CAPSULE_ESTIMATOR_VERSION,
 )
 from engram.config import RetrievalConfig, RetrievalMode
+from engram.retrieval import NOTICE_FTS_QUERY_TIMEOUT
 
 from .models import (
     FtsContractMetrics,
@@ -33,6 +34,7 @@ FTS_CONTRACT_RETRIEVAL_CONFIG = RetrievalConfig(
     fts_max_query_chars=1024,
     fts_max_query_terms=24,
     fts_min_prefix_chars=4,
+    fts_query_timeout_ms=250,
     hybrid_max_candidates=4096,
 )
 FTS_CONTRACT_THRESHOLDS = FtsContractThresholds(
@@ -115,6 +117,7 @@ def evaluate_fts_contract(
             poisoning.pass_rate >= active_thresholds.minimum_poisoning_pass_rate
         ),
         "recall_p95_ms": recall_p95_ms <= active_thresholds.maximum_recall_p95_ms,
+        "fts_query_timeout_absent": (recall.warning_counts.get(NOTICE_FTS_QUERY_TIMEOUT, 0) == 0),
     }
     return FtsContractMetrics(
         passed=all(checks.values()),
@@ -133,5 +136,6 @@ def evaluate_fts_contract(
         contradiction_pass_rate=contradiction.pass_rate,
         poisoning_pass_rate=poisoning.pass_rate,
         warning_counts=recall.fts_contract_warning_counts,
+        global_warning_counts=recall.warning_counts,
         recall_p95_ms=recall_p95_ms,
     )

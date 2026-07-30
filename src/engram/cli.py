@@ -11,12 +11,13 @@ import json
 import logging
 import os
 import socket
+import sqlite3
 import sys
 from datetime import date, datetime
 from pathlib import Path
 
 from . import __version__
-from .config import AppConfig, ConfigError, load_config
+from .config import AppConfig, ConfigError, load_config, load_preflight_config
 from .consolidation.gateway import DatacronGatewayError
 from .consolidation.mcp_gateway import McpDatacronGateway
 from .consolidation.models import ApplyStatus, ConsolidationPlan
@@ -27,19 +28,30 @@ from .consolidation.report import (
     render_plan_markdown,
 )
 from .consolidation.service import ConsolidationService
-from .db import DatabaseError, SQLiteVersionError, latest_schema_version
+from .db import (
+    DatabaseError,
+    SQLiteVersionError,
+    latest_schema_version,
+    preflight_database,
+)
 from .eval.gate import EvaluationGateError
 from .eval.models import EvalMode
 from .eval.runner import run_evaluation
 from .logging_setup import FileLogger
 from .models import Confidence, Entry, EntryKind, EntryStatus, Evidence, EvidenceType, SourceType
-from .normalization import normalize_claim_key, normalize_trusted_claim_key
+from .normalization import (
+    HARD_MAX_STATEMENT_CHARS,
+    HARD_MAX_SUBJECT_KEYS,
+    normalize_actor,
+    normalize_claim_key,
+    normalize_trusted_claim_key,
+)
 from .process_lock import (
     DatabaseLockError,
     DatabaseLockRole,
     DatabaseProcessLock,
 )
-from .retrieval import HybridRetriever, build_retriever
+from .retrieval import HybridRetriever, VectorRebuildError, build_retriever
 from .server import create_mcp_server
 from .store import EngramReader, EngramStore, StoreBusyError, StoreValidationError
 
@@ -62,6 +74,10 @@ class ConsolidationApplyError(RuntimeError):
     """Raised after an apply report records failed or stale propositions."""
 
 
+class UpgradePreflightError(RuntimeError):
+    """Raised when a read-only upgrade check finds incompatible persisted data."""
+
+
 def main() -> None:
     """Parse one supported command and execute its isolated workflow."""
     parser = _build_parser()
@@ -69,7 +85,7 @@ def main() -> None:
     debug = bool(arguments.debug) or _environment_debug_enabled()
     logger: logging.Logger | None = None
     try:
-        config = load_config()
+        config = load_preflight_config() if arguments.command == "preflight" else load_config()
         logger = FileLogger(config.logging).configure()
         _dispatch(parser, arguments, config=config, logger=logger)
     except KeyboardInterrupt:
@@ -82,8 +98,11 @@ def main() -> None:
         DatabaseLockError,
         DatacronGatewayError,
         ConsolidationApplyError,
+        UpgradePreflightError,
         EvaluationGateError,
+        VectorRebuildError,
         OSError,
+        sqlite3.Error,
         SQLiteVersionError,
         StoreBusyError,
         StoreValidationError,
@@ -108,6 +127,10 @@ def _build_parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("serve", help="Run the streamable HTTP MCP server")
     commands.add_parser("migrate", help="Migrate and validate storage offline")
+    commands.add_parser(
+        "preflight",
+        help="Validate an existing database read-only before an upgrade",
+    )
     commands.add_parser("reindex", help="Rebuild derived FTS and vector indexes")
     _add_trusted_command_parsers(commands)
     _add_evaluation_parser(commands)
@@ -243,7 +266,7 @@ def _add_consolidation_parser(
     )
 
 
-def _dispatch(
+def _dispatch(  # noqa: C901
     parser: argparse.ArgumentParser,
     arguments: argparse.Namespace,
     *,
@@ -255,6 +278,8 @@ def _dispatch(
         _serve(config=config, logger=logger)
     elif arguments.command == "migrate":
         _migrate(config=config, logger=logger)
+    elif arguments.command == "preflight":
+        _preflight(config=config, logger=logger)
     elif arguments.command == "reindex":
         _reindex(config=config, logger=logger)
     elif arguments.command == "attest":
@@ -324,8 +349,8 @@ def _serve(*, config: AppConfig, logger: logging.Logger) -> None:
             config.database.path,
             role=DatabaseLockRole.DAEMON,
             command="serve",
-        ),
-        EngramStore(config) as store,
+        ) as process_lock,
+        EngramStore(config, process_lock=process_lock) as store,
     ):
         server = create_mcp_server(config, store)
         logger.info(
@@ -380,13 +405,62 @@ def _migrate(*, config: AppConfig, logger: logging.Logger) -> None:
             config.database.path,
             role=DatabaseLockRole.OFFLINE_WRITER,
             command="migrate",
-        ),
-        EngramStore(config),
+        ) as process_lock,
+        EngramStore(config, process_lock=process_lock),
     ):
         pass
     schema_version = latest_schema_version()
     logger.info("Database migration complete: schema_version=%d", schema_version)
     _write_json({"schema_version": schema_version})
+
+
+def _preflight(*, config: AppConfig, logger: logging.Logger) -> None:
+    """Validate the configured database without migrations or content writes."""
+    with DatabaseProcessLock(
+        config.database.path,
+        role=DatabaseLockRole.OFFLINE_WRITER,
+        command="preflight",
+    ):
+        try:
+            report = preflight_database(
+                config.database,
+                limits=config.limits,
+            )
+        except DatabaseError as exc:
+            raise UpgradePreflightError(
+                "Upgrade preflight rejected persisted data: "
+                f"{exc}. No data was changed. Keep the verified backup and use "
+                "Engram 2026.0730.01 or the version named by the diagnostic to review "
+                "or export the reported row before retrying."
+            ) from exc
+    required_changes: list[str] = []
+    if config.limits.max_statement_chars > HARD_MAX_STATEMENT_CHARS:
+        required_changes.append(
+            f"limits.max_statement_chars must be at most {HARD_MAX_STATEMENT_CHARS}"
+        )
+    if config.limits.max_subject_keys > HARD_MAX_SUBJECT_KEYS:
+        required_changes.append(f"limits.max_subject_keys must be at most {HARD_MAX_SUBJECT_KEYS}")
+    if required_changes:
+        raise UpgradePreflightError(
+            "Upgrade preflight accepted persisted data, but configuration changes are "
+            f"required: {'; '.join(required_changes)}. No data was changed. Update the "
+            "configuration and rerun preflight."
+        )
+    logger.info(
+        "Upgrade preflight complete: compatible=true schema=%d target=%d",
+        report.schema_version,
+        report.target_schema_version,
+    )
+    _write_json(
+        {
+            "compatible": True,
+            "database": str(config.database.path),
+            "schema_version": report.schema_version,
+            "target_schema_version": report.target_schema_version,
+            "fts_rebuild_required": report.fts_rebuild_required,
+            "vector_rebuild_required": report.vector_rebuild_required,
+        }
+    )
 
 
 def _environment_debug_enabled() -> bool:
@@ -397,13 +471,11 @@ def _environment_debug_enabled() -> bool:
 def _error_exit_code(error: BaseException) -> int:
     if isinstance(error, ConfigError | StoreValidationError):
         return EXIT_USAGE_OR_CONFIG
-    if isinstance(error, DatacronGatewayError):
+    if isinstance(error, DatacronGatewayError | VectorRebuildError):
         return EXIT_EXTERNAL_DEPENDENCY
     if isinstance(error, StoreBusyError):
         return EXIT_TRANSIENT_BUSY
-    if isinstance(error, ConsolidationApplyError):
-        return EXIT_PARTIAL_RESULT
-    if isinstance(error, EvaluationGateError):
+    if isinstance(error, ConsolidationApplyError | EvaluationGateError):
         return EXIT_PARTIAL_RESULT
     return EXIT_LOCAL_RESOURCE
 
@@ -448,7 +520,7 @@ def _attest(  # noqa: PLR0913
     supersedes: tuple[str, ...],
 ) -> None:
     """Create one trusted entry and retire its explicitly replaced versions."""
-    selected_actor = config.attestation.default_actor if actor is None else actor
+    selected_actor = normalize_actor(config.attestation.default_actor if actor is None else actor)
     normalized_claim_key = normalize_trusted_claim_key(kind, claim_key)
     unique_supersedes = tuple(dict.fromkeys(supersedes))
     with (
@@ -456,8 +528,8 @@ def _attest(  # noqa: PLR0913
             config.database.path,
             role=DatabaseLockRole.OFFLINE_WRITER,
             command="attest",
-        ),
-        EngramStore(config) as store,
+        ) as process_lock,
+        EngramStore(config, process_lock=process_lock) as store,
         store.write_access(config.server.write_wait_timeout_ms),
     ):
         entry = store.add_attested(
@@ -492,14 +564,14 @@ def _classify(
 ) -> None:
     """Classify one trusted legacy entry through the offline writer path."""
     normalized_claim_key = normalize_claim_key(claim_key)
-    selected_actor = config.attestation.default_actor if actor is None else actor
+    selected_actor = normalize_actor(config.attestation.default_actor if actor is None else actor)
     with (
         DatabaseProcessLock(
             config.database.path,
             role=DatabaseLockRole.OFFLINE_WRITER,
             command="classify",
-        ),
-        EngramStore(config) as store,
+        ) as process_lock,
+        EngramStore(config, process_lock=process_lock) as store,
         store.write_access(config.server.write_wait_timeout_ms),
     ):
         entry = store.classify_claim(
@@ -520,14 +592,14 @@ def _supersede(
     actor: str | None,
 ) -> None:
     """Retire one entry in favor of an existing replacement."""
-    selected_actor = config.attestation.default_actor if actor is None else actor
+    selected_actor = normalize_actor(config.attestation.default_actor if actor is None else actor)
     with (
         DatabaseProcessLock(
             config.database.path,
             role=DatabaseLockRole.OFFLINE_WRITER,
             command="supersede",
-        ),
-        EngramStore(config) as store,
+        ) as process_lock,
+        EngramStore(config, process_lock=process_lock) as store,
         store.write_access(config.server.write_wait_timeout_ms),
     ):
         store.supersede(old_id, new_id, actor=selected_actor)
@@ -573,8 +645,8 @@ def _reindex(*, config: AppConfig, logger: logging.Logger) -> None:
         config.database.path,
         role=DatabaseLockRole.OFFLINE_WRITER,
         command="reindex",
-    ):
-        store = EngramStore(config)
+    ) as process_lock:
+        store = EngramStore(config, process_lock=process_lock)
         try:
             store.rebuild_fts()
             retriever = build_retriever(config, store)
@@ -627,8 +699,8 @@ def _consolidate(  # noqa: PLR0913
             config.database.path,
             role=DatabaseLockRole.OFFLINE_WRITER,
             command="consolidate",
-        ),
-        EngramStore(config) as store,
+        ) as process_lock,
+        EngramStore(config, process_lock=process_lock) as store,
     ):
         service = ConsolidationService(store, gateway, config.datacron)
         if generate_plan:

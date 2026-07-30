@@ -14,7 +14,7 @@ import pytest
 
 import engram.db as db_module
 from engram.config import AppConfig, RetrievalConfig, RetrievalMode
-from engram.embeddings import EmbeddingError
+from engram.embeddings import MAX_EMBEDDING_BATCH_ITEMS, EmbeddingError
 from engram.models import EntryKind, EntryStatus, SourceType
 from engram.retrieval import (
     NOTICE_CONFLICT_FAMILY_OVERFLOW,
@@ -28,6 +28,7 @@ from engram.retrieval import (
     FtsRetriever,
     HybridRetriever,
     RetrievalRequest,
+    VectorRebuildError,
     reciprocal_rank_fusion,
 )
 from engram.store import EngramStore, StoreValidationError
@@ -207,6 +208,18 @@ class DateAdvancingEmbeddingProvider(KeywordEmbeddingProvider):
     def embed(self, texts: Sequence[str]) -> tuple[tuple[float, ...], ...]:
         self._clock.current += timedelta(days=1)
         return super().embed(texts)
+
+
+class FixedEmbeddingProvider:
+    """Return one deliberately malformed provider result."""
+
+    def __init__(self, vectors: tuple[tuple[float, ...], ...]) -> None:
+        """Store the fixed malformed response."""
+        self._vectors = vectors
+
+    def embed(self, texts: Sequence[str]) -> tuple[tuple[float, ...], ...]:
+        del texts
+        return self._vectors
 
 
 def _keyword_vector(text: str) -> tuple[float, ...]:
@@ -984,6 +997,30 @@ def test_hybrid_retrieval_fuses_stored_vectors(store: EngramStore) -> None:
     assert {entry.id for entry in result.matches} == {lexical.id, semantic.id}
 
 
+def test_hybrid_vector_rebuild_uses_bounded_batches(store: EngramStore) -> None:
+    for index in range(MAX_EMBEDDING_BATCH_ITEMS + 1):
+        store.add_attested(
+            kind="episode",
+            scope="user",
+            statement=f"Bounded lexical embedding rebuild entry {index}.",
+            source_type=SourceType.HUMAN,
+        )
+    provider = KeywordEmbeddingProvider()
+    retriever = HybridRetriever(
+        store,
+        RetrievalConfig(
+            mode=RetrievalMode.HYBRID,
+            embeddings_model="mock-model",
+        ),
+        provider=provider,
+    )
+
+    rebuilt = retriever.rebuild_vectors()
+
+    assert rebuilt == MAX_EMBEDDING_BATCH_ITEMS + 1
+    assert [len(batch) for batch in provider.calls] == [MAX_EMBEDDING_BATCH_ITEMS, 1]
+
+
 def test_hybrid_preserves_old_lexical_hit_outside_semantic_window(
     store: EngramStore,
     clock: MutableClock,
@@ -1168,11 +1205,13 @@ def test_hybrid_corrupt_vector_degrades_to_incomplete_coverage(
 
     connection = sqlite3.connect(app_config.database.path)
     try:
+        connection.execute("PRAGMA ignore_check_constraints = ON")
         connection.execute(
             "UPDATE entry_vectors SET vector = X'00' WHERE entry_id = ?",
             (entry.id,),
         )
         connection.commit()
+        connection.execute("PRAGMA ignore_check_constraints = OFF")
     finally:
         connection.close()
 
@@ -1239,6 +1278,40 @@ def test_hybrid_zero_norm_query_vector_degrades_to_fts_with_notice(
     assert result.notices == (NOTICE_HYBRID_PROVIDER_INVALID_VECTOR,)
 
 
+@pytest.mark.parametrize(
+    "vectors",
+    [
+        (),
+        ((10**10_000,),),
+    ],
+    ids=["missing-vector", "unrepresentable-integer"],
+)
+def test_hybrid_malformed_provider_result_degrades_to_fts(
+    store: EngramStore,
+    vectors: tuple[tuple[float, ...], ...],
+) -> None:
+    entry = store.add_attested(
+        kind=EntryKind.FACT,
+        scope="user",
+        statement="Lexical fallback survives malformed provider output.",
+        source_type=SourceType.HUMAN,
+        claim_key="hybrid/malformed-provider",
+    )
+    retriever = HybridRetriever(
+        store,
+        RetrievalConfig(
+            mode=RetrievalMode.HYBRID,
+            embeddings_model="mock-model",
+        ),
+        provider=FixedEmbeddingProvider(vectors),
+    )
+
+    result = retriever.retrieve(_request("lexical fallback"))
+
+    assert result.matches[0].id == entry.id
+    assert NOTICE_HYBRID_PROVIDER_INVALID_VECTOR in result.notices
+
+
 def test_failed_vector_rebuild_retains_the_existing_model_index(
     store: EngramStore,
 ) -> None:
@@ -1259,9 +1332,9 @@ def test_failed_vector_rebuild_retains_the_existing_model_index(
         provider=KeywordEmbeddingProvider(fail=True),
     )
 
-    rebuilt = retriever.rebuild_vectors()
+    with pytest.raises(VectorRebuildError, match="existing vector index was retained"):
+        retriever.rebuild_vectors()
 
-    assert rebuilt == 0
     assert store.list_vectors("mock-model") == {entry.id: (1.0, 0.0)}
 
 
@@ -1289,9 +1362,9 @@ def test_oversized_vector_rebuild_retains_the_existing_model_index(
         provider=OversizedProvider(),
     )
 
-    rebuilt = retriever.rebuild_vectors()
+    with pytest.raises(VectorRebuildError, match="existing vector index was retained"):
+        retriever.rebuild_vectors()
 
-    assert rebuilt == 0
     assert store.list_vectors("mock-model") == {entry.id: (1.0, 0.0)}
 
 

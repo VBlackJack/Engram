@@ -79,9 +79,9 @@ overridden as `ENGRAM_<SECTION>_<KEY>`; relative paths resolve from the TOML fil
 | `[limits]` | `ENGRAM_LIMITS_MAX_STATEMENT_CHARS`, `ENGRAM_LIMITS_MAX_SUBJECT_KEYS` | Input bounds |
 | `[logging]` | `ENGRAM_LOGGING_PATH`, `_FILE_LEVEL`, `_CONSOLE_LEVEL` | Log file and levels |
 | `[attestation]` | `ENGRAM_ATTESTATION_DEFAULT_ACTOR` | Default actor for trusted local mutations |
-| `[server]` | `ENGRAM_SERVER_HOST`, `_PORT`, `_PATH`, `_WRITE_WAIT_TIMEOUT_MS`, `_TTL_SWEEP_INTERVAL_SECONDS` | HTTP endpoint, backpressure, and logical-expiry sweep |
+| `[server]` | `ENGRAM_SERVER_HOST`, `_PORT`, `_PATH`, `_WRITE_WAIT_TIMEOUT_MS`, `_TTL_SWEEP_INTERVAL_SECONDS`, `_MAX_REQUEST_BODY_BYTES` | Loopback HTTP endpoint, backpressure, a hard 512 KiB request-body ceiling, and logical-expiry sweep |
 | `[capsule]` | `ENGRAM_CAPSULE_DEFAULT_TOKEN_BUDGET`, `_MIN_TOKEN_BUDGET`, `_MAX_TOKEN_BUDGET` | Recall budget |
-| `[retrieval]` | `ENGRAM_RETRIEVAL_MODE`, `_FTS_TOP_K`, `_FTS_MAX_QUERY_CHARS`, `_FTS_MAX_QUERY_TERMS`, `_FTS_MIN_PREFIX_CHARS`, `_HYBRID_MAX_CANDIDATES`, `_EMBEDDINGS_ENDPOINT`, `_EMBEDDINGS_MODEL`, `_EMBEDDINGS_TIMEOUT_MS`, `_RRF_K` | Bounded FTS or local hybrid |
+| `[retrieval]` | `ENGRAM_RETRIEVAL_MODE`, `_FTS_TOP_K`, `_FTS_MAX_QUERY_CHARS`, `_FTS_MAX_QUERY_TERMS`, `_FTS_MIN_PREFIX_CHARS`, `_FTS_QUERY_TIMEOUT_MS`, `_HYBRID_MAX_CANDIDATES`, `_EMBEDDINGS_ENDPOINT`, `_EMBEDDINGS_MODEL`, `_EMBEDDINGS_TIMEOUT_MS`, `_RRF_K` | Bounded FTS with one absolute deadline, or local hybrid |
 | `[datacron]` | `ENGRAM_DATACRON_COMMAND`, `_ARGS`, `_VAULT_ROOT`, `_READ_PATHS`, `_WRITE_PATHS`, `_NEW_NOTE_DIRECTORY`, `_NEIGHBOR_LIMIT`, `_STARTUP_TIMEOUT_MS`, `_REQUEST_TIMEOUT_MS`, `_SHUTDOWN_TIMEOUT_MS` | Gateway, timeouts, and Datacron confinement |
 
 For list variables, `ARGS` uses shell parsing and `READ_PATHS`/`WRITE_PATHS` use the OS path
@@ -146,10 +146,19 @@ creating a duplicate.
 Stop the daemon before `migrate`, `classify`, `attest`, `supersede`, `reindex`, or `consolidate`,
 then restart it before recall. These commands acquire the same OS lock as the daemon and fail
 clearly while it is active; `list` remains available through a read-only SQLite connection. For an
-existing database, first take a SQLite-consistent backup, run `engram migrate`, then inventory
+existing database, first take a SQLite-consistent backup, stop the daemon, and run
+`engram preflight`. It holds the offline-writer lock, keeps the source database read-only, copies its
+snapshot to temporary storage, and proves the complete migration/rebuild there before reporting
+compatibility. Then run `engram migrate` and inventory
 `engram list --unclassified`. Review every historical preference, decision, or fact and assign its
 family explicitly with `engram classify ENTRY_ID --claim-key "topic/claim"`; never infer these keys
 in bulk. Trusted commands use `[attestation].default_actor` unless `--actor` is provided.
+R3 never truncates data that exceeds its new fixed bounds: a failed preflight names the first row
+to review with 2026.0730.01 before retrying. If preflight reports
+`vector_rebuild_required: true` and hybrid mode is enabled, run `engram reindex` after migration.
+SQLite first loads the schema under a temporary 256 KiB ceiling, then retains an 8 MiB
+value/row ceiling; consolidation snapshots have an explicit 4 MiB UTF-8 limit. Preflight rejects
+incompatible historical data without truncating it.
 
 Known CLI failures never print a traceback by default. Exit code `2` means usage or configuration,
 `3` means a local resource is unavailable (port, process lock, database, or SQLite runtime), `4`

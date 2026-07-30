@@ -33,14 +33,16 @@ n'existe pas. `notes.warnings` contient des codes stables et bornes :
 | `query_too_long` | La requete depasse le plafond de caracteres et n'a pas ete cherchee. | Raccourcir puis retenter. |
 | `query_too_many_terms` | La requete depasse le plafond de termes et n'a pas ete cherchee. | Garder un ensemble plus cible de sujets puis retenter. |
 | `query_has_no_search_terms` | La normalisation ne produit aucun terme lexical cherchable. | Fournir au moins un mot ou un nombre. |
+| `fts_query_timeout` | La deadline absolue du plan lexical a expire ; le resultat public est vide pour eviter toute revalidation non bornee ou partielle. | Ne pas conclure a une absence. Retenter avec moins de termes lexicaux, plus specifiques ; contacter l'operateur si cela persiste. |
 | `capsule_budget_overflow` | Des entrees entieres ont ete omises pour respecter le plafond du payload serialise. | Retenter avec un budget autorise plus grand ou une requete plus ciblee ; ne pas conclure a une absence. |
 | `unclassified_claim_omitted` | Un claim legacy de confiance n'a pas d'identite de proposition explicite et a ete omis fail-closed. | Demander a l'operateur de classifier l'entree legacy avant de se fier a la completude. |
 | `conflicts_hidden_by_request` | Des versions conflictuelles correspondent mais `include_conflicts` vaut false. | Retenter avec `include_conflicts=true` et traiter chaque version symetriquement. |
 | `conflict_family_overflow` | Une famille de conflit complete depasse le plafond et a ete omise. | Resserrer la requete ou demander a l'operateur de revoir `fts_top_k` ; ne jamais choisir implicitement une version. |
 | `project_state_overflow` | L'historique d'etat projet du scope depasse le plafond et a ete omis. | Ne pas conclure a l'absence de prochaine action ; resserrer le scope ou utiliser un inventaire operateur. |
 | `hybrid_provider_unavailable` | Les embeddings ont echoue et seul le FTS lexical a ete utilise. | Considerer le rappel semantique incomplet ; retenter plus tard ou continuer avec des limites lexicales explicites. |
-| `hybrid_provider_invalid_vector` | Le provider renvoie un vecteur de requete vide, non fini ou de norme nulle. | Considerer le rappel semantique indisponible et reparer ou remplacer le provider. |
+| `hybrid_provider_invalid_vector` | Le provider renvoie un mauvais nombre de vecteurs ou un vecteur vide, non numerique, non fini, hors float32, surdimensionne ou de norme nulle. | Considerer le rappel semantique indisponible et reparer ou remplacer le provider. |
 | `hybrid_candidate_overflow` | Le scan vectoriel exact depasse `hybrid_max_candidates` et seul le FTS a ete utilise. | Resserrer scope/kinds ou faire revoir le plafond hybride borne par l'operateur. |
+| `hybrid_vector_budget_exceeded` | Les dimensions ou octets vectoriels visibles depassent le budget memoire fixe ; seul le FTS a ete utilise. | Resserrer scope/kinds ou rester en mode FTS ; ne pas relever le budget de securite fixe. |
 | `hybrid_vector_coverage_incomplete` | Au moins une entree visible n'a aucun vecteur, ou une dimension compatible, pour le modele configure. | Reindexer les vecteurs ou considerer l'absence semantique comme inconnue. |
 
 ### 3. A la fin

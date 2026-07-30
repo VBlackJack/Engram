@@ -26,10 +26,12 @@ from engram.embeddings import EmbeddingProvider
 from engram.eval.gate import FTS_CONTRACT_CAPSULE_BYTE_BUDGET, EvaluationGateError
 from engram.eval.models import (
     EvalMode,
+    EvaluationMetrics,
     FtsContractThresholds,
     ModeStatus,
     P2Verdict,
 )
+from engram.eval.report import render_report
 from engram.eval.runner import METRICS_FILENAME, REPORT_FILENAME, run_evaluation
 from engram.logging_setup import FileLogger
 
@@ -55,6 +57,13 @@ class ConstantEmbeddingProvider:
 def _constant_provider(config: RetrievalConfig) -> EmbeddingProvider:
     del config
     return ConstantEmbeddingProvider()
+
+
+def _assert_report_reproducible(output: Path, expected: str) -> None:
+    reloaded = EvaluationMetrics.model_validate_json(
+        (output / METRICS_FILENAME).read_text(encoding="utf-8")
+    )
+    assert render_report(reloaded) == expected
 
 
 def test_two_fts_runs_produce_identical_metrics(
@@ -112,6 +121,8 @@ def test_fts_run_writes_all_families_and_unmeasured_verdict(
     assert fts.f5_system is not None
     assert fts.f5_system.recall_latency.samples == 88
     assert metrics.fts_contract.passed is True
+    assert metrics.fts_contract.checks["fts_query_timeout_absent"] is True
+    assert metrics.fts_contract.global_warning_counts.get("fts_query_timeout", 0) == 0
     assert metrics.fts_contract.thresholds.minimum_global_gold_in_capsule_rate == 0.98
     assert metrics.fts_contract.thresholds.minimum_lexical_degraded_gold_in_capsule_rate == 0.90
     assert metrics.fts_contract.thresholds.minimum_budget_pass_rate == 1.0
@@ -131,6 +142,7 @@ def test_fts_run_writes_all_families_and_unmeasured_verdict(
         "fts_max_query_chars": 1024,
         "fts_max_query_terms": 24,
         "fts_min_prefix_chars": 4,
+        "fts_query_timeout_ms": 250,
         "fts_top_k": 64,
         "hybrid_max_candidates": 4096,
         "mode": "fts",
@@ -139,11 +151,12 @@ def test_fts_run_writes_all_families_and_unmeasured_verdict(
     assert metrics.p2_verdict is P2Verdict.HYBRID_UNMEASURED
     assert (output / METRICS_FILENAME).is_file()
     payload = json.loads((output / METRICS_FILENAME).read_text(encoding="utf-8"))
-    assert payload["schema_version"] == 3
-    assert payload["corpus"]["semantic_benchmark_version"] == "om-04-v3"
-    assert payload["corpus"]["fts_contract_version"] == "fts-r2-v3"
+    assert payload["schema_version"] == 4
+    assert payload["corpus"]["semantic_benchmark_version"] == "om-04-v4"
+    assert payload["corpus"]["fts_contract_version"] == "fts-r3-v1"
     assert payload["fts_contract"]["capsule_byte_budget"] == 4800
     report = (output / REPORT_FILENAME).read_text(encoding="utf-8")
+    _assert_report_reproducible(output, report)
     assert "## Verdict P2" in report
     assert "## Gate FTS" in report
     assert "Plafond capsule contractuel: 4800 octets UTF-8 conservateurs (" in report
@@ -211,6 +224,7 @@ def test_failed_fts_contract_writes_artifacts_then_raises(
         "contradiction_pass_rate": False,
         "global_complete_recall_rate": False,
         "global_gold_in_capsule_rate": False,
+        "fts_query_timeout_absent": True,
         "lexical_complete_recall_rate": False,
         "lexical_degraded_gold_in_capsule_rate": False,
         "poisoning_pass_rate": False,

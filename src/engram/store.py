@@ -12,6 +12,7 @@ import math
 import secrets
 import sqlite3
 import struct
+import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -21,9 +22,16 @@ from threading import RLock
 from types import TracebackType
 from typing import Any, Literal, Self, cast, overload
 
-from .config import MAX_FTS_TOP_K, MAX_HYBRID_CANDIDATES, AppConfig
+from .config import (
+    MAX_FTS_QUERY_TIMEOUT_MS,
+    MAX_FTS_TOP_K,
+    MAX_HYBRID_CANDIDATES,
+    MIN_FTS_QUERY_TIMEOUT_MS,
+    AppConfig,
+)
 from .db import (
     FTS_TABLE_NAME,
+    MAX_CONSOLIDATION_SNAPSHOT_BYTES,
     open_database,
     open_database_read_only,
     rebuild_fts_index,
@@ -47,8 +55,12 @@ from .models import (
     SourceType,
 )
 from .normalization import (
+    MAX_EVIDENCE_ITEMS,
     StoreValidationError,
     validate_persisted_content,
+)
+from .normalization import (
+    bounded_text as _bounded_text,
 )
 from .normalization import (
     canonical_key as _canonical_key,
@@ -57,7 +69,19 @@ from .normalization import (
     generation_key as _generation_key,
 )
 from .normalization import (
+    normalize_actor as _normalize_actor,
+)
+from .normalization import (
+    normalize_datacron_ref as _normalize_datacron_ref,
+)
+from .normalization import (
+    normalize_embedding_model as _normalize_embedding_model,
+)
+from .normalization import (
     normalize_entry_id as _normalize_entry_id,
+)
+from .normalization import (
+    normalize_evidence_ref as _normalize_evidence_ref,
 )
 from .normalization import (
     normalize_scope as _normalize_scope,
@@ -75,21 +99,34 @@ from .normalization import (
     normalize_trusted_claim_key as _normalize_trusted_claim_key,
 )
 from .normalization import (
+    normalize_writer_model as _normalize_writer_model,
+)
+from .normalization import (
     required_text as _required_text,
 )
-from .vectors import FLOAT32_MAX
+from .process_lock import DatabaseLockRole, DatabaseProcessLock
+from .vectors import FLOAT32_MAX, MAX_VECTOR_DIMENSIONS
 
 __all__ = [
     "EngramReader",
     "EngramStore",
+    "FtsQueryDeadline",
     "StoreBusyError",
     "StoreClosedError",
+    "StoreQueryTimeoutError",
     "StoreValidationError",
+    "StoreVectorBudgetError",
 ]
 
 LOGGER = logging.getLogger(__name__)
 ULID_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
 PROCESS_WRITE_LOCK = RLock()
+SQLITE_PROGRESS_HANDLER_STEPS = 1000
+MAX_FTS_EXPRESSION_CHARS = 8192
+MAX_HYBRID_VECTOR_SCAN_VALUES = 262_144
+MAX_HYBRID_VECTOR_SCAN_BYTES = MAX_HYBRID_VECTOR_SCAN_VALUES * 4
+MAX_VECTOR_REBUILD_BATCH_ITEMS = 64
+VECTOR_REBUILD_STAGE_TABLE = "engram_vector_rebuild_stage"
 
 
 class StoreClosedError(RuntimeError):
@@ -98,6 +135,29 @@ class StoreClosedError(RuntimeError):
 
 class StoreBusyError(RuntimeError):
     """Raised when the bounded writer wait expires."""
+
+
+class StoreQueryTimeoutError(RuntimeError):
+    """Raised when one absolute FTS plan deadline expires."""
+
+
+class StoreVectorBudgetError(RuntimeError):
+    """Raised before a hybrid scan would exceed a fixed memory budget."""
+
+    def __init__(
+        self,
+        reason: Literal["candidate_count", "vector_values", "vector_bytes"],
+    ) -> None:
+        """Retain one stable machine-readable overflow reason."""
+        super().__init__(f"hybrid vector scan exceeded {reason} budget")
+        self.reason = reason
+
+
+@dataclass(frozen=True, slots=True)
+class FtsQueryDeadline:
+    """Monotone absolute deadline shared by every stage of one FTS plan."""
+
+    expires_at: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -162,23 +222,43 @@ class EngramReader:
 
 
 class EngramStore:
-    """Serialize every application write through one in-process lock."""
+    """Own the single cross-process writer lease and serialize local writes."""
 
     def __init__(
         self,
         config: AppConfig,
         *,
         clock: Callable[[], datetime] | None = None,
+        monotonic_clock: Callable[[], float] | None = None,
+        process_lock: DatabaseProcessLock | None = None,
     ) -> None:
-        """Open the configured database and create the writer lock."""
+        """Open the database under an owned or caller-provided writer lease."""
         self._config = config
         self._clock = clock or _utc_now
+        self._monotonic_clock = monotonic_clock or time.monotonic
         self._write_lock = PROCESS_WRITE_LOCK
-        with self._write_lock:
-            self._connection = open_database(
-                config.database,
-                limits=config.limits,
-            )
+        self._process_lock = process_lock or DatabaseProcessLock(
+            config.database.path,
+            role=DatabaseLockRole.WRITER,
+            command="library",
+        )
+        self._owns_process_lock = process_lock is None
+        if self._owns_process_lock:
+            self._process_lock.acquire()
+        elif not self._process_lock.covers(config.database.path):
+            raise RuntimeError("Provided database process lock is not acquired for this database")
+        try:
+            with self._write_lock:
+                self._connection = open_database(
+                    config.database,
+                    limits=config.limits,
+                )
+        except BaseException:
+            if self._owns_process_lock:
+                self._process_lock.release()
+            raise
+        self._vector_rebuild_model: str | None = None
+        self._vector_rebuild_data_version: int | None = None
         self._closed = False
 
     def __enter__(self) -> Self:
@@ -200,8 +280,12 @@ class EngramStore:
         with self._write_lock:
             if self._closed:
                 return
-            self._connection.close()
-            self._closed = True
+            try:
+                self._connection.close()
+            finally:
+                self._closed = True
+                if self._owns_process_lock:
+                    self._process_lock.release()
 
     @overload
     def add_candidate(
@@ -253,7 +337,7 @@ class EngramStore:
         include_outcome: bool = False,
     ) -> Entry | CandidateWriteResult:
         """Store an untrusted model inference with server-owned provenance fields."""
-        actor = _required_text(writer_model, "writer_model")
+        actor = _normalize_writer_model(writer_model)
         requested_confidence = _enum_value(Confidence, confidence, "confidence")
         effective_confidence, confidence_was_capped = _cap_confidence(
             SourceType.MODEL_INFERRED,
@@ -329,9 +413,8 @@ class EngramStore:
             valid_from=valid_from,
             valid_until=valid_until,
             evidence=evidence,
-            actor=_required_text(
+            actor=_normalize_actor(
                 self._config.attestation.default_actor if actor is None else actor,
-                "actor",
             ),
             action=AuditAction.ATTEST,
             confidence_was_capped=confidence_was_capped,
@@ -364,9 +447,8 @@ class EngramStore:
         normalized_new_id = _normalize_entry_id(new_id, "new_id")
         if normalized_old_id == normalized_new_id:
             raise StoreValidationError("An entry cannot supersede itself")
-        normalized_actor = _required_text(
+        normalized_actor = _normalize_actor(
             self._config.attestation.default_actor if actor is None else actor,
-            "actor",
         )
 
         with self._write_lock:
@@ -392,9 +474,8 @@ class EngramStore:
     ) -> Entry:
         """Classify one active trusted legacy entry without changing its content."""
         normalized_entry_id = _normalize_entry_id(entry_id)
-        normalized_actor = _required_text(
+        normalized_actor = _normalize_actor(
             self._config.attestation.default_actor if actor is None else actor,
-            "actor",
         )
         with self._write_lock:
             self._ensure_open()
@@ -575,6 +656,32 @@ class EngramStore:
             ).fetchall()
             return tuple(self._materialize_entry(row) for row in rows)
 
+    def list_entries_page(
+        self,
+        *,
+        after_id: str | None,
+        limit: int,
+    ) -> tuple[Entry, ...]:
+        """Return one stable ID-ordered page for bounded offline work."""
+        if isinstance(limit, bool) or not isinstance(limit, int):
+            raise StoreValidationError("limit must be an integer")
+        if not 1 <= limit <= MAX_VECTOR_REBUILD_BATCH_ITEMS:
+            raise StoreValidationError(
+                f"limit must be between 1 and {MAX_VECTOR_REBUILD_BATCH_ITEMS}"
+            )
+        normalized_after = None if after_id is None else _normalize_entry_id(after_id, "after_id")
+        query = "SELECT * FROM entries"
+        parameters: list[object] = []
+        if normalized_after is not None:
+            query += " WHERE id > ?"
+            parameters.append(normalized_after)
+        query += " ORDER BY id ASC LIMIT ?"
+        parameters.append(limit)
+        with self._write_lock:
+            self._ensure_open()
+            rows = self._connection.execute(query, parameters).fetchall()
+            return tuple(self._materialize_entry(row) for row in rows)
+
     def list_observations(self, entry_id: str) -> tuple[EntryObservation, ...]:
         """Return retained model observations for one entry generation."""
         normalized_entry_id = _normalize_entry_id(entry_id)
@@ -594,11 +701,17 @@ class EngramStore:
     def create_consolidation_plan(self, snapshot_json: str) -> StoredConsolidationPlan:
         """Persist one immutable consolidation snapshot and return its trusted identity."""
         normalized_snapshot = _required_text(snapshot_json, "snapshot_json")
+        encoded_snapshot = normalized_snapshot.encode("utf-8")
+        if len(encoded_snapshot) > MAX_CONSOLIDATION_SNAPSHOT_BYTES:
+            raise StoreValidationError(
+                "snapshot_json exceeds the fixed UTF-8 allocation bound of "
+                f"{MAX_CONSOLIDATION_SNAPSHOT_BYTES} bytes"
+            )
         with self._write_lock:
             self._ensure_open()
             now = self._now()
             plan_id = _new_ulid(now)
-            snapshot_hash = hashlib.sha256(normalized_snapshot.encode("utf-8")).hexdigest()
+            snapshot_hash = hashlib.sha256(encoded_snapshot).hexdigest()
             with transaction(self._connection):
                 self._connection.execute(
                     """
@@ -694,9 +807,9 @@ class EngramStore:
     ) -> Entry:
         """Record a verified Datacron promotion and its exact content hash."""
         normalized_entry_id = _normalize_entry_id(entry_id)
-        normalized_ref = _required_text(datacron_ref, "datacron_ref")
+        normalized_ref = _normalize_datacron_ref(datacron_ref)
         normalized_hash = _normalize_sha256_hex(datacron_hash, "datacron_hash")
-        normalized_actor = _required_text(actor, "actor")
+        normalized_actor = _normalize_actor(actor)
         with self._write_lock:
             self._ensure_open()
             now = self._now()
@@ -740,7 +853,7 @@ class EngramStore:
     def set_stale(self, entry_id: str, *, stale: bool, actor: str = "cli") -> Entry:
         """Mark a promoted entry stale or fresh without rewriting Datacron."""
         normalized_entry_id = _normalize_entry_id(entry_id)
-        normalized_actor = _required_text(actor, "actor")
+        normalized_actor = _normalize_actor(actor)
         with self._write_lock:
             self._ensure_open()
             now = self._now()
@@ -776,7 +889,23 @@ class EngramStore:
                     raise RuntimeError("Freshness entry disappeared")
                 return self._materialize_entry(updated_row)
 
-    def search_fts(
+    def begin_fts_query(self, timeout_ms: int | None = None) -> FtsQueryDeadline:
+        """Create one absolute monotone deadline for a progressive FTS plan."""
+        selected_timeout = (
+            self._config.retrieval.fts_query_timeout_ms if timeout_ms is None else timeout_ms
+        )
+        if isinstance(selected_timeout, bool) or not isinstance(selected_timeout, int):
+            raise StoreValidationError("timeout_ms must be an integer")
+        if not MIN_FTS_QUERY_TIMEOUT_MS <= selected_timeout <= MAX_FTS_QUERY_TIMEOUT_MS:
+            raise StoreValidationError(
+                "timeout_ms must be between "
+                f"{MIN_FTS_QUERY_TIMEOUT_MS} and {MAX_FTS_QUERY_TIMEOUT_MS}"
+            )
+        return FtsQueryDeadline(
+            expires_at=self._monotonic_clock() + selected_timeout / 1000,
+        )
+
+    def search_fts(  # noqa: PLR0913
         self,
         match_query: str,
         *,
@@ -784,16 +913,21 @@ class EngramStore:
         kinds: frozenset[EntryKind] | None,
         writer_model: str | None = None,
         limit: int = 64,
+        deadline: FtsQueryDeadline | None = None,
     ) -> tuple[Entry, ...]:
         """Return a bounded visible FTS rank ordered by BM25 and recency."""
-        normalized_query = _required_text(match_query, "match_query")
+        normalized_query = _bounded_text(
+            match_query,
+            "match_query",
+            MAX_FTS_EXPRESSION_CHARS,
+        )
         if isinstance(limit, bool) or not isinstance(limit, int):
             raise StoreValidationError("limit must be an integer")
         if not 1 <= limit <= MAX_FTS_TOP_K:
             raise StoreValidationError(f"limit must be between 1 and {MAX_FTS_TOP_K}")
-        normalized_writer = (
-            None if writer_model is None else _required_text(writer_model, "writer_model")
-        )
+        normalized_writer = None if writer_model is None else _normalize_writer_model(writer_model)
+        normalized_scope = None if scope is None else _normalize_scope(scope)
+        selected_deadline = deadline or self.begin_fts_query()
         now = self._now()
         today = now.date().isoformat()
         visibility_clauses, visibility_parameters = _retrieval_visibility_sql(
@@ -803,9 +937,9 @@ class EngramStore:
         )
         clauses = [f"{FTS_TABLE_NAME} MATCH ?", *visibility_clauses]
         parameters: list[object] = [normalized_query, *visibility_parameters]
-        if scope is not None:
+        if normalized_scope is not None:
             clauses.append("entries.scope = ?")
-            parameters.append(scope)
+            parameters.append(normalized_scope)
         if kinds:
             ordered_kinds = sorted(kind.value for kind in kinds)
             placeholders = ", ".join("?" for _ in ordered_kinds)
@@ -820,10 +954,57 @@ class EngramStore:
             "LIMIT ?"
         )
         parameters.append(limit)
-        with self._write_lock:
+        rows = self._fetchall_with_deadline(
+            query,
+            parameters,
+            deadline=selected_deadline,
+        )
+        return tuple(self._materialize_entry(row) for row in rows)
+
+    def _fetchall_with_deadline(
+        self,
+        query: str,
+        parameters: Sequence[object],
+        *,
+        deadline: FtsQueryDeadline,
+    ) -> list[sqlite3.Row]:
+        """Run one SQLite statement under the remaining absolute deadline."""
+        remaining = deadline.expires_at - self._monotonic_clock()
+        if remaining <= 0 or not self._write_lock.acquire(timeout=remaining):
+            raise StoreQueryTimeoutError("FTS query deadline expired")
+        try:
             self._ensure_open()
-            rows = self._connection.execute(query, parameters).fetchall()
-            return tuple(self._materialize_entry(row) for row in rows)
+            expired = False
+
+            def progress_handler() -> int:
+                nonlocal expired
+                if self._monotonic_clock() >= deadline.expires_at:
+                    expired = True
+                    return 1
+                return 0
+
+            cursor: sqlite3.Cursor | None = None
+            self._connection.set_progress_handler(
+                progress_handler,
+                SQLITE_PROGRESS_HANDLER_STEPS,
+            )
+            try:
+                cursor = self._connection.cursor()
+                cursor.execute(query, parameters)
+                rows = cursor.fetchall()
+            except sqlite3.DatabaseError as exc:
+                if expired and getattr(exc, "sqlite_errorcode", None) == sqlite3.SQLITE_INTERRUPT:
+                    raise StoreQueryTimeoutError("FTS query deadline expired") from exc
+                raise
+            finally:
+                if cursor is not None:
+                    cursor.close()
+                self._connection.set_progress_handler(None, 0)
+            if self._monotonic_clock() >= deadline.expires_at:
+                raise StoreQueryTimeoutError("FTS query deadline expired")
+            return cast("list[sqlite3.Row]", rows)
+        finally:
+            self._write_lock.release()
 
     def list_retrieval_entries(
         self,
@@ -834,7 +1015,8 @@ class EngramStore:
         limit: int,
     ) -> tuple[Entry, ...]:
         """Return a bounded recency window with recall visibility applied in SQL."""
-        normalized_writer = _required_text(writer_model, "writer_model")
+        normalized_writer = _normalize_writer_model(writer_model)
+        normalized_scope = None if scope is None else _normalize_scope(scope)
         normalized_limit = _retrieval_limit(limit)
         now = self._now()
         today = now.date().isoformat()
@@ -843,9 +1025,9 @@ class EngramStore:
             today=today,
             writer_model=normalized_writer,
         )
-        if scope is not None:
+        if normalized_scope is not None:
             clauses.append("entries.scope = ?")
-            parameters.append(scope)
+            parameters.append(normalized_scope)
         if kinds:
             ordered_kinds = sorted(kind.value for kind in kinds)
             placeholders = ", ".join("?" for _ in ordered_kinds)
@@ -871,14 +1053,15 @@ class EngramStore:
         kinds: frozenset[EntryKind] | None,
         writer_model: str,
         limit: int,
-    ) -> tuple[tuple[Entry, tuple[float, ...] | None], ...]:
-        """Return all visible entries with optional vectors under one hard scan cap."""
-        normalized_model = _required_text(model, "model")
-        normalized_writer = _required_text(writer_model, "writer_model")
+    ) -> tuple[tuple[str, tuple[float, ...] | None], ...]:
+        """Return visible IDs and vectors only after a metadata-only memory preflight."""
+        normalized_model = _normalize_embedding_model(model)
+        normalized_writer = _normalize_writer_model(writer_model)
+        normalized_scope = None if scope is None else _normalize_scope(scope)
         if isinstance(limit, bool) or not isinstance(limit, int):
             raise StoreValidationError("limit must be an integer")
-        if not 1 <= limit <= MAX_HYBRID_CANDIDATES + 1:
-            raise StoreValidationError(f"limit must be between 1 and {MAX_HYBRID_CANDIDATES + 1}")
+        if not 1 <= limit <= MAX_HYBRID_CANDIDATES:
+            raise StoreValidationError(f"limit must be between 1 and {MAX_HYBRID_CANDIDATES}")
         now = self._now()
         today = now.date().isoformat()
         clauses, visibility_parameters = _retrieval_visibility_sql(
@@ -887,35 +1070,88 @@ class EngramStore:
             writer_model=normalized_writer,
         )
         parameters: list[object] = [normalized_model, *visibility_parameters]
-        if scope is not None:
+        if normalized_scope is not None:
             clauses.append("entries.scope = ?")
-            parameters.append(scope)
+            parameters.append(normalized_scope)
         if kinds:
             ordered_kinds = sorted(kind.value for kind in kinds)
             placeholders = ", ".join("?" for _ in ordered_kinds)
             clauses.append(f"entries.kind IN ({placeholders})")
             parameters.extend(ordered_kinds)
-        parameters.append(limit)
-        query = (
-            "SELECT entries.*, entry_vectors.dim AS vector_dim, "  # noqa: S608
-            "entry_vectors.vector AS vector_blob "
+        where_clause = " AND ".join(clauses)
+        preflight_parameters = [*parameters, limit + 1]
+        preflight_query = (
+            "SELECT COUNT(*) AS candidate_count, "  # noqa: S608
+            "COALESCE(SUM(CASE "
+            "WHEN vector_dim IS NULL THEN 0 "
+            f"WHEN vector_dim BETWEEN 1 AND {MAX_HYBRID_VECTOR_SCAN_VALUES} THEN vector_dim "
+            f"ELSE {MAX_HYBRID_VECTOR_SCAN_VALUES + 1} END), 0) AS vector_values, "
+            "COALESCE(SUM(CASE "
+            "WHEN vector_blob_bytes IS NULL THEN 0 "
+            f"WHEN vector_blob_bytes <= {MAX_HYBRID_VECTOR_SCAN_BYTES} THEN vector_blob_bytes "
+            f"ELSE {MAX_HYBRID_VECTOR_SCAN_BYTES + 1} END), 0) AS vector_bytes "
+            "FROM ("
+            "SELECT entry_vectors.dim AS vector_dim, "
+            "octet_length(entry_vectors.vector) AS vector_blob_bytes "
             "FROM entries "
             "LEFT JOIN entry_vectors "
             "ON entries.id = entry_vectors.entry_id AND entry_vectors.model = ? "
-            f"WHERE {' AND '.join(clauses)} "
+            f"WHERE {where_clause} "
+            "ORDER BY entries.id ASC "
+            "LIMIT ?"
+            ")"
+        )
+        query = (
+            "SELECT entries.id AS entry_id, entry_vectors.dim AS vector_dim, "  # noqa: S608
+            "CASE WHEN entry_vectors.vector IS NULL THEN 0 "
+            "WHEN typeof(entry_vectors.vector) = 'blob' "
+            f"AND entry_vectors.dim BETWEEN 1 AND {MAX_VECTOR_DIMENSIONS} "
+            "AND octet_length(entry_vectors.vector) = entry_vectors.dim * 4 "
+            "THEN 0 ELSE 1 END AS vector_invalid, "
+            "CASE "
+            "WHEN typeof(entry_vectors.vector) = 'blob' "
+            f"AND entry_vectors.dim BETWEEN 1 AND {MAX_VECTOR_DIMENSIONS} "
+            "AND octet_length(entry_vectors.vector) = entry_vectors.dim * 4 "
+            "THEN entry_vectors.vector ELSE NULL END AS vector_blob "
+            "FROM entries "
+            "LEFT JOIN entry_vectors "
+            "ON entries.id = entry_vectors.entry_id AND entry_vectors.model = ? "
+            f"WHERE {where_clause} "
             "ORDER BY entries.id ASC "
             "LIMIT ?"
         )
         with self._write_lock:
             self._ensure_open()
-            rows = self._connection.execute(query, parameters).fetchall()
-            return tuple(
-                (
-                    self._materialize_entry(row),
-                    _decode_retrieval_vector(row),
-                )
-                for row in rows
-            )
+            preflight = self._connection.execute(
+                preflight_query,
+                preflight_parameters,
+            ).fetchone()
+            if preflight is None:  # pragma: no cover - aggregate always returns one row
+                raise RuntimeError("Hybrid vector preflight returned no row")
+            candidate_count = int(preflight["candidate_count"])
+            vector_values = int(preflight["vector_values"])
+            vector_bytes = int(preflight["vector_bytes"])
+            if candidate_count > limit:
+                raise StoreVectorBudgetError("candidate_count")
+            if vector_values > MAX_HYBRID_VECTOR_SCAN_VALUES:
+                raise StoreVectorBudgetError("vector_values")
+            if vector_bytes > MAX_HYBRID_VECTOR_SCAN_BYTES:
+                raise StoreVectorBudgetError("vector_bytes")
+
+            cursor = self._connection.execute(query, [*parameters, limit])
+            decoded: list[tuple[str, tuple[float, ...] | None]] = []
+            try:
+                while rows := cursor.fetchmany(MAX_VECTOR_REBUILD_BATCH_ITEMS):
+                    decoded.extend(
+                        (
+                            str(row["entry_id"]),
+                            _decode_retrieval_vector(row),
+                        )
+                        for row in rows
+                    )
+            finally:
+                cursor.close()
+            return tuple(decoded)
 
     def get_retrieval_entries(
         self,
@@ -929,7 +1165,7 @@ class EngramStore:
             return ()
         if len(normalized_ids) > MAX_FTS_TOP_K:
             raise StoreValidationError(f"entry_ids must contain at most {MAX_FTS_TOP_K} values")
-        normalized_writer = _required_text(writer_model, "writer_model")
+        normalized_writer = _normalize_writer_model(writer_model)
         now = self._now()
         today = now.date().isoformat()
         clauses, parameters = _retrieval_visibility_sql(
@@ -1008,7 +1244,7 @@ class EngramStore:
     def upsert_vector(self, entry_id: str, model: str, vector: Sequence[float]) -> None:
         """Store one derived vector for an existing entry."""
         normalized_entry_id = _normalize_entry_id(entry_id)
-        normalized_model = _required_text(model, "model")
+        normalized_model = _normalize_embedding_model(model)
         encoded, dimension = _encode_vector(vector)
         with self._write_lock:
             self._ensure_open()
@@ -1030,9 +1266,9 @@ class EngramStore:
         vectors: Mapping[str, Sequence[float]],
     ) -> None:
         """Replace all derived vectors atomically for one embedding model."""
-        normalized_model = _required_text(model, "model")
+        normalized_model = _normalize_embedding_model(model)
         encoded = {
-            _required_text(entry_id, "entry_id"): _encode_vector(vector)
+            _normalize_entry_id(entry_id): _encode_vector(vector)
             for entry_id, vector in vectors.items()
         }
         with self._write_lock:
@@ -1053,6 +1289,137 @@ class EngramStore:
                     ),
                 )
 
+    def begin_vector_rebuild(self, model: str) -> None:
+        """Create an empty connection-local stage without touching the live index."""
+        normalized_model = _normalize_embedding_model(model)
+        with self._write_lock:
+            self._ensure_open()
+            if self._vector_rebuild_model is not None:
+                raise StoreBusyError("a vector rebuild is already in progress")
+            self._connection.execute(
+                f"""
+                CREATE TEMP TABLE IF NOT EXISTS {VECTOR_REBUILD_STAGE_TABLE} (
+                    entry_id TEXT PRIMARY KEY,
+                    model TEXT NOT NULL,
+                    dim INTEGER NOT NULL,
+                    vector BLOB NOT NULL
+                )
+                """
+            )
+            with transaction(self._connection):
+                self._connection.execute(f"DELETE FROM {VECTOR_REBUILD_STAGE_TABLE}")  # noqa: S608
+            self._vector_rebuild_model = normalized_model
+            self._vector_rebuild_data_version = _database_data_version(self._connection)
+
+    def stage_vector_rebuild(
+        self,
+        model: str,
+        vectors: Mapping[str, Sequence[float]],
+    ) -> None:
+        """Append one encoded bounded batch to the connection-local stage."""
+        normalized_model = _normalize_embedding_model(model)
+        if len(vectors) > MAX_VECTOR_REBUILD_BATCH_ITEMS:
+            raise StoreValidationError(
+                f"vector rebuild batch exceeds {MAX_VECTOR_REBUILD_BATCH_ITEMS} items"
+            )
+        encoded = {
+            _normalize_entry_id(entry_id): _encode_vector(vector)
+            for entry_id, vector in vectors.items()
+        }
+        with self._write_lock:
+            self._ensure_open()
+            if self._vector_rebuild_model != normalized_model:
+                raise StoreValidationError("vector rebuild stage is not active for this model")
+            if self._vector_rebuild_data_version != _database_data_version(self._connection):
+                raise StoreBusyError(
+                    "database changed from another connection during vector rebuild"
+                )
+            with transaction(self._connection):
+                self._connection.executemany(
+                    f"""
+                    INSERT INTO {VECTOR_REBUILD_STAGE_TABLE}(entry_id, model, dim, vector)
+                    VALUES (?, ?, ?, ?)
+                    """,  # noqa: S608
+                    (
+                        (entry_id, normalized_model, dimension, vector_blob)
+                        for entry_id, (vector_blob, dimension) in encoded.items()
+                    ),
+                )
+
+    def finish_vector_rebuild(self, model: str, *, expected_count: int) -> None:
+        """Atomically replace one live model after validating the full stage."""
+        normalized_model = _normalize_embedding_model(model)
+        if (
+            isinstance(expected_count, bool)
+            or not isinstance(expected_count, int)
+            or expected_count < 0
+        ):
+            raise StoreValidationError("expected_count must be a non-negative integer")
+        with self._write_lock:
+            self._ensure_open()
+            if self._vector_rebuild_model != normalized_model:
+                raise StoreValidationError("vector rebuild stage is not active for this model")
+            if self._vector_rebuild_data_version != _database_data_version(self._connection):
+                raise StoreBusyError(
+                    "database changed from another connection during vector rebuild"
+                )
+            with transaction(self._connection):
+                if self._vector_rebuild_data_version != _database_data_version(self._connection):
+                    raise StoreBusyError(
+                        "database changed from another connection during vector rebuild"
+                    )
+                row = self._connection.execute(
+                    f"""
+                    SELECT COUNT(*) AS staged_count,
+                           COUNT(DISTINCT model) AS model_count,
+                           MIN(model) AS staged_model
+                    FROM {VECTOR_REBUILD_STAGE_TABLE}
+                    """  # noqa: S608
+                ).fetchone()
+                if row is None:  # pragma: no cover - aggregate always returns one row
+                    raise RuntimeError("Vector rebuild stage returned no row")
+                staged_count = int(row["staged_count"])
+                if staged_count != expected_count:
+                    raise StoreValidationError(
+                        "vector rebuild stage count does not match expected_count"
+                    )
+                if staged_count and (
+                    int(row["model_count"]) != 1 or str(row["staged_model"]) != normalized_model
+                ):
+                    raise StoreValidationError("vector rebuild stage model does not match")
+                self._connection.execute(
+                    "DELETE FROM entry_vectors WHERE model = ?",
+                    (normalized_model,),
+                )
+                self._connection.execute(
+                    f"""
+                    INSERT INTO entry_vectors(entry_id, model, dim, vector)
+                    SELECT entry_id, model, dim, vector
+                    FROM {VECTOR_REBUILD_STAGE_TABLE}
+                    ORDER BY entry_id
+                    """  # noqa: S608
+                )
+                self._connection.execute(f"DELETE FROM {VECTOR_REBUILD_STAGE_TABLE}")  # noqa: S608
+            self._vector_rebuild_model = None
+            self._vector_rebuild_data_version = None
+
+    def abort_vector_rebuild(self) -> None:
+        """Discard a connection-local stage while preserving every live vector."""
+        with self._write_lock:
+            self._ensure_open()
+            row = self._connection.execute(
+                "SELECT 1 FROM temp.sqlite_master WHERE type = 'table' AND name = ?",
+                (VECTOR_REBUILD_STAGE_TABLE,),
+            ).fetchone()
+            if row is None:
+                self._vector_rebuild_model = None
+                self._vector_rebuild_data_version = None
+                return
+            with transaction(self._connection):
+                self._connection.execute(f"DELETE FROM {VECTOR_REBUILD_STAGE_TABLE}")  # noqa: S608
+            self._vector_rebuild_model = None
+            self._vector_rebuild_data_version = None
+
     def clear_vectors(self) -> None:
         """Clear every derived vector before a full configured rebuild."""
         with self._write_lock:
@@ -1067,7 +1434,7 @@ class EngramStore:
         entry_ids: Sequence[str] | None = None,
     ) -> dict[str, tuple[float, ...]]:
         """Return derived vectors for one model, optionally restricted by ID."""
-        normalized_model = _required_text(model, "model")
+        normalized_model = _normalize_embedding_model(model)
         normalized_ids = None if entry_ids is None else _normalize_entry_ids(entry_ids, "entry_ids")
         if normalized_ids is not None and len(normalized_ids) > MAX_FTS_TOP_K:
             raise StoreValidationError(f"entry_ids must contain at most {MAX_FTS_TOP_K} values")
@@ -1110,6 +1477,8 @@ class EngramStore:
         attest_existing_candidate: bool = False,
         supersedes: Sequence[str] = (),
     ) -> tuple[Entry, bool, RememberOutcome]:
+        actor = _normalize_actor(actor)
+        writer_model = None if writer_model is None else _normalize_writer_model(writer_model)
         normalized_kind = _enum_value(EntryKind, kind, "kind")
         normalized_scope = _normalize_scope(scope)
         normalized_statement = _normalize_statement(
@@ -1919,8 +2288,20 @@ def _utc_now() -> datetime:
     return datetime.now(UTC)
 
 
+def _database_data_version(connection: sqlite3.Connection) -> int:
+    row = connection.execute("PRAGMA data_version").fetchone()
+    if row is None or type(row[0]) is not int:  # pragma: no cover - SQLite invariant
+        raise RuntimeError("SQLite returned an invalid data_version")
+    return int(row[0])
+
+
 def _encode_vector(vector: Sequence[float]) -> tuple[bytes, int]:
-    values = tuple(float(value) for value in vector)
+    if len(vector) > MAX_VECTOR_DIMENSIONS:
+        raise StoreValidationError(f"vector exceeds limit of {MAX_VECTOR_DIMENSIONS} dimensions")
+    try:
+        values = tuple(float(value) for value in vector)
+    except (OverflowError, TypeError, ValueError) as exc:
+        raise StoreValidationError("vector values must be numeric float32 values") from exc
     if not values:
         raise StoreValidationError("vector must not be empty")
     if not all(math.isfinite(value) for value in values):
@@ -1937,7 +2318,7 @@ def _encode_vector(vector: Sequence[float]) -> tuple[bytes, int]:
 
 
 def _decode_vector(vector_blob: bytes, dimension: int) -> tuple[float, ...]:
-    if dimension <= 0 or len(vector_blob) != dimension * 4:
+    if dimension <= 0 or dimension > MAX_VECTOR_DIMENSIONS or len(vector_blob) != dimension * 4:
         raise StoreValidationError("stored vector has an invalid dimension")
     values = tuple(struct.unpack(f"<{dimension}f", vector_blob))
     if not all(math.isfinite(value) for value in values):
@@ -1950,6 +2331,8 @@ def _decode_vector(vector_blob: bytes, dimension: int) -> tuple[float, ...]:
 def _decode_retrieval_vector(row: sqlite3.Row) -> tuple[float, ...] | None:
     """Treat one invalid derived vector as missing instead of failing recall."""
     if row["vector_blob"] is None:
+        if bool(row["vector_invalid"]):
+            LOGGER.warning("Stored hybrid vector is invalid; semantic coverage is incomplete")
         return None
     try:
         return _decode_vector(
@@ -1971,11 +2354,15 @@ def _enum_value[EnumType: StrEnum](
 
 
 def _normalize_evidence(values: Sequence[Evidence]) -> tuple[Evidence, ...]:
+    if isinstance(values, str) or not isinstance(values, Sequence):
+        raise StoreValidationError("evidence must be a sequence of Evidence instances")
+    if len(values) > MAX_EVIDENCE_ITEMS:
+        raise StoreValidationError(f"evidence exceeds limit of {MAX_EVIDENCE_ITEMS} items")
     normalized: list[Evidence] = []
     for evidence in values:
         if not isinstance(evidence, Evidence):
             raise StoreValidationError("evidence items must be Evidence instances")
-        reference = _required_text(evidence.ref, "evidence ref")
+        reference = _normalize_evidence_ref(evidence.ref)
         evidence_type = _enum_value(EvidenceType, evidence.type, "evidence type")
         normalized.append(Evidence(type=evidence_type, ref=reference))
     return tuple(normalized)
@@ -2289,9 +2676,20 @@ def _validate_stored_entry(
             max_statement_chars=max_statement_chars,
             max_subject_keys=max_subject_keys,
         )
+        if entry.writer_model is not None:
+            _require_equal(
+                _normalize_writer_model(entry.writer_model),
+                entry.writer_model,
+                "stored writer_model is not normalized",
+            )
+        _require_equal(
+            _normalize_evidence(entry.evidence),
+            entry.evidence,
+            "stored evidence is not normalized",
+        )
         if (
             entry.datacron_ref is not None
-            and _required_text(entry.datacron_ref, "datacron_ref") != entry.datacron_ref
+            and _normalize_datacron_ref(entry.datacron_ref) != entry.datacron_ref
         ):
             raise StoreValidationError(  # noqa: TRY301
                 "stored datacron_ref is not normalized"
@@ -2302,6 +2700,11 @@ def _validate_stored_entry(
         raise RuntimeError(
             f"Stored entry violates normalized content invariant: {entry.id}"
         ) from exc
+
+
+def _require_equal(actual: object, expected: object, message: str) -> None:
+    if actual != expected:
+        raise StoreValidationError(message)
 
 
 def _entry_matches_observation(  # noqa: PLR0913

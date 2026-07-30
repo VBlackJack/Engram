@@ -81,11 +81,36 @@ Stop the daemon and take a SQLite-consistent backup before migrating. During a r
 exercise the workflow on a copy first, then run:
 
 ```powershell
+engram preflight
 engram migrate
 engram list --unclassified
 ```
 
-`migrate` applies schema v5 in one transaction and rejects malformed historical rows without
+`preflight` requires the daemon to be stopped and holds the offline-writer OS lock. It opens the
+source database read-only, pins one SQLite snapshot, copies that snapshot to a temporary on-disk
+database, then executes the complete migration, derived-index reconstruction, and integrity checks
+on the disposable copy. The source bytes are not changed. Ensure temporary storage can hold one
+database copy. Schemas 3 through 5 are supported; an older schema requires the staged
+2026.0721.04 upgrade named by the diagnostic.
+
+Version 2026.0730.02 adds fixed ceilings for statements, subject keys, client/audit identities,
+evidence, and durable references. It never truncates legacy content. If preflight reports an
+incompatible row, keep the verified backup and use 2026.0730.01 to review or export that row before
+retrying. In the JSON report, `vector_rebuild_required: true` means the old derived vector table
+will be replaced; run `engram reindex` after migration when hybrid mode is enabled.
+`fts_rebuild_required: true` means the FTS schema must be recreated; `null` means its schema matched
+and startup will still validate its external content.
+
+Inventory pending candidates before upgrading if an R2 MCP client identity was missing or empty, or
+if its name/version contained `%`, `/`, surrounding whitespace, more than 128 characters,
+control/bidi characters, line separators, or Unicode surrogates. R3 preserves ordinary legacy
+`name/version` owners, but reserved separators use a domain-separated SHA-256 `mcp-v2:` identity
+and invalid components are rejected. Use `engram list --status quarantined` with the previous
+release to review or export affected candidates, and attest one only after human verification;
+otherwise let its prior TTL policy apply. Preflight cannot distinguish generic Store writer names
+from MCP owners.
+
+`migrate` applies every pending schema step in one transaction and rejects malformed historical rows without
 leaving a partial migration. Project states receive their reserved family; episodes do not use one.
 For every preference, decision, or fact in the inventory, review the content and assign a stable
 semantic family manually:
@@ -106,7 +131,7 @@ Expected local failures use stable process exit codes and one actionable stderr 
 | --- | --- | --- |
 | `2` | Invalid usage or configuration | Fix the command or `engram.toml` value |
 | `3` | Local resource unavailable | Free the port/lock, repair the database, or upgrade SQLite |
-| `4` | Datacron unavailable | Install Datacron or fix its command and arguments |
+| `4` | External provider unavailable | Repair Datacron or the configured embedding endpoint |
 | `5` | Transient store contention | Retry after the current write finishes |
 | `6` | Apply report contains failed or stale propositions | Inspect the report and generate a new plan |
 | `130` | Operator interruption reached the CLI | No recovery required |
@@ -124,7 +149,9 @@ uv run --python 3.14.3 engram reindex
 ```
 
 In `fts` mode, only FTS indexes are rebuilt. In `hybrid` mode, the configured model is called to
-recreate vectors. The `entries` table and audit log are unchanged.
+recreate vectors. The live vector index is swapped only after every bounded batch succeeds and no
+other SQLite connection has committed during the rebuild. The `entries` table and audit log are
+unchanged.
 
 ## Evaluate retrieval
 
@@ -162,7 +189,8 @@ uv run --python 3.14.3 engram consolidate --plan --out local/consolidation/plan.
 
 This command is read-only for Datacron. It stores an immutable plan snapshot in Engram SQLite, then
 writes the review artifacts. Read the companion Markdown file, then edit the JSON. Every proposition
-is `pending` by default.
+is `pending` by default. The complete canonical snapshot must fit within 4 MiB of UTF-8; reduce the
+batch before generating another plan when it does not.
 
 ### 2. Review manually
 

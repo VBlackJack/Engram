@@ -9,8 +9,9 @@ import math
 import os
 import shlex
 import tomllib
+import unicodedata
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import InitVar, dataclass, field
 from enum import StrEnum
 from ipaddress import ip_address
 from pathlib import Path
@@ -18,6 +19,14 @@ from typing import Any
 from urllib.parse import urlparse
 
 from .models import EntryKind
+from .normalization import (
+    HARD_MAX_STATEMENT_CHARS,
+    HARD_MAX_SUBJECT_KEYS,
+    MAX_EMBEDDING_MODEL_CHARS,
+    StoreValidationError,
+    normalize_actor,
+    normalize_embedding_model,
+)
 
 ENV_PREFIX = "ENGRAM_"
 DEFAULT_CONFIG_PATH = Path("engram.toml")
@@ -29,8 +38,13 @@ MAX_FTS_QUERY_CHARS = 4096
 MAX_FTS_QUERY_TERMS = 64
 MIN_FTS_PREFIX_CHARS = 2
 MAX_FTS_MIN_PREFIX_CHARS = 32
+MIN_FTS_QUERY_TIMEOUT_MS = 10
+MAX_FTS_QUERY_TIMEOUT_MS = 2000
 MAX_HYBRID_CANDIDATES = 16_384
 MIN_CAPSULE_BYTE_BUDGET = 1200
+MIN_HTTP_REQUEST_BODY_BYTES = 4096
+MAX_HTTP_REQUEST_BODY_BYTES = 512 * 1024
+MAX_EMBEDDINGS_ENDPOINT_CHARS = 2048
 
 
 class ConfigError(ValueError):
@@ -90,6 +104,26 @@ class LimitsConfig:
 
     max_statement_chars: int = 2000
     max_subject_keys: int = 8
+    _allow_legacy_oversize: InitVar[bool] = False
+
+    def __post_init__(self, _allow_legacy_oversize: bool) -> None:
+        """Keep configurable storage bounds inside fixed safe ceilings."""
+        if (
+            not _is_plain_int(self.max_statement_chars)
+            or self.max_statement_chars < 1
+            or (self.max_statement_chars > HARD_MAX_STATEMENT_CHARS and not _allow_legacy_oversize)
+        ):
+            raise ConfigError(
+                f"limits.max_statement_chars must be between 1 and {HARD_MAX_STATEMENT_CHARS}"
+            )
+        if (
+            not _is_plain_int(self.max_subject_keys)
+            or self.max_subject_keys < 1
+            or (self.max_subject_keys > HARD_MAX_SUBJECT_KEYS and not _allow_legacy_oversize)
+        ):
+            raise ConfigError(
+                f"limits.max_subject_keys must be between 1 and {HARD_MAX_SUBJECT_KEYS}"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -107,6 +141,15 @@ class AttestationConfig:
 
     default_actor: str = "local-operator"
 
+    def __post_init__(self) -> None:
+        """Reject audit identities that would fail only on the first mutation."""
+        try:
+            normalized = normalize_actor(self.default_actor)
+        except StoreValidationError as exc:
+            raise ConfigError(f"attestation.default_actor is invalid: {exc}") from exc
+        if normalized != self.default_actor:
+            raise ConfigError("attestation.default_actor must not contain surrounding whitespace")
+
 
 @dataclass(frozen=True, slots=True)
 class ServerConfig:
@@ -117,6 +160,7 @@ class ServerConfig:
     path: str = "/mcp"
     write_wait_timeout_ms: int = 2000
     ttl_sweep_interval_seconds: float = 60.0
+    max_request_body_bytes: int = MAX_HTTP_REQUEST_BODY_BYTES
 
     def __post_init__(self) -> None:
         """Make unsafe direct construction fail closed, including library use."""
@@ -127,6 +171,16 @@ class ServerConfig:
             raise ConfigError("server.path must start with a slash")
         if not _is_plain_int(self.write_wait_timeout_ms) or self.write_wait_timeout_ms <= 0:
             raise ConfigError("server.write_wait_timeout_ms must be a positive integer")
+        if (
+            not _is_plain_int(self.max_request_body_bytes)
+            or not MIN_HTTP_REQUEST_BODY_BYTES
+            <= self.max_request_body_bytes
+            <= MAX_HTTP_REQUEST_BODY_BYTES
+        ):
+            raise ConfigError(
+                "server.max_request_body_bytes must be between "
+                f"{MIN_HTTP_REQUEST_BODY_BYTES} and {MAX_HTTP_REQUEST_BODY_BYTES}"
+            )
         if (
             isinstance(self.ttl_sweep_interval_seconds, bool)
             or not isinstance(self.ttl_sweep_interval_seconds, int | float)
@@ -187,6 +241,7 @@ class RetrievalConfig:
     fts_max_query_terms: int = 24
     fts_min_prefix_chars: int = 4
     hybrid_max_candidates: int = 4096
+    fts_query_timeout_ms: int = 250
 
     def __post_init__(self) -> None:
         """Enforce retrieval bounds for configuration and direct library use."""
@@ -209,6 +264,7 @@ def _validate_retrieval_integer_types(config: RetrievalConfig) -> None:
         "fts_max_query_chars": config.fts_max_query_chars,
         "fts_max_query_terms": config.fts_max_query_terms,
         "fts_min_prefix_chars": config.fts_min_prefix_chars,
+        "fts_query_timeout_ms": config.fts_query_timeout_ms,
         "hybrid_max_candidates": config.hybrid_max_candidates,
         "embeddings_timeout_ms": config.embeddings_timeout_ms,
         "rrf_k": config.rrf_k,
@@ -237,6 +293,11 @@ def _validate_fts_bounds(config: RetrievalConfig) -> None:
         )
     if config.fts_min_prefix_chars > config.fts_max_query_chars:
         raise ConfigError("retrieval.fts_min_prefix_chars must not exceed fts_max_query_chars")
+    if not MIN_FTS_QUERY_TIMEOUT_MS <= config.fts_query_timeout_ms <= MAX_FTS_QUERY_TIMEOUT_MS:
+        raise ConfigError(
+            "retrieval.fts_query_timeout_ms must be between "
+            f"{MIN_FTS_QUERY_TIMEOUT_MS} and {MAX_FTS_QUERY_TIMEOUT_MS}"
+        )
 
 
 def _validate_hybrid_and_embedding_settings(config: RetrievalConfig) -> None:
@@ -245,22 +306,54 @@ def _validate_hybrid_and_embedding_settings(config: RetrievalConfig) -> None:
         raise ConfigError(
             f"retrieval.hybrid_max_candidates must be between 1 and {MAX_HYBRID_CANDIDATES}"
         )
-    if (
-        not isinstance(config.embeddings_endpoint, str)
-        or config.embeddings_endpoint.strip() != config.embeddings_endpoint
-    ):
-        raise ConfigError("retrieval.embeddings_endpoint must be an HTTP URL")
-    endpoint = urlparse(config.embeddings_endpoint)
-    if endpoint.scheme not in {"http", "https"} or not endpoint.netloc:
-        raise ConfigError("retrieval.embeddings_endpoint must be an HTTP URL")
+    _validate_embedding_endpoint(config.embeddings_endpoint)
     if config.embeddings_timeout_ms <= 0:
         raise ConfigError("retrieval.embeddings_timeout_ms must be greater than zero")
     if config.rrf_k <= 0:
         raise ConfigError("retrieval.rrf_k must be greater than zero")
-    if not isinstance(config.embeddings_model, str):
-        raise ConfigError("retrieval.embeddings_model must be a string")
-    if config.mode is RetrievalMode.HYBRID and not config.embeddings_model.strip():
+    normalized_model = _validate_embedding_model(config.embeddings_model)
+    if config.mode is RetrievalMode.HYBRID and not normalized_model:
         raise ConfigError("retrieval.embeddings_model is required in hybrid mode")
+
+
+def _validate_embedding_endpoint(value: object) -> None:
+    """Reject an endpoint that URL parsers or HTTPX would reinterpret later."""
+    if (
+        not isinstance(value, str)
+        or value.strip() != value
+        or len(value) > MAX_EMBEDDINGS_ENDPOINT_CHARS
+        or any(
+            character.isspace() or unicodedata.category(character) in {"Cc", "Cf", "Cs", "Zl", "Zp"}
+            for character in value
+        )
+    ):
+        raise ConfigError("retrieval.embeddings_endpoint must be an HTTP URL")
+    try:
+        endpoint = urlparse(value)
+        hostname = endpoint.hostname
+        _parsed_port = endpoint.port
+    except ValueError as exc:
+        raise ConfigError("retrieval.embeddings_endpoint must be an HTTP URL") from exc
+    if endpoint.scheme not in {"http", "https"} or not endpoint.netloc or hostname is None:
+        raise ConfigError("retrieval.embeddings_endpoint must be an HTTP URL")
+
+
+def _validate_embedding_model(value: object) -> str:
+    """Return one normalized model identifier or fail during configuration."""
+    if not isinstance(value, str):
+        raise ConfigError(
+            "retrieval.embeddings_model must be a string of at most "
+            f"{MAX_EMBEDDING_MODEL_CHARS} characters"
+        )
+    if not value:
+        return ""
+    try:
+        normalized = normalize_embedding_model(value)
+    except StoreValidationError as exc:
+        raise ConfigError(f"retrieval.embeddings_model is invalid: {exc}") from exc
+    if normalized != value:
+        raise ConfigError("retrieval.embeddings_model must not have surrounding whitespace")
+    return normalized
 
 
 @dataclass(frozen=True, slots=True)
@@ -421,6 +514,12 @@ def load_config(
                 environment,
                 DEFAULT_SERVER_CONFIG.ttl_sweep_interval_seconds,
             ),
+            max_request_body_bytes=_integer_value(
+                server,
+                "max_request_body_bytes",
+                environment,
+                DEFAULT_SERVER_CONFIG.max_request_body_bytes,
+            ),
         ),
         capsule=CapsuleConfig(
             default_token_budget=_integer_value(
@@ -469,6 +568,12 @@ def load_config(
                 "fts_min_prefix_chars",
                 environment,
                 DEFAULT_RETRIEVAL_CONFIG.fts_min_prefix_chars,
+            ),
+            fts_query_timeout_ms=_integer_value(
+                retrieval,
+                "fts_query_timeout_ms",
+                environment,
+                DEFAULT_RETRIEVAL_CONFIG.fts_query_timeout_ms,
             ),
             hybrid_max_candidates=_integer_value(
                 retrieval,
@@ -568,6 +673,88 @@ def load_config(
         ),
     )
     _validate_config(result)
+    return result
+
+
+def load_preflight_config(
+    path: str | Path | None = None,
+    *,
+    environ: Mapping[str, str] | None = None,
+) -> AppConfig:
+    """Load only database, legacy limits, and logging needed for preflight."""
+    environment = os.environ if environ is None else environ
+    selected_path: str | Path
+    if path is not None:
+        selected_path = path
+    else:
+        selected_path = environment.get(f"{ENV_PREFIX}CONFIG", str(DEFAULT_CONFIG_PATH))
+    config_path = Path(selected_path).expanduser().resolve()
+    if not config_path.is_file():
+        raise ConfigError(f"Configuration file does not exist: {config_path}")
+    try:
+        with config_path.open("rb") as config_file:
+            raw = tomllib.load(config_file)
+    except tomllib.TOMLDecodeError as exc:
+        raise ConfigError(f"Invalid TOML configuration: {exc}") from exc
+
+    database = _section(raw, "database")
+    limits = _section(raw, "limits")
+    logging_config = _section(raw, "logging")
+    base_directory = config_path.parent
+    result = AppConfig(
+        database=DatabaseConfig(
+            path=_resolve_path(
+                base_directory,
+                _string_value(database, "path", environment, DEFAULT_DATABASE_CONFIG.path),
+            ),
+            busy_timeout_ms=_integer_value(
+                database,
+                "busy_timeout_ms",
+                environment,
+                DEFAULT_DATABASE_CONFIG.busy_timeout_ms,
+            ),
+        ),
+        ttl_days=DEFAULT_TTL_CONFIG,
+        limits=LimitsConfig(
+            max_statement_chars=_integer_value(
+                limits,
+                "max_statement_chars",
+                environment,
+                DEFAULT_LIMITS_CONFIG.max_statement_chars,
+            ),
+            max_subject_keys=_integer_value(
+                limits,
+                "max_subject_keys",
+                environment,
+                DEFAULT_LIMITS_CONFIG.max_subject_keys,
+            ),
+            _allow_legacy_oversize=True,
+        ),
+        logging=LoggingConfig(
+            path=_resolve_path(
+                base_directory,
+                _string_value(logging_config, "path", environment, DEFAULT_LOGGING_CONFIG.path),
+            ),
+            file_level=_string_value(
+                logging_config,
+                "file_level",
+                environment,
+                DEFAULT_LOGGING_CONFIG.file_level,
+            ).upper(),
+            console_level=_string_value(
+                logging_config,
+                "console_level",
+                environment,
+                DEFAULT_LOGGING_CONFIG.console_level,
+            ).upper(),
+        ),
+    )
+    if result.database.busy_timeout_ms <= 0:
+        raise ConfigError("database.busy_timeout_ms must be greater than zero")
+    if result.logging.file_level not in SUPPORTED_LOG_LEVELS:
+        raise ConfigError(f"Unsupported file log level: {result.logging.file_level}")
+    if result.logging.console_level not in SUPPORTED_LOG_LEVELS:
+        raise ConfigError(f"Unsupported console log level: {result.logging.console_level}")
     return result
 
 
@@ -761,6 +948,15 @@ def _validate_server_config(config: AppConfig) -> None:
         raise ConfigError("server.path must start with a slash")
     if config.server.write_wait_timeout_ms <= 0:
         raise ConfigError("server.write_wait_timeout_ms must be greater than zero")
+    if not (
+        MIN_HTTP_REQUEST_BODY_BYTES
+        <= config.server.max_request_body_bytes
+        <= MAX_HTTP_REQUEST_BODY_BYTES
+    ):
+        raise ConfigError(
+            "server.max_request_body_bytes must be between "
+            f"{MIN_HTTP_REQUEST_BODY_BYTES} and {MAX_HTTP_REQUEST_BODY_BYTES}"
+        )
     if (
         not math.isfinite(config.server.ttl_sweep_interval_seconds)
         or config.server.ttl_sweep_interval_seconds <= 0

@@ -83,11 +83,37 @@ Arreter le daemon et creer une sauvegarde SQLite coherente avant toute migration
 d'abord sur une copie lors d'une reprise ou d'un incident, puis executer :
 
 ```powershell
+engram preflight
 engram migrate
 engram list --unclassified
 ```
 
-`migrate` applique le schema v5 dans une transaction et refuse une ligne historique mal formee sans
+`preflight` exige l'arret du daemon et garde le verrou OS du writer offline. Il ouvre la base source
+en lecture seule, fige un snapshot SQLite, copie ce snapshot vers une base temporaire sur disque,
+puis execute la migration complete, la reconstruction des index derives et les controles
+d'integrite sur cette copie jetable. Les octets de la source ne changent pas. Prevoir assez d'espace
+temporaire pour une copie de la base. Les schemas 3 a 5 sont pris en charge ; un schema plus ancien
+exige l'upgrade intermediaire 2026.0721.04 indique par le diagnostic.
+
+La version 2026.0730.02 ajoute des plafonds fixes pour les statements, cles sujet, identites
+client/audit, preuves et references durables. Elle ne tronque jamais le contenu historique. Si une
+ligne incompatible est signalee, conserver la sauvegarde verifiee et utiliser 2026.0730.01 pour
+relire ou exporter cette ligne avant de retenter. Dans le rapport JSON,
+`vector_rebuild_required: true` signifie que l'ancienne table vectorielle derivee sera remplacee ;
+lancer `engram reindex` apres migration lorsque le mode hybride est actif.
+`fts_rebuild_required: true` signifie que le schema FTS doit etre recree ; `null` signifie que son
+schema correspond et que le contenu external sera tout de meme valide au demarrage.
+
+Inventorier les candidats pending avant upgrade si l'identite d'un client MCP R2 manquait ou etait
+vide, ou si son nom/version contenait `%`, `/`, des espaces externes, plus de 128 caracteres, des
+controles/bidi, des separateurs de ligne ou des surrogates Unicode. R3 preserve les owners legacy
+ordinaires `name/version`, mais les separateurs reserves utilisent une identite `mcp-v2:`
+domain-separated par SHA-256 et les composantes invalides sont refusees. Avec la version precedente,
+utiliser `engram list --status quarantined` pour relire ou exporter les candidats concernes et
+n'attester qu'apres verification humaine ; sinon laisser leur politique TTL anterieure s'appliquer.
+Preflight ne peut pas distinguer les noms generiques de la Store API des owners MCP.
+
+`migrate` applique toutes les etapes de schema pending dans une transaction et refuse une ligne historique mal formee sans
 laisser de migration partielle. Les `project_state` recoivent leur famille reservee ; les episodes
 n'en utilisent pas. Pour chaque preference, decision ou fait retourne par l'inventaire, relire le
 contenu et attribuer manuellement une famille semantique stable :
@@ -110,7 +136,7 @@ actionnable :
 | --- | --- | --- |
 | `2` | Usage ou configuration invalide | Corriger la commande ou la valeur dans `engram.toml` |
 | `3` | Ressource locale indisponible | Liberer port/verrou, reparer la base ou mettre SQLite a jour |
-| `4` | Datacron indisponible | Installer Datacron ou corriger sa commande et ses arguments |
+| `4` | Provider externe indisponible | Reparer Datacron ou l'endpoint d'embedding configure |
 | `5` | Contention transitoire du store | Reessayer apres la fin de l'ecriture courante |
 | `6` | Rapport apply avec proposition failed ou stale | Lire le rapport et generer un nouveau plan |
 | `130` | Interruption operateur recue par la CLI | Aucune reprise necessaire |
@@ -129,7 +155,9 @@ uv run --python 3.14.3 engram reindex
 ```
 
 En mode `fts`, seuls les index FTS sont reconstruits. En mode `hybrid`, le modele configure est
-appele pour recreer les vecteurs. La table `entries` et l'audit ne sont pas modifies.
+appele pour recreer les vecteurs. L'index vectoriel live n'est remplace qu'apres la reussite de
+chaque batch borne et si aucune autre connexion SQLite n'a commite pendant le rebuild. La table
+`entries` et l'audit ne sont pas modifies.
 
 ## Evaluer le retrieval
 
@@ -169,7 +197,8 @@ uv run --python 3.14.3 engram consolidate --plan --out local/consolidation/plan.
 
 Cette commande est read-only pour Datacron. Elle conserve un snapshot de plan immuable dans la base
 SQLite Engram, puis produit les artefacts de revue. Lire le fichier Markdown compagnon, puis editer
-le JSON. Chaque proposition reste `pending` par defaut.
+le JSON. Chaque proposition reste `pending` par defaut. Le snapshot canonique complet doit tenir
+dans 4 Mio UTF-8 ; au-dela, reduire le lot avant de regenerer le plan.
 
 ### 2. Valider humainement
 

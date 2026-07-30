@@ -13,6 +13,7 @@ import os
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
+from threading import RLock
 from types import TracebackType
 from typing import BinaryIO, Protocol, Self, cast
 
@@ -41,6 +42,7 @@ POSIX_LOCK_API = (
 
 LOCKED_BYTE_COUNT = 1
 LOGGER = logging.getLogger(__name__)
+PROCESS_LOCK_REGISTRY_GUARD = RLock()
 
 
 class DatabaseLockRole(StrEnum):
@@ -48,6 +50,7 @@ class DatabaseLockRole(StrEnum):
 
     DAEMON = "daemon"
     OFFLINE_WRITER = "offline_writer"
+    WRITER = "writer"
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,6 +60,16 @@ class DatabaseLockOwner:
     pid: int
     role: DatabaseLockRole
     command: str
+
+
+@dataclass(slots=True)
+class _SharedLockState:
+    handle: BinaryIO
+    owner: DatabaseLockOwner
+    references: int
+
+
+PROCESS_LOCK_REGISTRY: dict[Path, _SharedLockState] = {}
 
 
 class DatabaseLockError(RuntimeError):
@@ -107,22 +120,35 @@ class DatabaseProcessLock:
         """Acquire ownership or fail immediately with current owner diagnostics."""
         if self._handle is not None:
             raise RuntimeError("Database process lock is already acquired")
-        handle = _open_lock_file(self.path)
-        try:
-            acquired = _try_lock(handle)
-        except BaseException:
-            handle.close()
-            raise
-        if not acquired:
-            owner = _read_owner(handle)
-            handle.close()
-            raise DatabaseLockError(self.path, owner)
-        try:
-            _write_owner(handle, self._owner)
-        except BaseException:
-            handle.close()
-            raise
-        self._handle = handle
+        with PROCESS_LOCK_REGISTRY_GUARD:
+            shared = PROCESS_LOCK_REGISTRY.get(self.path)
+            if shared is not None and shared.owner.pid == os.getpid():
+                if shared.owner != self._owner:
+                    raise DatabaseLockError(self.path, shared.owner)
+                shared.references += 1
+                self._handle = shared.handle
+                return
+            handle = _open_lock_file(self.path)
+            try:
+                acquired = _try_lock(handle)
+            except BaseException:
+                handle.close()
+                raise
+            if not acquired:
+                owner = _read_owner(handle)
+                handle.close()
+                raise DatabaseLockError(self.path, owner)
+            try:
+                _write_owner(handle, self._owner)
+            except BaseException:
+                handle.close()
+                raise
+            PROCESS_LOCK_REGISTRY[self.path] = _SharedLockState(
+                handle=handle,
+                owner=self._owner,
+                references=1,
+            )
+            self._handle = handle
 
     def release(self) -> None:
         """Clear diagnostics and release OS ownership without unlinking the lock inode."""
@@ -130,17 +156,28 @@ class DatabaseProcessLock:
         if handle is None:
             return
         self._handle = None
-        try:
+        with PROCESS_LOCK_REGISTRY_GUARD:
+            shared = PROCESS_LOCK_REGISTRY.get(self.path)
+            if shared is not None and shared.handle is handle:
+                shared.references -= 1
+                if shared.references > 0:
+                    return
+                del PROCESS_LOCK_REGISTRY[self.path]
             try:
-                _clear_owner(handle)
-            except OSError as exc:
-                LOGGER.warning("Could not clear database lock metadata: %s", exc)
-            try:
-                _unlock(handle)
-            except OSError as exc:
-                LOGGER.warning("Could not explicitly unlock database lock: %s", exc)
-        finally:
-            handle.close()
+                try:
+                    _clear_owner(handle)
+                except OSError as exc:
+                    LOGGER.warning("Could not clear database lock metadata: %s", exc)
+                try:
+                    _unlock(handle)
+                except OSError as exc:
+                    LOGGER.warning("Could not explicitly unlock database lock: %s", exc)
+            finally:
+                handle.close()
+
+    def covers(self, database_path: Path) -> bool:
+        """Return whether this acquired lock owns the requested database path."""
+        return self._handle is not None and self.path == database_lock_path(database_path)
 
 
 def database_lock_path(database_path: Path) -> Path:
@@ -259,6 +296,8 @@ def _locked_message(owner: DatabaseLockOwner | None) -> str:
         return "Engram database is locked by another process; wait for it to finish"
     if owner.role is DatabaseLockRole.DAEMON:
         return f"Engram daemon is active (pid {owner.pid}); stop it before an offline write"
+    if owner.role is DatabaseLockRole.WRITER:
+        return f"Engram writer '{owner.command}' is active (pid {owner.pid}); wait for it to finish"
     return (
         f"Engram offline writer '{owner.command}' is active (pid {owner.pid}); "
         "wait for it to finish"

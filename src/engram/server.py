@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -21,10 +23,11 @@ from mcp.types import AnyFunction, CallToolResult, TextContent, ToolAnnotations
 from pydantic import BaseModel, ConfigDict, Field
 from starlette.applications import Starlette
 from starlette.requests import Request
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from . import __version__
 from .capsule import CapsuleBuilder, CapsuleResult
-from .config import AppConfig
+from .config import MAX_FTS_QUERY_CHARS, AppConfig
 from .models import (
     CandidateWriteResult,
     EntryKind,
@@ -34,13 +37,34 @@ from .models import (
     PromotionState,
     RememberOutcome,
 )
+from .normalization import (
+    HARD_MAX_STATEMENT_CHARS,
+    HARD_MAX_SUBJECT_KEYS,
+    MAX_EVIDENCE_ITEMS,
+    MAX_EVIDENCE_REF_CHARS,
+    MAX_MCP_CLIENT_COMPONENT_CHARS,
+    MAX_SCOPE_CHARS,
+    MAX_SUBJECT_KEY_CHARS,
+    MAX_WRITER_MODEL_CHARS,
+    StoreValidationError,
+    bounded_text,
+    normalize_mcp_client_component,
+    normalize_scope,
+)
 from .retrieval import EntryIndexer, RetrievalRequest, Retriever, build_retriever
 from .store import EngramStore, StoreBusyError
 
-UNKNOWN_CLIENT = "unknown-client"
+MAX_HTTP_BODY_CHUNKS = 256
+MAX_CLIENT_COMPONENT_CHARS = MAX_MCP_CLIENT_COMPONENT_CHARS
+ASCII_ZERO = ord("0")
+ASCII_NINE = ord("9")
 LOGGER = logging.getLogger(__name__)
 ToolContext = Context[ServerSession, object, Request]
 McpLogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
+SubjectKeyInput = Annotated[
+    str,
+    Field(min_length=1, max_length=MAX_SUBJECT_KEY_CHARS),
+]
 
 
 class EvidenceInput(BaseModel):
@@ -49,7 +73,7 @@ class EvidenceInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     type: EvidenceType
-    ref: str = Field(min_length=1)
+    ref: str = Field(min_length=1, max_length=MAX_EVIDENCE_REF_CHARS)
 
 
 class RememberArguments(ArgModelBase):
@@ -57,12 +81,15 @@ class RememberArguments(ArgModelBase):
 
     model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid")
 
-    statement: str = Field(min_length=1)
+    statement: str = Field(min_length=1, max_length=HARD_MAX_STATEMENT_CHARS)
     kind: EntryKind
-    scope: str = "user"
-    subject_keys: list[str] = Field(default_factory=list)
+    scope: str = Field(default="user", min_length=1, max_length=MAX_SCOPE_CHARS)
+    subject_keys: list[SubjectKeyInput] = Field(
+        default_factory=list,
+        max_length=HARD_MAX_SUBJECT_KEYS,
+    )
     observed_at: datetime | None = None
-    evidence: list[EvidenceInput] = Field(default_factory=list)
+    evidence: list[EvidenceInput] = Field(default_factory=list, max_length=MAX_EVIDENCE_ITEMS)
 
 
 class RecallArguments(ArgModelBase):
@@ -70,9 +97,9 @@ class RecallArguments(ArgModelBase):
 
     model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid")
 
-    query: str = Field(min_length=1)
-    scope: str | None = None
-    kinds: list[EntryKind] = Field(default_factory=list)
+    query: str = Field(min_length=1, max_length=MAX_FTS_QUERY_CHARS)
+    scope: str | None = Field(default=None, min_length=1, max_length=MAX_SCOPE_CHARS)
+    kinds: list[EntryKind] = Field(default_factory=list, max_length=len(EntryKind))
     include_conflicts: bool = False
     token_budget: int | None = None
 
@@ -88,6 +115,105 @@ class RememberResult(BaseModel):
     expires_at: str | None
     idempotent: bool
     outcome: RememberOutcome
+
+
+class RequestBodyLimitMiddleware:
+    """Reject oversized POST bodies before the MCP SDK buffers or parses them."""
+
+    def __init__(self, app: ASGIApp, *, max_body_bytes: int) -> None:
+        """Bind one downstream ASGI application and its byte ceiling."""
+        self._app = app
+        self._max_body_bytes = max_body_bytes
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        """Buffer one bounded POST body and replay it exactly once."""
+        if scope["type"] != "http" or scope.get("method") != "POST":
+            await self._app(scope, receive, send)
+            return
+
+        try:
+            self._validate_content_length(scope)
+            body = await self._read_body(receive)
+        except _RequestBodyRejectedError as exc:
+            await self._reject(send, exc.status_code, exc.detail)
+            return
+        if body is None:
+            return
+
+        replayed = False
+
+        async def replay_receive() -> Message:
+            nonlocal replayed
+            if not replayed:
+                replayed = True
+                return {
+                    "type": "http.request",
+                    "body": bytes(body),
+                    "more_body": False,
+                }
+            return await receive()
+
+        await self._app(scope, replay_receive, send)
+
+    def _validate_content_length(self, scope: Scope) -> None:
+        content_lengths = [
+            value for name, value in scope.get("headers", ()) if name.lower() == b"content-length"
+        ]
+        if len(content_lengths) > 1:
+            raise _RequestBodyRejectedError(400, "invalid Content-Length")
+        if not content_lengths:
+            return
+        raw_length = content_lengths[0]
+        if not raw_length or any(byte < ASCII_ZERO or byte > ASCII_NINE for byte in raw_length):
+            raise _RequestBodyRejectedError(400, "invalid Content-Length")
+        if (
+            len(raw_length) > len(str(self._max_body_bytes))
+            or int(raw_length) > self._max_body_bytes
+        ):
+            raise _RequestBodyRejectedError(413, "request body too large")
+
+    async def _read_body(self, receive: Receive) -> bytes | None:
+        body = bytearray()
+        for _ in range(MAX_HTTP_BODY_CHUNKS):
+            message = await receive()
+            if message["type"] == "http.disconnect":
+                return None
+            if message["type"] != "http.request":
+                raise _RequestBodyRejectedError(400, "invalid request body")
+            chunk = message.get("body", b"")
+            if not isinstance(chunk, bytes):
+                raise _RequestBodyRejectedError(400, "invalid request body")
+            if len(chunk) > self._max_body_bytes - len(body):
+                raise _RequestBodyRejectedError(413, "request body too large")
+            body.extend(chunk)
+            if not message.get("more_body", False):
+                return bytes(body)
+        raise _RequestBodyRejectedError(413, "request body too large")
+
+    @staticmethod
+    async def _reject(send: Send, status_code: int, detail: str) -> None:
+        body = detail.encode("utf-8")
+        await send(
+            {
+                "type": "http.response.start",
+                "status": status_code,
+                "headers": [
+                    (b"cache-control", b"no-store"),
+                    (b"content-length", str(len(body)).encode("ascii")),
+                    (b"content-type", b"text/plain; charset=utf-8"),
+                ],
+            }
+        )
+        await send({"type": "http.response.body", "body": body})
+
+
+class _RequestBodyRejectedError(Exception):
+    """Carry one deliberate HTTP-layer body rejection."""
+
+    def __init__(self, status_code: int, detail: str) -> None:
+        super().__init__(detail)
+        self.status_code = status_code
+        self.detail = detail
 
 
 class EngramFastMCP(FastMCP[object]):
@@ -127,6 +253,10 @@ class EngramFastMCP(FastMCP[object]):
                     task_group.cancel_scope.cancel()
 
         app.router.lifespan_context = lifespan
+        app.add_middleware(
+            RequestBodyLimitMiddleware,
+            max_body_bytes=self._engram_config.server.max_request_body_bytes,
+        )
         return app
 
 
@@ -169,6 +299,8 @@ def create_mcp_server(
             outcome = await anyio.to_thread.run_sync(write_candidate)
         except StoreBusyError as exc:
             raise ToolError("server busy, retry") from exc
+        except StoreValidationError as exc:
+            raise ToolError(str(exc)) from exc
 
         entry = outcome.entry
         if isinstance(selected_retriever, EntryIndexer):
@@ -201,7 +333,10 @@ def create_mcp_server(
         except ValueError as exc:
             raise ToolError(str(exc)) from exc
 
-        normalized_scope = None if scope is None else scope.strip().casefold()
+        try:
+            normalized_scope = None if scope is None else normalize_scope(scope)
+        except StoreValidationError as exc:
+            raise ToolError(str(exc)) from exc
         writer_model = _client_identity(ctx)
         request = RetrievalRequest(
             query=query,
@@ -297,12 +432,33 @@ def _strict_tool(
 def _client_identity(context: ToolContext) -> str:
     params = context.request_context.session.client_params
     if params is None:
-        return UNKNOWN_CLIENT
-    name = params.clientInfo.name.strip()
-    version = params.clientInfo.version.strip()
-    if not name or not version:
-        return UNKNOWN_CLIENT
-    return f"{name}/{version}"
+        raise ToolError("initialized client identity is required")
+    try:
+        bounded_name = _client_component(params.clientInfo.name, "client name")
+        bounded_version = _client_component(params.clientInfo.version, "client version")
+        return _client_writer_model(bounded_name, bounded_version)
+    except StoreValidationError as exc:
+        raise ToolError(str(exc)) from exc
+
+
+def _client_component(value: str, field_name: str) -> str:
+    return normalize_mcp_client_component(value, field_name)
+
+
+def _client_writer_model(name: str, version: str) -> str:
+    """Preserve safe legacy owners and domain-separate ambiguous components."""
+    if all(character not in component for component in (name, version) for character in "%/"):
+        return bounded_text(
+            f"{name}/{version}",
+            "writer_model",
+            MAX_WRITER_MODEL_CHARS,
+        )
+    payload = json.dumps(
+        [name, version],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return f"mcp-v2:{hashlib.sha256(payload).hexdigest()}"
 
 
 def _remember_text(outcome: CandidateWriteResult) -> str:

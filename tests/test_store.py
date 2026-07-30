@@ -20,7 +20,13 @@ import pytest
 import engram.db as db_module
 from engram.cli import _list_entries
 from engram.config import AppConfig
-from engram.db import DatabaseError, SQLiteVersionError, open_database, verify_sqlite_version
+from engram.db import (
+    MAX_CONSOLIDATION_SNAPSHOT_BYTES,
+    DatabaseError,
+    SQLiteVersionError,
+    open_database,
+    verify_sqlite_version,
+)
 from engram.models import (
     AuditAction,
     Confidence,
@@ -31,7 +37,7 @@ from engram.models import (
     RememberOutcome,
     SourceType,
 )
-from engram.normalization import canonical_key, generation_key
+from engram.normalization import HARD_MAX_STATEMENT_CHARS, canonical_key, generation_key
 from engram.retrieval import FtsRetriever, RetrievalRequest
 from engram.store import EngramStore, StoreValidationError
 from tests.conftest import MutableClock
@@ -95,6 +101,19 @@ def _retrieval_request(query: str) -> RetrievalRequest:
         kinds=None,
         writer_model="test-client",
     )
+
+
+def test_store_wraps_database_open_failure(
+    app_config: AppConfig,
+    tmp_path: Path,
+) -> None:
+    config = replace(
+        app_config,
+        database=replace(app_config.database, path=tmp_path),
+    )
+
+    with pytest.raises(DatabaseError, match="database open failed"):
+        EngramStore(config)
 
 
 def test_add_candidate_owns_provenance_fields(store: EngramStore) -> None:
@@ -929,6 +948,44 @@ def test_migration_five_rejects_malformed_v4_content_atomically(  # noqa: PLR091
     assert canonical_column is None
 
 
+def test_migration_precheck_bounds_nul_terminated_text_before_materializing(
+    app_config: AppConfig,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_path = tmp_path / "nul-terminated-oversize-v4.db"
+    config = replace(
+        app_config,
+        database=replace(app_config.database, path=database_path),
+    )
+    entry_id = "01NNNNNNNNNNNNNNNNNNNNNNNN"
+    _seed_v4_trusted_entry(
+        config,
+        monkeypatch,
+        entry_id=entry_id,
+        kind=EntryKind.FACT,
+        statement="Legacy bounded content.",
+    )
+    connection = sqlite3.connect(database_path)
+    try:
+        connection.execute(
+            "UPDATE entries SET statement = ? WHERE id = ?",
+            ("A\0" + "x" * (HARD_MAX_STATEMENT_CHARS * 8), entry_id),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    def forbidden_materialization(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        pytest.fail("migration materialized an entry after the allocation precheck")
+
+    monkeypatch.setattr(db_module, "_validate_v4_entry_content", forbidden_materialization)
+
+    with pytest.raises(DatabaseError, match=rf"{entry_id}.*statement|statement.*{entry_id}"):
+        EngramStore(config)
+
+
 def test_concurrent_writes_are_serialized_without_loss(store: EngramStore) -> None:
     entry_count = 48
 
@@ -1102,6 +1159,35 @@ def test_consolidation_plan_snapshot_is_persisted_and_consumed_once(
             created.plan_id,
             expected_hash=created.snapshot_hash,
         )
+
+
+def test_consolidation_plan_rejects_oversized_snapshot_before_mutation(
+    store: EngramStore,
+) -> None:
+    with pytest.raises(StoreValidationError, match=r"snapshot_json.*allocation bound"):
+        store.create_consolidation_plan("x" * (MAX_CONSOLIDATION_SNAPSHOT_BYTES + 1))
+
+
+def test_reopen_rejects_legacy_oversized_consolidation_snapshot(
+    app_config: AppConfig,
+) -> None:
+    with EngramStore(app_config) as store:
+        created = store.create_consolidation_plan('{"schema_version":1,"propositions":[]}')
+    connection = sqlite3.connect(app_config.database.path)
+    try:
+        connection.execute(
+            "UPDATE consolidation_plans SET snapshot_json = ? WHERE plan_id = ?",
+            (
+                "x" * (MAX_CONSOLIDATION_SNAPSHOT_BYTES + 1),
+                created.plan_id,
+            ),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(DatabaseError, match="consolidation plan payload"):
+        EngramStore(app_config)
 
 
 def test_consolidation_plan_is_consumed_by_exactly_one_independent_store(

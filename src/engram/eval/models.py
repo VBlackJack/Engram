@@ -303,6 +303,7 @@ class FtsContractMetrics(BaseModel):
     contradiction_pass_rate: float
     poisoning_pass_rate: float
     warning_counts: dict[str, int]
+    global_warning_counts: dict[str, int]
     recall_p95_ms: float
 
 
@@ -331,7 +332,7 @@ class EvaluationMetrics(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    schema_version: int = 3
+    schema_version: int = 4
     requested_mode: EvalMode
     surface: str
     corpus: CorpusMetrics

@@ -53,9 +53,9 @@ BANNED_PUNCTUATION = frozenset(
 def test_corpus_static_dimensions_and_ascii_punctuation() -> None:
     validate_corpus()
 
-    assert CORPUS_VERSION == "r2.3"
-    assert SEMANTIC_BENCHMARK_VERSION == "om-04-v3"
-    assert FTS_CONTRACT_VERSION == "fts-r2-v3"
+    assert CORPUS_VERSION == "r3.0"
+    assert SEMANTIC_BENCHMARK_VERSION == "om-04-v4"
+    assert FTS_CONTRACT_VERSION == "fts-r3-v1"
     assert len(SEMANTIC_BENCHMARK_SHA256) == 64
     assert len(FTS_CONTRACT_SHA256) == 64
     assert len(SEED_ENTRIES) == 72

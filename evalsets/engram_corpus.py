@@ -36,11 +36,11 @@ from engram.models import PROJECT_STATE_CLAIM_KEY, EntryKind, SourceType
 TEST_WRITER = "eval-client/1.0"
 OTHER_WRITER = "other-client/2.0"
 ATTACKER_WRITER = "attacker-client/9.9"
-CORPUS_VERSION = "r2.3"
-SEMANTIC_BENCHMARK_VERSION = "om-04-v3"
-FTS_CONTRACT_VERSION = "fts-r2-v3"
-SEMANTIC_BENCHMARK_SHA256 = "d02d65536f020363f3ab2aa6a2a6346f610e27acc0b5110f9d121c3cb4e1bafe"
-FTS_CONTRACT_SHA256 = "ba5433fb970e5e178527d5c2be89f2b2eefe67b87d75d781655f9aa5edc961f9"
+CORPUS_VERSION = "r3.0"
+SEMANTIC_BENCHMARK_VERSION = "om-04-v4"
+FTS_CONTRACT_VERSION = "fts-r3-v1"
+SEMANTIC_BENCHMARK_SHA256 = "ff2b4af2d6db15e1c6834d69e43244d349dc5c31a6df428bcddcf0e52c9ce75b"
+FTS_CONTRACT_SHA256 = "a2c657b6d2db6f60d792dc53068cfc1b6fa18aa55ea39068d06b92bbcbafd51c"
 SHARED_CLAIM_KEYS = {
     "conflict_theme_light": "editor/theme",
     "conflict_theme_dark": "editor/theme",

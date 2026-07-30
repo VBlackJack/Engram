@@ -40,6 +40,7 @@ from engram.models import (
     PromotionState,
     SourceType,
 )
+from engram.normalization import MAX_SUBJECT_KEY_CHARS
 from engram.retrieval import FtsRetriever, RetrievalRequest
 from engram.store import EngramStore, StoreValidationError
 from tests.conftest import MutableClock
@@ -336,7 +337,7 @@ def test_new_paths_bound_long_unicode_slugs_without_losing_uniqueness(
     store: EngramStore,
     app_config: AppConfig,
 ) -> None:
-    prefix = "é" * 1_000
+    prefix = "é" * (MAX_SUBJECT_KEY_CHARS - len("/alpha"))
     first = store.add_attested(
         kind=EntryKind.FACT,
         scope="global",
@@ -1805,6 +1806,7 @@ def test_cli_plan_then_apply_uses_gateway_and_writes_review_artifacts(
     monkeypatch.setattr(cli_module, "McpDatacronGateway", lambda _config: gateway)
     plan_path = tmp_path / "consolidation" / "plan.json"
     logger = logging.getLogger("engram.test.consolidation-cli")
+    store.close()
 
     _consolidate(
         config=app_config,
@@ -1831,7 +1833,8 @@ def test_cli_plan_then_apply_uses_gateway_and_writes_review_artifacts(
     assert plan_path.with_suffix(".md").is_file()
     assert plan.propositions[0].decision is ReviewDecision.PENDING
     assert report.outcomes[0].status is ApplyStatus.APPLIED
-    current = store.get_entry(entry.id)
+    with EngramStore(app_config) as reopened:
+        current = reopened.get_entry(entry.id)
     assert current is not None
     assert current.promotion_state is PromotionState.PROMOTED
 
@@ -1855,6 +1858,7 @@ def test_cli_apply_writes_partial_report_and_refuses_plan_replay(
     plan_path = tmp_path / "consolidation" / "plan.json"
     report_path = tmp_path / "consolidation" / "apply.json"
     logger = logging.getLogger("engram.test.consolidation-cli-partial")
+    store.close()
 
     _consolidate(
         config=app_config,

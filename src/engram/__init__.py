@@ -9,4 +9,4 @@ from .store import EngramStore
 
 __all__ = ["AppConfig", "EngramStore", "Entry", "load_config"]
 
-__version__ = "2026.0730.01"
+__version__ = "2026.0730.02"

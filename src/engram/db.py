@@ -13,10 +13,14 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
+from functools import lru_cache
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from .config import DatabaseConfig, LimitsConfig
 from .models import (
     PROJECT_STATE_CLAIM_KEY,
+    AuditAction,
     Confidence,
     EntryKind,
     EntryStatus,
@@ -25,14 +29,28 @@ from .models import (
     SourceType,
 )
 from .normalization import (
+    HARD_MAX_STATEMENT_CHARS,
+    HARD_MAX_SUBJECT_KEYS,
+    MAX_ACTOR_CHARS,
+    MAX_CLAIM_KEY_CHARS,
+    MAX_DATACRON_REF_CHARS,
+    MAX_EVIDENCE_ITEMS,
+    MAX_EVIDENCE_REF_CHARS,
+    MAX_SCOPE_CHARS,
+    MAX_SUBJECT_KEY_CHARS,
+    MAX_WRITER_MODEL_CHARS,
+    ULID_LENGTH,
     StoreValidationError,
     canonical_key,
+    normalize_actor,
+    normalize_datacron_ref,
     normalize_entry_id,
+    normalize_evidence_ref,
     normalize_scope,
     normalize_sha256_hex,
     normalize_statement,
     normalize_subject_keys,
-    required_text,
+    normalize_writer_model,
     validate_persisted_content,
 )
 
@@ -40,7 +58,16 @@ LOGGER = logging.getLogger(__name__)
 MINIMUM_SQLITE_VERSION = (3, 51, 3)
 SQLITE_VERSION_COMPONENTS = 3
 LIFECYCLE_SCHEMA_VERSION = 5
+MINIMUM_PREFLIGHT_SCHEMA_VERSION = 3
+CONSOLIDATION_SCHEMA_VERSION = 4
 SHA256_HEX_LENGTH = 64
+MAX_TEMPORAL_TEXT_CHARS = 64
+MAX_JSON_ESCAPE_CHARS = 6
+MAX_UTF8_BYTES_PER_CHAR = 4
+MAX_SCHEMA_SQL_BYTES = 256 * 1024
+MAX_SQLITE_VALUE_BYTES = 8 * 1024 * 1024
+MAX_CONSOLIDATION_SNAPSHOT_BYTES = 4 * 1024 * 1024
+LEGACY_CLAIM_HASH_CHARS = len("legacy:") + SHA256_HEX_LENGTH
 FTS_TABLE_NAME = "entries_fts"
 CREATE_FTS_TABLE_SQL = """
 CREATE VIRTUAL TABLE entries_fts USING fts5(
@@ -55,11 +82,20 @@ CREATE_VECTOR_TABLE_SQL = """
 CREATE TABLE entry_vectors (
     entry_id TEXT NOT NULL REFERENCES entries(id) ON DELETE CASCADE,
     model TEXT NOT NULL,
-    dim INTEGER NOT NULL CHECK (dim > 0),
-    vector BLOB NOT NULL,
+    dim INTEGER NOT NULL CHECK (dim BETWEEN 1 AND 8192),
+    vector BLOB NOT NULL CHECK (
+        typeof(vector) = 'blob' AND octet_length(vector) = dim * 4
+    ),
     PRIMARY KEY (entry_id, model)
 )
 """
+CANONICAL_V5_TABLES = (
+    "entries",
+    "audit_log",
+    "consolidation_plans",
+    "entry_observations",
+    "entry_supersessions",
+)
 REQUIRED_V5_TRIGGERS = {
     "entries_lifecycle_insert": "entries",
     "entries_lifecycle_update": "entries",
@@ -91,6 +127,40 @@ class SQLiteVersionError(RuntimeError):
 
 class DatabaseError(RuntimeError):
     """Raised when database setup or migration cannot complete safely."""
+
+
+@dataclass(frozen=True, slots=True)
+class UpgradePreflightReport:
+    """Read-only compatibility result for one supported persisted schema."""
+
+    schema_version: int
+    target_schema_version: int
+    fts_rebuild_required: bool | None
+    vector_rebuild_required: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _SupersessionNode:
+    """Compact canonical projection retained while validating an edge graph."""
+
+    kind: str
+    scope: str
+    status: str
+    promotion_state: str
+    source_type: str
+    canonical_key: str
+    claim_key: str | None
+    claim_key_present: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _SchemaObjectDefinition:
+    """Bounded sqlite_schema projection for one exact package-owned name."""
+
+    object_type: str
+    table_matches: bool
+    sql: str | None
+    definition_within_bound: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -696,15 +766,19 @@ def open_database(
     limits: LimitsConfig | None = None,
 ) -> sqlite3.Connection:
     """Open, validate, configure, and migrate an Engram database."""
-    config.path.parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(
-        config.path,
-        timeout=config.busy_timeout_ms / 1000,
-        isolation_level=None,
-        check_same_thread=False,
-    )
+    try:
+        config.path.parent.mkdir(parents=True, exist_ok=True)
+        connection = sqlite3.connect(
+            config.path,
+            timeout=config.busy_timeout_ms / 1000,
+            isolation_level=None,
+            check_same_thread=False,
+        )
+    except (OSError, sqlite3.Error) as exc:
+        raise DatabaseError(f"SQLite database open failed: {exc}") from exc
     connection.row_factory = sqlite3.Row
     try:
+        _apply_sqlite_resource_limits(connection)
         verify_sqlite_version(connection)
         _configure_connection(connection, config.busy_timeout_ms)
         apply_migrations(connection, limits=limits)
@@ -714,6 +788,12 @@ def open_database(
             max_statement_chars=None if limits is None else limits.max_statement_chars,
             max_subject_keys=None if limits is None else limits.max_subject_keys,
         )
+    except (DatabaseError, SQLiteVersionError):
+        connection.close()
+        raise
+    except sqlite3.Error as exc:
+        connection.close()
+        raise DatabaseError(f"SQLite database initialization failed: {exc}") from exc
     except BaseException:
         connection.close()
         raise
@@ -729,15 +809,19 @@ def open_database_read_only(
     database_path = config.path.expanduser().resolve()
     if not database_path.is_file():
         raise DatabaseError(f"Engram database does not exist: {database_path}")
-    connection = sqlite3.connect(
-        f"{database_path.as_uri()}?mode=ro",
-        uri=True,
-        timeout=config.busy_timeout_ms / 1000,
-        isolation_level=None,
-        check_same_thread=False,
-    )
+    try:
+        connection = sqlite3.connect(
+            f"{database_path.as_uri()}?mode=ro",
+            uri=True,
+            timeout=config.busy_timeout_ms / 1000,
+            isolation_level=None,
+            check_same_thread=False,
+        )
+    except (OSError, sqlite3.Error) as exc:
+        raise DatabaseError(f"SQLite read-only open failed: {exc}") from exc
     connection.row_factory = sqlite3.Row
     try:
+        _apply_sqlite_resource_limits(connection)
         verify_sqlite_version(connection)
         _configure_read_only_connection(connection, config.busy_timeout_ms)
         _validate_read_only_schema(connection)
@@ -746,10 +830,76 @@ def open_database_read_only(
             max_statement_chars=None if limits is None else limits.max_statement_chars,
             max_subject_keys=None if limits is None else limits.max_subject_keys,
         )
+    except (DatabaseError, SQLiteVersionError):
+        connection.close()
+        raise
+    except sqlite3.Error as exc:
+        connection.close()
+        raise DatabaseError(f"SQLite read-only validation failed: {exc}") from exc
     except BaseException:
         connection.close()
         raise
     return connection
+
+
+def preflight_database(
+    config: DatabaseConfig,
+    *,
+    limits: LimitsConfig | None = None,
+) -> UpgradePreflightReport:
+    """Validate an upgrade read-only, including supported pre-v5 databases."""
+    database_path = config.path.expanduser().resolve()
+    if not database_path.is_file():
+        raise DatabaseError(f"Engram database does not exist: {database_path}")
+    try:
+        connection = sqlite3.connect(
+            f"{database_path.as_uri()}?mode=ro",
+            uri=True,
+            timeout=config.busy_timeout_ms / 1000,
+            isolation_level=None,
+            check_same_thread=False,
+        )
+    except (OSError, sqlite3.Error) as exc:
+        raise DatabaseError(f"SQLite upgrade preflight failed: {exc}") from exc
+    connection.row_factory = sqlite3.Row
+    try:
+        _apply_sqlite_resource_limits(connection)
+        verify_sqlite_version(connection)
+        _configure_read_only_connection(connection, config.busy_timeout_ms)
+        connection.execute("BEGIN")
+        if not _table_exists(connection, "schema_version"):
+            raise DatabaseError("Engram database has no schema version")
+        current_version = _schema_version(connection)
+        latest_version = latest_schema_version()
+        if current_version > latest_version:
+            raise DatabaseError(
+                f"Engram database schema version {current_version} is newer than "
+                f"supported version {latest_version}"
+            )
+        if current_version < MINIMUM_PREFLIGHT_SCHEMA_VERSION:
+            raise DatabaseError(
+                f"Engram database schema version {current_version} requires a staged upgrade "
+                "with Engram 2026.0721.04 before this preflight"
+            )
+        if current_version == latest_version:
+            _validate_preflight_schema(connection, current_version)
+        _simulate_upgrade(
+            connection,
+            busy_timeout_ms=config.busy_timeout_ms,
+            limits=limits,
+        )
+        return UpgradePreflightReport(
+            schema_version=current_version,
+            target_schema_version=latest_version,
+            fts_rebuild_required=(None if _fts_schema_matches(connection) else True),
+            vector_rebuild_required=_vector_rebuild_required(connection),
+        )
+    except (OSError, sqlite3.Error) as exc:
+        raise DatabaseError(f"SQLite upgrade preflight failed: {exc}") from exc
+    finally:
+        if connection.in_transaction:
+            connection.rollback()
+        connection.close()
 
 
 def verify_sqlite_version(
@@ -774,7 +924,7 @@ def apply_migrations(
     *,
     limits: LimitsConfig | None = None,
 ) -> None:
-    """Apply each pending numbered migration in its own transaction."""
+    """Apply every pending migration and final canonical validation atomically."""
     _ensure_version_table(connection)
     current_version = _schema_version(connection)
     latest_version = MIGRATIONS[-1].version if MIGRATIONS else 0
@@ -784,16 +934,22 @@ def apply_migrations(
             f"version {latest_version}"
         )
 
-    for migration in MIGRATIONS:
-        if migration.version <= current_version:
-            continue
-        with transaction(connection):
+    pending = tuple(migration for migration in MIGRATIONS if migration.version > current_version)
+    if not pending:
+        return
+    with transaction(connection):
+        for migration in pending:
             if migration.preflight is not None:
                 migration.preflight(connection, limits)
             for statement in migration.statements:
                 connection.execute(statement)
             connection.execute("UPDATE schema_version SET version = ?", (migration.version,))
-        current_version = migration.version
+        if latest_version >= LIFECYCLE_SCHEMA_VERSION:
+            verify_database_integrity(
+                connection,
+                max_statement_chars=None if limits is None else limits.max_statement_chars,
+                max_subject_keys=None if limits is None else limits.max_subject_keys,
+            )
 
 
 def ensure_derived_indexes(connection: sqlite3.Connection) -> None:
@@ -839,19 +995,78 @@ def _table_schema_matches(
     expected_sql: str,
 ) -> bool:
     """Compare one table with a normalized checked-in schema definition."""
-    row = connection.execute(
-        "SELECT type, sql FROM sqlite_schema WHERE name = ?",
-        (name,),
-    ).fetchone()
-    if row is None:
+    definition = _read_bounded_schema_object(
+        connection,
+        name=name,
+        expected_table=name,
+    )
+    if definition is None:
         return False
-    object_type = row["type"] if isinstance(row, sqlite3.Row) else row[0]
-    schema_sql = row["sql"] if isinstance(row, sqlite3.Row) else row[1]
-    if str(object_type) != "table" or not isinstance(schema_sql, str):
+    if (
+        definition.object_type != "table"
+        or not definition.table_matches
+        or not definition.definition_within_bound
+        or definition.sql is None
+    ):
         return False
-    actual = " ".join(schema_sql.split()).casefold()
+    actual = " ".join(definition.sql.split()).casefold()
     expected = " ".join(expected_sql.split()).casefold()
     return actual == expected
+
+
+def _read_bounded_schema_object(
+    connection: sqlite3.Connection,
+    *,
+    name: str,
+    expected_table: str,
+) -> _SchemaObjectDefinition | None:
+    """Fetch one schema definition only after SQLite proves its byte bound."""
+    row = connection.execute(
+        """
+        SELECT
+            CASE
+                WHEN typeof(type) != 'text' THEN NULL
+                WHEN octet_length(type) > 16 THEN NULL
+                ELSE type
+            END AS bounded_type,
+            tbl_name = ? AS table_matches,
+            CASE
+                WHEN sql IS NULL THEN NULL
+                WHEN typeof(sql) != 'text' THEN NULL
+                WHEN octet_length(sql) > ? THEN NULL
+                ELSE sql
+            END AS bounded_sql,
+            CASE
+                WHEN sql IS NULL THEN 1
+                WHEN typeof(sql) != 'text' THEN 0
+                WHEN octet_length(sql) > ? THEN 0
+                ELSE 1
+            END AS definition_within_bound
+        FROM sqlite_schema
+        WHERE name = ?
+        """,
+        (
+            expected_table,
+            MAX_SCHEMA_SQL_BYTES,
+            MAX_SCHEMA_SQL_BYTES,
+            name,
+        ),
+    ).fetchone()
+    if row is None:
+        return None
+    if isinstance(row, sqlite3.Row):
+        object_type = row["bounded_type"]
+        table_matches = row["table_matches"]
+        bounded_sql = row["bounded_sql"]
+        definition_within_bound = row["definition_within_bound"]
+    else:
+        object_type, table_matches, bounded_sql, definition_within_bound = row
+    return _SchemaObjectDefinition(
+        object_type="" if object_type is None else str(object_type),
+        table_matches=bool(table_matches),
+        sql=None if bounded_sql is None else str(bounded_sql),
+        definition_within_bound=bool(definition_within_bound),
+    )
 
 
 def rebuild_fts_index(connection: sqlite3.Connection) -> None:
@@ -933,6 +1148,19 @@ def _parse_sqlite_version(version: str) -> tuple[int, int, int]:
         raise SQLiteVersionError(f"SQLite reported an invalid runtime version: {version}") from exc
 
 
+def _apply_sqlite_resource_limits(connection: sqlite3.Connection) -> None:
+    """Bound SQL text, stored values, rows, and lazy sqlite_schema parsing."""
+    connection.setlimit(sqlite3.SQLITE_LIMIT_SQL_LENGTH, MAX_SCHEMA_SQL_BYTES)
+    connection.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, MAX_SCHEMA_SQL_BYTES)
+    connection.execute("SELECT COUNT(*) FROM sqlite_schema").fetchone()
+    connection.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, MAX_SQLITE_VALUE_BYTES)
+    if (
+        connection.getlimit(sqlite3.SQLITE_LIMIT_LENGTH) != MAX_SQLITE_VALUE_BYTES
+        or connection.getlimit(sqlite3.SQLITE_LIMIT_SQL_LENGTH) != MAX_SCHEMA_SQL_BYTES
+    ):
+        raise DatabaseError("SQLite refused a configured resource length limit")
+
+
 def _configure_connection(connection: sqlite3.Connection, busy_timeout_ms: int) -> None:
     journal_mode_row = connection.execute("PRAGMA journal_mode = WAL").fetchone()
     journal_mode = "" if journal_mode_row is None else str(journal_mode_row[0]).lower()
@@ -982,12 +1210,525 @@ def _validate_read_only_schema(connection: sqlite3.Connection) -> None:
         raise DatabaseError(f"Engram database is missing required tables: {missing}")
 
 
+def _validate_preflight_schema(
+    connection: sqlite3.Connection,
+    schema_version: int,
+) -> None:
+    """Require canonical tables while allowing derived indexes to be rebuilt."""
+    required_tables = ["entries", "audit_log"]
+    if schema_version >= CONSOLIDATION_SCHEMA_VERSION:
+        required_tables.append("consolidation_plans")
+    if schema_version >= LIFECYCLE_SCHEMA_VERSION:
+        required_tables.extend(("entry_observations", "entry_supersessions"))
+    missing_tables = [name for name in required_tables if not _table_exists(connection, name)]
+    if missing_tables:
+        raise DatabaseError(
+            "Engram database is missing required tables for schema "
+            f"{schema_version}: {', '.join(missing_tables)}"
+        )
+
+
+def _simulate_upgrade(
+    source: sqlite3.Connection,
+    *,
+    busy_timeout_ms: int,
+    limits: LimitsConfig | None,
+) -> None:
+    """Prove the complete migration against a disposable on-disk snapshot."""
+    with TemporaryDirectory(prefix="engram-preflight-") as temporary_directory:
+        snapshot_path = Path(temporary_directory) / "engram-upgrade.db"
+        snapshot = sqlite3.connect(
+            snapshot_path,
+            timeout=busy_timeout_ms / 1000,
+            isolation_level=None,
+            check_same_thread=False,
+        )
+        snapshot.row_factory = sqlite3.Row
+        try:
+            source.backup(snapshot, pages=256, sleep=0.01)
+            _apply_sqlite_resource_limits(snapshot)
+            _configure_connection(snapshot, busy_timeout_ms)
+            apply_migrations(snapshot, limits=limits)
+            ensure_derived_indexes(snapshot)
+            verify_database_integrity(
+                snapshot,
+                max_statement_chars=None if limits is None else limits.max_statement_chars,
+                max_subject_keys=None if limits is None else limits.max_subject_keys,
+            )
+        finally:
+            snapshot.close()
+
+
+def _vector_rebuild_required(connection: sqlite3.Connection) -> bool:
+    if not _vector_schema_matches(connection):
+        return True
+    invalid = connection.execute(
+        """
+        SELECT 1
+        FROM entry_vectors
+        WHERE dim NOT BETWEEN 1 AND 8192
+           OR typeof(vector) != 'blob'
+           OR octet_length(vector) != dim * 4
+        LIMIT 1
+        """
+    ).fetchone()
+    return invalid is not None
+
+
+def _precheck_entry_payload_lengths(
+    connection: sqlite3.Connection,
+    *,
+    max_statement_chars: int | None,
+    max_subject_keys: int | None,
+) -> None:
+    """Reject one oversized persisted value before SQLite returns its payload."""
+    statement_limit = (
+        HARD_MAX_STATEMENT_CHARS
+        if max_statement_chars is None
+        else min(max_statement_chars, HARD_MAX_STATEMENT_CHARS)
+    )
+    subject_key_limit = (
+        HARD_MAX_SUBJECT_KEYS
+        if max_subject_keys is None
+        else min(max_subject_keys, HARD_MAX_SUBJECT_KEYS)
+    )
+    subject_json_limit = (
+        2
+        + subject_key_limit * (MAX_JSON_ESCAPE_CHARS * MAX_SUBJECT_KEY_CHARS + 2)
+        + max(subject_key_limit - 1, 0)
+    )
+    evidence_json_limit = (
+        2
+        + MAX_EVIDENCE_ITEMS * (MAX_JSON_ESCAPE_CHARS * MAX_EVIDENCE_REF_CHARS + 128)
+        + max(MAX_EVIDENCE_ITEMS - 1, 0)
+    )
+    count_row = connection.execute("SELECT COUNT(*) FROM entries").fetchone()
+    entry_count = 0 if count_row is None else int(count_row[0])
+    supersedes_json_limit = 2 + entry_count * (ULID_LENGTH + 8)
+    invalid = connection.execute(
+        """
+        WITH checked AS (
+            SELECT
+                rowid AS entry_rowid,
+                CASE
+                    WHEN typeof(id) != 'text' THEN 'id'
+                    WHEN octet_length(id) > :id_bytes THEN 'id'
+                    WHEN instr(id, char(0)) > 0 OR length(id) != :id_chars THEN 'id'
+                    WHEN typeof(kind) != 'text' THEN 'kind'
+                    WHEN octet_length(kind) > :enum_bytes THEN 'kind'
+                    WHEN instr(kind, char(0)) > 0 OR length(kind) > 64 THEN 'kind'
+                    WHEN typeof(scope) != 'text' THEN 'scope'
+                    WHEN octet_length(scope) > :scope_bytes THEN 'scope'
+                    WHEN instr(scope, char(0)) > 0
+                      OR length(scope) > :scope_chars THEN 'scope'
+                    WHEN typeof(statement) != 'text' THEN 'statement'
+                    WHEN octet_length(statement) > :statement_bytes THEN 'statement'
+                    WHEN instr(statement, char(0)) > 0
+                      OR length(statement) > :statement_chars THEN 'statement'
+                    WHEN typeof(subject_keys) != 'text' THEN 'subject_keys'
+                    WHEN octet_length(subject_keys) > :subject_json_bytes THEN 'subject_keys'
+                    WHEN instr(subject_keys, char(0)) > 0
+                      OR length(subject_keys) > :subject_json_chars THEN 'subject_keys'
+                    WHEN typeof(status) != 'text' THEN 'status'
+                    WHEN octet_length(status) > :enum_bytes THEN 'status'
+                    WHEN instr(status, char(0)) > 0 OR length(status) > 64 THEN 'status'
+                    WHEN typeof(promotion_state) != 'text' THEN 'promotion_state'
+                    WHEN octet_length(promotion_state) > :enum_bytes THEN 'promotion_state'
+                    WHEN instr(promotion_state, char(0)) > 0
+                      OR length(promotion_state) > 64 THEN 'promotion_state'
+                    WHEN typeof(source_type) != 'text' THEN 'source_type'
+                    WHEN octet_length(source_type) > :enum_bytes THEN 'source_type'
+                    WHEN instr(source_type, char(0)) > 0
+                      OR length(source_type) > 64 THEN 'source_type'
+                    WHEN typeof(writer_model) NOT IN ('null', 'text') THEN 'writer_model'
+                    WHEN octet_length(writer_model) > :writer_model_bytes THEN 'writer_model'
+                    WHEN instr(writer_model, char(0)) > 0
+                      OR length(writer_model) > :writer_model_chars THEN 'writer_model'
+                    WHEN typeof(confidence) != 'text' THEN 'confidence'
+                    WHEN octet_length(confidence) > :enum_bytes THEN 'confidence'
+                    WHEN instr(confidence, char(0)) > 0
+                      OR length(confidence) > 64 THEN 'confidence'
+                    WHEN typeof(idempotency_key) != 'text' THEN 'idempotency_key'
+                    WHEN octet_length(idempotency_key) > :hash_bytes THEN 'idempotency_key'
+                    WHEN instr(idempotency_key, char(0)) > 0
+                      OR length(idempotency_key) != :hash_chars THEN 'idempotency_key'
+                    WHEN typeof(supersedes) != 'text' THEN 'supersedes'
+                    WHEN octet_length(supersedes) > :supersedes_json_bytes THEN 'supersedes'
+                    WHEN instr(supersedes, char(0)) > 0
+                      OR length(supersedes) > :supersedes_json_chars THEN 'supersedes'
+                    WHEN typeof(evidence) != 'text' THEN 'evidence'
+                    WHEN octet_length(evidence) > :evidence_json_bytes THEN 'evidence'
+                    WHEN instr(evidence, char(0)) > 0
+                      OR length(evidence) > :evidence_json_chars THEN 'evidence'
+                    WHEN typeof(datacron_ref) NOT IN ('null', 'text') THEN 'datacron_ref'
+                    WHEN octet_length(datacron_ref) > :datacron_ref_bytes THEN 'datacron_ref'
+                    WHEN instr(datacron_ref, char(0)) > 0
+                      OR length(datacron_ref) > :datacron_ref_chars THEN 'datacron_ref'
+                    WHEN typeof(datacron_hash) NOT IN ('null', 'text') THEN 'datacron_hash'
+                    WHEN octet_length(datacron_hash) > :hash_bytes THEN 'datacron_hash'
+                    WHEN instr(datacron_hash, char(0)) > 0
+                      OR length(datacron_hash) > :hash_chars THEN 'datacron_hash'
+                    WHEN typeof(recorded_at) != 'text' THEN 'recorded_at'
+                    WHEN octet_length(recorded_at) > :temporal_bytes THEN 'recorded_at'
+                    WHEN instr(recorded_at, char(0)) > 0
+                      OR length(recorded_at) > :temporal_chars THEN 'recorded_at'
+                    WHEN typeof(observed_at) NOT IN ('null', 'text') THEN 'observed_at'
+                    WHEN octet_length(observed_at) > :temporal_bytes THEN 'observed_at'
+                    WHEN instr(observed_at, char(0)) > 0
+                      OR length(observed_at) > :temporal_chars THEN 'observed_at'
+                    WHEN typeof(valid_from) NOT IN ('null', 'text') THEN 'valid_from'
+                    WHEN octet_length(valid_from) > :date_bytes THEN 'valid_from'
+                    WHEN instr(valid_from, char(0)) > 0
+                      OR length(valid_from) > 10 THEN 'valid_from'
+                    WHEN typeof(valid_until) NOT IN ('null', 'text') THEN 'valid_until'
+                    WHEN octet_length(valid_until) > :date_bytes THEN 'valid_until'
+                    WHEN instr(valid_until, char(0)) > 0
+                      OR length(valid_until) > 10 THEN 'valid_until'
+                    WHEN typeof(expires_at) NOT IN ('null', 'text') THEN 'expires_at'
+                    WHEN octet_length(expires_at) > :temporal_bytes THEN 'expires_at'
+                    WHEN instr(expires_at, char(0)) > 0
+                      OR length(expires_at) > :temporal_chars THEN 'expires_at'
+                    WHEN typeof(synced_at) NOT IN ('null', 'text') THEN 'synced_at'
+                    WHEN octet_length(synced_at) > :temporal_bytes THEN 'synced_at'
+                    WHEN instr(synced_at, char(0)) > 0
+                      OR length(synced_at) > :temporal_chars THEN 'synced_at'
+                    WHEN typeof(is_stale) != 'integer' THEN 'is_stale'
+                END AS invalid_field
+            FROM entries
+        )
+        SELECT entry_rowid, invalid_field
+        FROM checked
+        WHERE invalid_field IS NOT NULL
+        ORDER BY entry_rowid
+        LIMIT 1
+        """,
+        {
+            "id_bytes": ULID_LENGTH * MAX_UTF8_BYTES_PER_CHAR,
+            "id_chars": ULID_LENGTH,
+            "enum_bytes": 64 * MAX_UTF8_BYTES_PER_CHAR,
+            "scope_bytes": MAX_SCOPE_CHARS * MAX_UTF8_BYTES_PER_CHAR,
+            "scope_chars": MAX_SCOPE_CHARS,
+            "statement_bytes": statement_limit * MAX_UTF8_BYTES_PER_CHAR,
+            "statement_chars": statement_limit,
+            "subject_json_bytes": subject_json_limit * MAX_UTF8_BYTES_PER_CHAR,
+            "subject_json_chars": subject_json_limit,
+            "writer_model_bytes": MAX_WRITER_MODEL_CHARS * MAX_UTF8_BYTES_PER_CHAR,
+            "writer_model_chars": MAX_WRITER_MODEL_CHARS,
+            "hash_bytes": SHA256_HEX_LENGTH * MAX_UTF8_BYTES_PER_CHAR,
+            "hash_chars": SHA256_HEX_LENGTH,
+            "supersedes_json_bytes": supersedes_json_limit * MAX_UTF8_BYTES_PER_CHAR,
+            "supersedes_json_chars": supersedes_json_limit,
+            "evidence_json_bytes": evidence_json_limit * MAX_UTF8_BYTES_PER_CHAR,
+            "evidence_json_chars": evidence_json_limit,
+            "datacron_ref_bytes": MAX_DATACRON_REF_CHARS * MAX_UTF8_BYTES_PER_CHAR,
+            "datacron_ref_chars": MAX_DATACRON_REF_CHARS,
+            "temporal_bytes": MAX_TEMPORAL_TEXT_CHARS * MAX_UTF8_BYTES_PER_CHAR,
+            "temporal_chars": MAX_TEMPORAL_TEXT_CHARS,
+            "date_bytes": 10 * MAX_UTF8_BYTES_PER_CHAR,
+        },
+    ).fetchone()
+    if invalid is not None:
+        safe_identity = connection.execute(
+            """
+            SELECT id
+            FROM entries
+            WHERE rowid = ?
+              AND CASE
+                    WHEN typeof(id) != 'text' THEN 0
+                    WHEN octet_length(id) > ? THEN 0
+                    WHEN instr(id, char(0)) = 0 AND length(id) = ? THEN 1
+                    ELSE 0
+                  END = 1
+            """,
+            (
+                invalid["entry_rowid"],
+                ULID_LENGTH * MAX_UTF8_BYTES_PER_CHAR,
+                ULID_LENGTH,
+            ),
+        ).fetchone()
+        location = (
+            f"entry {safe_identity['id']!s}"
+            if safe_identity is not None
+            else f"row {invalid['entry_rowid']!s}"
+        )
+        raise DatabaseError(
+            "Persisted entry payload exceeds a fixed preflight allocation bound or has "
+            f"an invalid SQLite type at {location}, "
+            f"field {invalid['invalid_field']!s}"
+        )
+    if _schema_version(connection) >= LIFECYCLE_SCHEMA_VERSION:
+        invalid_v5 = connection.execute(
+            """
+            SELECT rowid
+            FROM entries
+            WHERE CASE
+                    WHEN typeof(canonical_key) != 'text' THEN 1
+                    WHEN octet_length(canonical_key) > :canonical_bytes THEN 1
+                    WHEN instr(canonical_key, char(0)) > 0
+                      OR length(canonical_key) != :canonical_chars THEN 1
+                    WHEN typeof(claim_key) NOT IN ('null', 'text') THEN 1
+                    WHEN octet_length(claim_key) > :claim_bytes THEN 1
+                    WHEN instr(claim_key, char(0)) > 0
+                      OR length(claim_key) > :claim_chars THEN 1
+                    ELSE 0
+                  END = 1
+            ORDER BY rowid
+            LIMIT 1
+            """,
+            {
+                "canonical_bytes": SHA256_HEX_LENGTH * MAX_UTF8_BYTES_PER_CHAR,
+                "canonical_chars": SHA256_HEX_LENGTH,
+                "claim_bytes": MAX_CLAIM_KEY_CHARS * MAX_UTF8_BYTES_PER_CHAR,
+                "claim_chars": MAX_CLAIM_KEY_CHARS,
+            },
+        ).fetchone()
+        if invalid_v5 is not None:
+            raise DatabaseError(
+                "Persisted entry identity payload exceeds a fixed preflight allocation "
+                f"bound or has an invalid SQLite type at row {invalid_v5['rowid']!s}"
+            )
+
+
+def _precheck_observation_payload_lengths(
+    connection: sqlite3.Connection,
+    *,
+    max_subject_keys: int | None,
+) -> None:
+    subject_key_limit = (
+        HARD_MAX_SUBJECT_KEYS
+        if max_subject_keys is None
+        else min(max_subject_keys, HARD_MAX_SUBJECT_KEYS)
+    )
+    subject_json_limit = (
+        2
+        + subject_key_limit * (MAX_JSON_ESCAPE_CHARS * MAX_SUBJECT_KEY_CHARS + 2)
+        + max(subject_key_limit - 1, 0)
+    )
+    evidence_json_limit = (
+        2
+        + MAX_EVIDENCE_ITEMS * (MAX_JSON_ESCAPE_CHARS * MAX_EVIDENCE_REF_CHARS + 128)
+        + max(MAX_EVIDENCE_ITEMS - 1, 0)
+    )
+    invalid = connection.execute(
+        """
+        SELECT 1
+        FROM entry_observations
+        WHERE CASE
+                WHEN typeof(entry_id) != 'text' THEN 1
+                WHEN octet_length(entry_id) > :entry_id_bytes THEN 1
+                WHEN instr(entry_id, char(0)) > 0
+                  OR length(entry_id) != :entry_id_chars THEN 1
+                WHEN typeof(writer_model) != 'text' THEN 1
+                WHEN octet_length(writer_model) > :writer_model_bytes THEN 1
+                WHEN instr(writer_model, char(0)) > 0
+                  OR length(writer_model) > :writer_model_chars THEN 1
+                WHEN typeof(claim_hash) != 'text' THEN 1
+                WHEN octet_length(claim_hash) > :claim_hash_bytes THEN 1
+                WHEN instr(claim_hash, char(0)) > 0
+                  OR length(claim_hash) > :claim_hash_chars THEN 1
+                WHEN typeof(confidence) != 'text' THEN 1
+                WHEN octet_length(confidence) > :enum_bytes THEN 1
+                WHEN instr(confidence, char(0)) > 0
+                  OR length(confidence) > 64 THEN 1
+                WHEN typeof(subject_keys) != 'text' THEN 1
+                WHEN octet_length(subject_keys) > :subject_json_bytes THEN 1
+                WHEN instr(subject_keys, char(0)) > 0
+                  OR length(subject_keys) > :subject_json_chars THEN 1
+                WHEN typeof(evidence) != 'text' THEN 1
+                WHEN octet_length(evidence) > :evidence_json_bytes THEN 1
+                WHEN instr(evidence, char(0)) > 0
+                  OR length(evidence) > :evidence_json_chars THEN 1
+                WHEN typeof(recorded_at) != 'text' THEN 1
+                WHEN octet_length(recorded_at) > :temporal_bytes THEN 1
+                WHEN instr(recorded_at, char(0)) > 0
+                  OR length(recorded_at) > :temporal_chars THEN 1
+                WHEN typeof(observed_at) NOT IN ('null', 'text') THEN 1
+                WHEN octet_length(observed_at) > :temporal_bytes THEN 1
+                WHEN instr(observed_at, char(0)) > 0
+                  OR length(observed_at) > :temporal_chars THEN 1
+                WHEN typeof(valid_from) NOT IN ('null', 'text') THEN 1
+                WHEN octet_length(valid_from) > :date_bytes THEN 1
+                WHEN instr(valid_from, char(0)) > 0
+                  OR length(valid_from) > 10 THEN 1
+                WHEN typeof(valid_until) NOT IN ('null', 'text') THEN 1
+                WHEN octet_length(valid_until) > :date_bytes THEN 1
+                WHEN instr(valid_until, char(0)) > 0
+                  OR length(valid_until) > 10 THEN 1
+                ELSE 0
+              END = 1
+        LIMIT 1
+        """,
+        {
+            "entry_id_bytes": ULID_LENGTH * MAX_UTF8_BYTES_PER_CHAR,
+            "entry_id_chars": ULID_LENGTH,
+            "writer_model_bytes": MAX_WRITER_MODEL_CHARS * MAX_UTF8_BYTES_PER_CHAR,
+            "writer_model_chars": MAX_WRITER_MODEL_CHARS,
+            "claim_hash_bytes": LEGACY_CLAIM_HASH_CHARS * MAX_UTF8_BYTES_PER_CHAR,
+            "claim_hash_chars": LEGACY_CLAIM_HASH_CHARS,
+            "enum_bytes": 64 * MAX_UTF8_BYTES_PER_CHAR,
+            "subject_json_bytes": subject_json_limit * MAX_UTF8_BYTES_PER_CHAR,
+            "subject_json_chars": subject_json_limit,
+            "evidence_json_bytes": evidence_json_limit * MAX_UTF8_BYTES_PER_CHAR,
+            "evidence_json_chars": evidence_json_limit,
+            "temporal_bytes": MAX_TEMPORAL_TEXT_CHARS * MAX_UTF8_BYTES_PER_CHAR,
+            "temporal_chars": MAX_TEMPORAL_TEXT_CHARS,
+            "date_bytes": 10 * MAX_UTF8_BYTES_PER_CHAR,
+        },
+    ).fetchone()
+    if invalid is not None:
+        raise DatabaseError(
+            "Persisted observation payload exceeds a fixed preflight allocation bound "
+            "or has an invalid SQLite type"
+        )
+
+
+def _precheck_audit_payload_lengths(connection: sqlite3.Connection) -> None:
+    invalid = connection.execute(
+        """
+        SELECT 1
+        FROM audit_log
+        WHERE CASE
+                WHEN typeof(actor) != 'text' THEN 1
+                WHEN octet_length(actor) > :actor_bytes THEN 1
+                WHEN instr(actor, char(0)) > 0
+                  OR length(actor) > :actor_chars THEN 1
+                WHEN typeof(ts) != 'text' THEN 1
+                WHEN octet_length(ts) > :temporal_bytes THEN 1
+                WHEN instr(ts, char(0)) > 0
+                  OR length(ts) > :temporal_chars THEN 1
+                WHEN typeof(action) != 'text' THEN 1
+                WHEN octet_length(action) > :temporal_bytes THEN 1
+                WHEN instr(action, char(0)) > 0
+                  OR length(action) > :temporal_chars THEN 1
+                WHEN typeof(entry_id) NOT IN ('null', 'text') THEN 1
+                WHEN octet_length(entry_id) > :audit_reference_bytes THEN 1
+                WHEN instr(entry_id, char(0)) > 0
+                  OR length(entry_id) > :audit_reference_chars THEN 1
+                WHEN typeof(detail_hash) NOT IN ('null', 'text') THEN 1
+                WHEN octet_length(detail_hash) > :audit_reference_bytes THEN 1
+                WHEN instr(detail_hash, char(0)) > 0
+                  OR length(detail_hash) > :audit_reference_chars THEN 1
+                ELSE 0
+              END = 1
+        LIMIT 1
+        """,
+        {
+            "actor_bytes": MAX_ACTOR_CHARS * MAX_UTF8_BYTES_PER_CHAR,
+            "actor_chars": MAX_ACTOR_CHARS,
+            "temporal_bytes": MAX_TEMPORAL_TEXT_CHARS * MAX_UTF8_BYTES_PER_CHAR,
+            "temporal_chars": MAX_TEMPORAL_TEXT_CHARS,
+            "audit_reference_bytes": 1024 * MAX_UTF8_BYTES_PER_CHAR,
+            "audit_reference_chars": 1024,
+        },
+    ).fetchone()
+    if invalid is not None:
+        raise DatabaseError(
+            "Persisted audit payload exceeds a fixed preflight allocation bound "
+            "or has an invalid SQLite type"
+        )
+
+
+def _precheck_supersession_payload_lengths(connection: sqlite3.Connection) -> None:
+    invalid = connection.execute(
+        """
+        SELECT 1
+        FROM entry_supersessions
+        WHERE CASE
+                WHEN typeof(old_entry_id) != 'text' THEN 1
+                WHEN octet_length(old_entry_id) > :entry_id_bytes THEN 1
+                WHEN instr(old_entry_id, char(0)) > 0
+                  OR length(old_entry_id) != :entry_id_chars THEN 1
+                WHEN typeof(new_entry_id) != 'text' THEN 1
+                WHEN octet_length(new_entry_id) > :entry_id_bytes THEN 1
+                WHEN instr(new_entry_id, char(0)) > 0
+                  OR length(new_entry_id) != :entry_id_chars THEN 1
+                WHEN typeof(recorded_at) != 'text' THEN 1
+                WHEN octet_length(recorded_at) > :temporal_bytes THEN 1
+                WHEN instr(recorded_at, char(0)) > 0
+                  OR length(recorded_at) > :temporal_chars THEN 1
+                WHEN typeof(actor) != 'text' THEN 1
+                WHEN octet_length(actor) > :actor_bytes THEN 1
+                WHEN instr(actor, char(0)) > 0
+                  OR length(actor) > :actor_chars THEN 1
+                ELSE 0
+              END = 1
+        LIMIT 1
+        """,
+        {
+            "entry_id_bytes": ULID_LENGTH * MAX_UTF8_BYTES_PER_CHAR,
+            "entry_id_chars": ULID_LENGTH,
+            "temporal_bytes": MAX_TEMPORAL_TEXT_CHARS * MAX_UTF8_BYTES_PER_CHAR,
+            "temporal_chars": MAX_TEMPORAL_TEXT_CHARS,
+            "actor_bytes": MAX_ACTOR_CHARS * MAX_UTF8_BYTES_PER_CHAR,
+            "actor_chars": MAX_ACTOR_CHARS,
+        },
+    ).fetchone()
+    if invalid is not None:
+        raise DatabaseError(
+            "Persisted supersession payload exceeds a fixed preflight allocation bound "
+            "or has an invalid SQLite type"
+        )
+
+
+def _precheck_consolidation_plan_payload_lengths(connection: sqlite3.Connection) -> None:
+    invalid = connection.execute(
+        """
+        SELECT 1
+        FROM consolidation_plans
+        WHERE CASE
+                WHEN typeof(plan_id) != 'text' THEN 1
+                WHEN octet_length(plan_id) > :plan_id_bytes THEN 1
+                WHEN instr(plan_id, char(0)) > 0
+                  OR length(plan_id) != :plan_id_chars THEN 1
+                WHEN typeof(created_at) != 'text' THEN 1
+                WHEN octet_length(created_at) > :temporal_bytes THEN 1
+                WHEN instr(created_at, char(0)) > 0
+                  OR length(created_at) > :temporal_chars THEN 1
+                WHEN typeof(snapshot_json) != 'text' THEN 1
+                WHEN octet_length(snapshot_json) > :snapshot_bytes THEN 1
+                WHEN instr(snapshot_json, char(0)) > 0 THEN 1
+                WHEN typeof(snapshot_hash) != 'text' THEN 1
+                WHEN octet_length(snapshot_hash) > :hash_bytes THEN 1
+                WHEN instr(snapshot_hash, char(0)) > 0
+                  OR length(snapshot_hash) != :hash_chars THEN 1
+                WHEN typeof(consumed_at) NOT IN ('null', 'text') THEN 1
+                WHEN octet_length(consumed_at) > :temporal_bytes THEN 1
+                WHEN instr(consumed_at, char(0)) > 0
+                  OR length(consumed_at) > :temporal_chars THEN 1
+                ELSE 0
+              END = 1
+        LIMIT 1
+        """,
+        {
+            "plan_id_bytes": ULID_LENGTH * MAX_UTF8_BYTES_PER_CHAR,
+            "plan_id_chars": ULID_LENGTH,
+            "temporal_bytes": MAX_TEMPORAL_TEXT_CHARS * MAX_UTF8_BYTES_PER_CHAR,
+            "temporal_chars": MAX_TEMPORAL_TEXT_CHARS,
+            "snapshot_bytes": MAX_CONSOLIDATION_SNAPSHOT_BYTES,
+            "hash_bytes": SHA256_HEX_LENGTH * MAX_UTF8_BYTES_PER_CHAR,
+            "hash_chars": SHA256_HEX_LENGTH,
+        },
+    ).fetchone()
+    if invalid is not None:
+        raise DatabaseError(
+            "Persisted consolidation plan payload exceeds a fixed preflight "
+            "allocation bound or has an invalid SQLite type"
+        )
+
+
 def _preflight_lifecycle_v5(  # noqa: C901
     connection: sqlite3.Connection,
     *,
     limits: LimitsConfig | None,
 ) -> None:
     """Validate every v4 row and JSON edge before installing stricter structures."""
+    _verify_rebuildable_derived_objects(connection)
+    _precheck_consolidation_plan_payload_lengths(connection)
+    _precheck_entry_payload_lengths(
+        connection,
+        max_statement_chars=None if limits is None else limits.max_statement_chars,
+        max_subject_keys=None if limits is None else limits.max_subject_keys,
+    )
     rows = connection.execute(
         """
         SELECT
@@ -998,14 +1739,18 @@ def _preflight_lifecycle_v5(  # noqa: C901
         FROM entries
         ORDER BY id
         """
-    ).fetchall()
-    rows_by_id = {str(row["id"]): row for row in rows}
+    )
+    rows_by_id: dict[str, _SupersessionNode] = {}
     edges: dict[str, str] = {}
     for row in rows:
         entry_id = str(row["id"])
         try:
-            normalize_entry_id(entry_id)
-        except StoreValidationError as exc:
+            _require_equal(
+                normalize_entry_id(entry_id),
+                entry_id,
+                "id is not normalized",
+            )
+        except (StoreValidationError, ValueError) as exc:
             raise DatabaseError(f"Migration v5 rejected entry {entry_id} field id: {exc}") from exc
         if type(row["is_stale"]) is not int or int(row["is_stale"]) not in {0, 1}:
             raise DatabaseError(
@@ -1014,6 +1759,16 @@ def _preflight_lifecycle_v5(  # noqa: C901
         if not _legacy_lifecycle_is_valid(row):
             raise DatabaseError(f"Migration v5 rejected invalid lifecycle entry: {entry_id}")
         _validate_v4_entry_content(row, limits=limits)
+        rows_by_id[entry_id] = _SupersessionNode(
+            kind=str(row["kind"]),
+            scope=str(row["scope"]),
+            status=str(row["status"]),
+            promotion_state=str(row["promotion_state"]),
+            source_type=str(row["source_type"]),
+            canonical_key=str(row["idempotency_key"]),
+            claim_key=None,
+            claim_key_present=False,
+        )
         try:
             decoded = json.loads(str(row["supersedes"]))
         except json.JSONDecodeError as exc:
@@ -1028,8 +1783,12 @@ def _preflight_lifecycle_v5(  # noqa: C901
             raise DatabaseError(f"Migration v5 rejected duplicate supersedes IDs: {entry_id}")
         for old_id in decoded:
             try:
-                normalize_entry_id(old_id, "supersedes entry ID")
-            except StoreValidationError as exc:
+                _require_equal(
+                    normalize_entry_id(old_id, "supersedes entry ID"),
+                    old_id,
+                    "supersedes entry ID is not normalized",
+                )
+            except (StoreValidationError, ValueError) as exc:
                 raise DatabaseError(
                     f"Migration v5 rejected entry {entry_id} field supersedes: {exc}"
                 ) from exc
@@ -1042,6 +1801,17 @@ def _preflight_lifecycle_v5(  # noqa: C901
                 )
             edges[old_id] = entry_id
     _verify_edge_graph(rows_by_id, edges, context="Migration v5")
+    _verify_audit_integrity(connection)
+
+
+def _verify_rebuildable_derived_objects(connection: sqlite3.Connection) -> None:
+    for object_name in (FTS_TABLE_NAME, "entry_vectors"):
+        object_type = _schema_object_type(connection, object_name)
+        if object_type not in {None, "table"}:
+            raise DatabaseError(
+                f"Cannot rebuild derived object {object_name!r} over unexpected "
+                f"SQLite object type {object_type}"
+            )
 
 
 def _validate_v4_entry_content(
@@ -1081,7 +1851,7 @@ def _validate_v4_entry_content(
         writer_model = row["writer_model"]
         if writer_model is not None:
             _require_equal(
-                required_text(writer_model, "writer_model"),
+                normalize_writer_model(writer_model),
                 writer_model,
                 "writer_model is not normalized",
             )
@@ -1114,6 +1884,8 @@ def _validate_evidence_json(value: object) -> list[dict[str, str]]:
         raise ValueError("evidence is not valid JSON") from exc
     if not isinstance(decoded, list):
         raise ValueError("evidence is not an array")
+    if len(decoded) > MAX_EVIDENCE_ITEMS:
+        raise ValueError(f"evidence exceeds limit of {MAX_EVIDENCE_ITEMS} items")
     normalized: list[dict[str, str]] = []
     for index, item in enumerate(decoded):
         if not isinstance(item, dict) or set(item) != {"type", "ref"}:
@@ -1126,10 +1898,7 @@ def _validate_evidence_json(value: object) -> list[dict[str, str]]:
             EvidenceType(evidence_type)
         except ValueError as exc:
             raise ValueError(f"evidence[{index}].type is invalid") from exc
-        if (
-            not isinstance(reference, str)
-            or required_text(reference, f"evidence[{index}].ref") != reference
-        ):
+        if not isinstance(reference, str) or normalize_evidence_ref(reference) != reference:
             raise ValueError(f"evidence[{index}].ref is not normalized")
         normalized.append({"type": evidence_type, "ref": reference})
     return normalized
@@ -1149,13 +1918,18 @@ def _validate_datacron_fields(row: sqlite3.Row) -> None:
     reference = row["datacron_ref"]
     if reference is not None:
         _require_equal(
-            required_text(reference, "datacron_ref"),
+            normalize_datacron_ref(reference),
             reference,
             "datacron_ref is not normalized",
         )
     content_hash = row["datacron_hash"]
     if content_hash is not None:
-        normalize_sha256_hex(str(content_hash), "datacron_hash")
+        normalized_hash = normalize_sha256_hex(str(content_hash), "datacron_hash")
+        _require_equal(
+            normalized_hash,
+            content_hash,
+            "datacron_hash is not normalized",
+        )
 
 
 def _validate_datetime_field(
@@ -1253,6 +2027,12 @@ def verify_database_integrity(
 ) -> None:
     """Fail closed when canonical lifecycle or relationship invariants diverge."""
     _verify_required_v5_schema(connection)
+    _precheck_consolidation_plan_payload_lengths(connection)
+    _precheck_entry_payload_lengths(
+        connection,
+        max_statement_chars=max_statement_chars,
+        max_subject_keys=max_subject_keys,
+    )
     foreign_key_violation = connection.execute("PRAGMA foreign_key_check").fetchone()
     if foreign_key_violation is not None:
         raise DatabaseError(
@@ -1317,47 +2097,108 @@ def verify_database_integrity(
         connection,
         max_subject_keys=max_subject_keys,
     )
+    _verify_audit_integrity(connection)
     _verify_live_canonical_uniqueness(connection)
     _verify_supersession_integrity(connection)
     _warn_unclassified_legacy_entries(connection)
 
 
 def _verify_required_v5_schema(connection: sqlite3.Connection) -> None:
+    _verify_canonical_table_schemas(connection)
     names = tuple(REQUIRED_V5_TRIGGERS) + tuple(REQUIRED_V5_PARTIAL_INDEX_FRAGMENTS)
     expected_definitions = _expected_v5_schema_definitions(names)
-    placeholders = ", ".join("?" for _ in names)
-    rows = connection.execute(
-        "SELECT type, name, tbl_name, sql FROM sqlite_schema "  # noqa: S608
-        f"WHERE name IN ({placeholders})",
-        names,
-    ).fetchall()
-    by_name = {str(row["name"]): row for row in rows}
     for name, table_name in REQUIRED_V5_TRIGGERS.items():
-        row = by_name.get(name)
+        definition = _read_bounded_schema_object(
+            connection,
+            name=name,
+            expected_table=table_name,
+        )
+        if definition is not None and not definition.definition_within_bound:
+            raise DatabaseError(
+                f"Database schema definition exceeds fixed allocation bound: {name}"
+            )
         if (
-            row is None
-            or str(row["type"]) != "trigger"
-            or str(row["tbl_name"]) != table_name
-            or row["sql"] is None
+            definition is None
+            or definition.object_type != "trigger"
+            or not definition.table_matches
+            or definition.sql is None
         ):
             raise DatabaseError(f"Database is missing required trigger: {name}")
-        if _normalize_schema_sql(str(row["sql"])) != expected_definitions[name]:
+        if _normalize_schema_sql(definition.sql) != expected_definitions[name]:
             raise DatabaseError(f"Database trigger definition is invalid: {name}")
     for name, fragments in REQUIRED_V5_PARTIAL_INDEX_FRAGMENTS.items():
-        row = by_name.get(name)
+        definition = _read_bounded_schema_object(
+            connection,
+            name=name,
+            expected_table="entries",
+        )
+        if definition is not None and not definition.definition_within_bound:
+            raise DatabaseError(
+                f"Database schema definition exceeds fixed allocation bound: {name}"
+            )
         if (
-            row is None
-            or str(row["type"]) != "index"
-            or str(row["tbl_name"]) != "entries"
-            or row["sql"] is None
+            definition is None
+            or definition.object_type != "index"
+            or not definition.table_matches
+            or definition.sql is None
         ):
             raise DatabaseError(f"Database is missing required partial index: {name}")
-        normalized_sql = _normalize_schema_sql(str(row["sql"]))
+        normalized_sql = _normalize_schema_sql(definition.sql)
         if (
             any(fragment not in normalized_sql for fragment in fragments)
             or normalized_sql != expected_definitions[name]
         ):
             raise DatabaseError(f"Database partial index definition is invalid: {name}")
+
+
+def _verify_canonical_table_schemas(connection: sqlite3.Connection) -> None:
+    expected = _expected_canonical_table_schemas()
+    for table_name in CANONICAL_V5_TABLES:
+        definition = _read_bounded_schema_object(
+            connection,
+            name=table_name,
+            expected_table=table_name,
+        )
+        if definition is not None and not definition.definition_within_bound:
+            raise DatabaseError(
+                f"Database canonical table definition exceeds fixed allocation bound: {table_name}"
+            )
+        if (
+            definition is None
+            or definition.object_type != "table"
+            or not definition.table_matches
+            or definition.sql is None
+            or _normalize_schema_sql(definition.sql) != expected[table_name]
+        ):
+            raise DatabaseError(f"Database canonical table definition is invalid: {table_name}")
+
+
+@lru_cache(maxsize=1)
+def _expected_canonical_table_schemas() -> dict[str, str]:
+    reference = sqlite3.connect(":memory:", isolation_level=None)
+    reference.row_factory = sqlite3.Row
+    try:
+        _apply_sqlite_resource_limits(reference)
+        reference.execute("PRAGMA foreign_keys = ON")
+        with transaction(reference):
+            for migration in MIGRATIONS:
+                for statement in migration.statements:
+                    reference.execute(statement)
+        expected: dict[str, str] = {}
+        for table_name in CANONICAL_V5_TABLES:
+            row = reference.execute(
+                "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = ?",
+                (table_name,),
+            ).fetchone()
+            if row is None or row["sql"] is None:  # pragma: no cover - package invariant
+                raise RuntimeError(f"Migration set lacks canonical table: {table_name}")
+            expected[table_name] = _normalize_schema_sql(str(row["sql"]))
+    except sqlite3.Error as exc:  # pragma: no cover - package invariant
+        raise RuntimeError("Could not construct the canonical migration schema") from exc
+    else:
+        return expected
+    finally:
+        reference.close()
 
 
 def _expected_v5_schema_definitions(names: tuple[str, ...]) -> dict[str, str]:
@@ -1408,7 +2249,7 @@ def _verify_normalized_entry_content(
         FROM entries
         ORDER BY id
         """
-    ).fetchall()
+    )
     for row in rows:
         entry_id = str(row["id"])
         try:
@@ -1432,7 +2273,7 @@ def _verify_normalized_entry_content(
             writer_model = row["writer_model"]
             if writer_model is not None:
                 _require_equal(
-                    required_text(writer_model, "writer_model"),
+                    normalize_writer_model(writer_model),
                     writer_model,
                     "writer_model is not normalized",
                 )
@@ -1455,6 +2296,10 @@ def _verify_observation_integrity(
     *,
     max_subject_keys: int | None,
 ) -> None:
+    _precheck_observation_payload_lengths(
+        connection,
+        max_subject_keys=max_subject_keys,
+    )
     rows = connection.execute(
         """
         SELECT
@@ -1464,14 +2309,14 @@ def _verify_observation_integrity(
         ORDER BY observation.entry_id, observation.writer_model,
                  observation.claim_hash
         """
-    ).fetchall()
+    )
     for row in rows:
         entry_id = str(row["entry_id"])
         claim_hash = str(row["claim_hash"])
         try:
             writer_model = str(row["writer_model"])
             _require_equal(
-                required_text(writer_model, "writer_model"),
+                normalize_writer_model(writer_model),
                 writer_model,
                 "writer_model is not normalized",
             )
@@ -1648,16 +2493,67 @@ def _warn_unclassified_legacy_entries(connection: sqlite3.Connection) -> None:
         )
 
 
+def _verify_audit_integrity(connection: sqlite3.Connection) -> None:
+    _precheck_audit_payload_lengths(connection)
+    rows = connection.execute(
+        """
+        SELECT seq, ts, actor, action, entry_id, detail_hash
+        FROM audit_log
+        ORDER BY seq
+        """
+    )
+    for row in rows:
+        sequence = int(row["seq"])
+        try:
+            actor = str(row["actor"])
+            _require_equal(
+                normalize_actor(actor),
+                actor,
+                "actor is not normalized",
+            )
+            _validate_datetime_field(row["ts"], "ts", optional=False)
+            AuditAction(str(row["action"]))
+            if row["entry_id"] is not None:
+                entry_id = str(row["entry_id"])
+                _require_equal(
+                    normalize_entry_id(entry_id),
+                    entry_id,
+                    "entry_id is not normalized",
+                )
+            if row["detail_hash"] is not None:
+                detail_hash = str(row["detail_hash"])
+                _require_equal(
+                    normalize_sha256_hex(detail_hash, "detail_hash"),
+                    detail_hash,
+                    "detail_hash is not normalized",
+                )
+        except (StoreValidationError, TypeError, ValueError) as exc:
+            raise DatabaseError(
+                f"Audit record violates content invariant at sequence {sequence}: {exc}"
+            ) from exc
+
+
 def _verify_supersession_integrity(connection: sqlite3.Connection) -> None:
+    _precheck_supersession_payload_lengths(connection)
     rows = connection.execute(
         "SELECT id, kind, scope, status, promotion_state, source_type, supersedes, "
         "canonical_key, claim_key "
         "FROM entries ORDER BY id"
-    ).fetchall()
-    rows_by_id = {str(row["id"]): row for row in rows}
+    )
+    rows_by_id: dict[str, _SupersessionNode] = {}
     json_edges: dict[str, str] = {}
     for row in rows:
         entry_id = str(row["id"])
+        rows_by_id[entry_id] = _SupersessionNode(
+            kind=str(row["kind"]),
+            scope=str(row["scope"]),
+            status=str(row["status"]),
+            promotion_state=str(row["promotion_state"]),
+            source_type=str(row["source_type"]),
+            canonical_key=str(row["canonical_key"]),
+            claim_key=None if row["claim_key"] is None else str(row["claim_key"]),
+            claim_key_present=True,
+        )
         try:
             decoded = json.loads(str(row["supersedes"]))
         except json.JSONDecodeError as exc:
@@ -1675,25 +2571,40 @@ def _verify_supersession_integrity(connection: sqlite3.Connection) -> None:
             json_edges[old_id] = entry_id
     relation_rows = connection.execute(
         """
-        SELECT old_entry_id, new_entry_id
+        SELECT old_entry_id, new_entry_id, recorded_at, actor
         FROM entry_supersessions
         ORDER BY old_entry_id, new_entry_id
         """
-    ).fetchall()
-    relation_edges = {str(row["old_entry_id"]): str(row["new_entry_id"]) for row in relation_rows}
+    )
+    relation_edges: dict[str, str] = {}
+    for row in relation_rows:
+        old_id = str(row["old_entry_id"])
+        try:
+            actor = str(row["actor"])
+            _require_equal(
+                normalize_actor(actor),
+                actor,
+                "actor is not normalized",
+            )
+            _validate_datetime_field(row["recorded_at"], "recorded_at", optional=False)
+        except (StoreValidationError, TypeError, ValueError) as exc:
+            raise DatabaseError(
+                f"Supersession metadata violates content invariant for entry {old_id}: {exc}"
+            ) from exc
+        relation_edges[old_id] = str(row["new_entry_id"])
     if json_edges != relation_edges:
         raise DatabaseError("Supersession relation and legacy JSON are inconsistent")
     _verify_edge_graph(rows_by_id, relation_edges, context="Database")
 
 
 def _verify_edge_graph(  # noqa: C901, PLR0912
-    rows_by_id: dict[str, sqlite3.Row],
+    rows_by_id: dict[str, _SupersessionNode],
     edges: dict[str, str],
     *,
     context: str,
 ) -> None:
     for entry_id, row in rows_by_id.items():
-        if str(row["status"]) == "superseded" and entry_id not in edges:
+        if row.status == "superseded" and entry_id not in edges:
             raise DatabaseError(
                 f"{context} contains a superseded entry without replacement: {entry_id}"
             )
@@ -1702,45 +2613,36 @@ def _verify_edge_graph(  # noqa: C901, PLR0912
         new = rows_by_id.get(new_id)
         if old is None or new is None:
             raise DatabaseError(f"{context} contains a dangling supersession: {old_id}")
-        if str(old["kind"]) != str(new["kind"]) or str(old["scope"]) != str(new["scope"]):
+        if old.kind != new.kind or old.scope != new.scope:
             raise DatabaseError(
                 f"{context} contains a cross-kind or cross-scope supersession: {old_id}"
             )
-        if str(old["status"]) not in {"superseded", "expired"}:
+        if old.status not in {"superseded", "expired"}:
             raise DatabaseError(f"{context} contains a non-terminal superseded entry: {old_id}")
         if not (
-            str(new["promotion_state"]) in {"approved", "promoted"}
-            and str(new["source_type"]) in {"human", "tool_verified"}
+            new.promotion_state in {"approved", "promoted"}
+            and new.source_type in {"human", "tool_verified"}
         ):
             raise DatabaseError(f"{context} contains an untrusted replacement: {new_id}")
-        if str(old["promotion_state"]) == "candidate":
-            old_key_name = (
-                "canonical_key"
-                if "canonical_key" in old.keys()  # noqa: SIM118
-                else "idempotency_key"
-            )
-            new_key_name = (
-                "canonical_key"
-                if "canonical_key" in new.keys()  # noqa: SIM118
-                else "idempotency_key"
-            )
-            if str(old[old_key_name]) != str(new[new_key_name]):
+        if old.promotion_state == "candidate":
+            if old.canonical_key != new.canonical_key:
                 raise DatabaseError(
                     f"{context} contains a cross-canonical candidate merge: {old_id}"
                 )
-        elif (
-            "claim_key" in old.keys()  # noqa: SIM118
-            and old["claim_key"] != new["claim_key"]
-        ):
+        elif old.claim_key_present and old.claim_key != new.claim_key:
             raise DatabaseError(f"{context} contains a cross-claim supersession: {old_id}")
+    checked: set[str] = set()
     for start in edges:
-        seen: set[str] = set()
+        if start in checked:
+            continue
+        path: set[str] = set()
         current = start
-        while current in edges:
-            if current in seen:
+        while current in edges and current not in checked:
+            if current in path:
                 raise DatabaseError(f"{context} contains a supersession cycle at entry: {current}")
-            seen.add(current)
+            path.add(current)
             current = edges[current]
+        checked.update(path)
 
 
 def _ensure_version_table(connection: sqlite3.Connection) -> None:
@@ -1755,7 +2657,22 @@ def _ensure_version_table(connection: sqlite3.Connection) -> None:
 
 
 def _schema_version(connection: sqlite3.Connection) -> int:
-    row = connection.execute("SELECT version FROM schema_version").fetchone()
-    if row is None:
-        raise DatabaseError("schema_version is empty")
-    return int(row[0])
+    row = connection.execute(
+        """
+        SELECT
+            COUNT(*) AS row_count,
+            SUM(CASE WHEN typeof(version) = 'integer' THEN 1 ELSE 0 END)
+                AS integer_count,
+            MIN(CASE WHEN typeof(version) = 'integer' THEN version END)
+                AS valid_version
+        FROM schema_version
+        """
+    ).fetchone()
+    if row is None or int(row[0]) != 1:
+        raise DatabaseError("schema_version must contain exactly one row")
+    if int(row[1]) != 1:
+        raise DatabaseError("schema_version must contain one non-negative integer")
+    value = row[2]
+    if type(value) is not int or value < 0:
+        raise DatabaseError("schema_version must contain one non-negative integer")
+    return value
