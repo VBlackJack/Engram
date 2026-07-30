@@ -2,6 +2,9 @@
 
 [Francais](spec.md) | [English](../en/spec.md)
 
+> **Document de reference :** utile pour implementer ou auditer un client. Pour l'usage courant,
+> lire le [guide utilisateur](user-guide.md).
+
 Ce document decrit le contrat persistant d'Engram. Les champs de confiance et de provenance sont
 des decisions du serveur, pas des affirmations libres du client.
 
@@ -97,11 +100,11 @@ perimees ne peuvent donc pas bloquer la reprise. Le listing par statut utilise u
 migree en mode SQLite read-only ; il reste disponible pendant le fonctionnement du daemon.
 
 Le contrat d'erreur CLI reserve le code `2` a l'usage/configuration, `3` aux ressources locales
-indisponibles, `4` aux pannes de transport Datacron, `5` a la contention transitoire du store, `6` a
-un rapport apply contenant des propositions failed ou stale et `130` a une interruption operateur
-propagee a la CLI. Les erreurs connues omettent les tracebacks, sauf si le flag global `--debug` ou
-`ENGRAM_DEBUG=1` est actif. La disponibilite du port est verifiee avant l'ouverture de SQLite ou du
-verrou de processus.
+indisponibles, `4` aux dependances externes indisponibles (transport Datacron ou endpoint
+d'embeddings), `5` a la contention transitoire du store, `6` a un rapport apply contenant des
+propositions failed ou stale et `130` a une interruption operateur propagee a la CLI. Les erreurs
+connues omettent les tracebacks, sauf si le flag global `--debug` ou `ENGRAM_DEBUG=1` est actif. La
+disponibilite du port est verifiee avant l'ouverture de SQLite ou du verrou de processus.
 
 ## Idempotence
 

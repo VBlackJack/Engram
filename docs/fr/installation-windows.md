@@ -2,6 +2,10 @@
 
 [Francais](installation-windows.md) | [English](../en/installation-windows.md)
 
+> **Utilisez cette page uniquement si** le controle SQLite du
+> [demarrage rapide](quick-start.md) affiche une version inferieure a `3.51.3`.<br>
+> **Verifie le :** 2026-07-30.
+
 ## Pourquoi ce prerequis est dur
 
 Engram utilise SQLite en mode WAL. SQLite documente un bug de corruption WAL-reset dans les
@@ -16,13 +20,13 @@ Cette methode ne modifie pas un runtime existant :
 
 ```powershell
 uv python install 3.14.3
-uv sync --extra dev --python 3.14.3
+uv sync --python 3.14.3
 uv run --python 3.14.3 python -c "import sys, sqlite3; print(sys.executable); print(sqlite3.sqlite_version)"
 ```
 
 La commande doit afficher une version SQLite au moins egale a `3.51.3` (le build teste pour cette
-release affiche `3.53.3`). Utiliser le meme `--python 3.14.3` pour `serve`, les tests et les autres
-commandes.
+release affiche `3.53.3`). Utiliser le meme `--python 3.14.3` pour `serve` et les autres commandes.
+Les contributeurs installent separement `--extra dev` avant les tests.
 
 ## Methode DLL SQLite 3.53.x
 
@@ -51,16 +55,13 @@ DLL `sqlite3.dll` separee. Ne jamais remplacer un fichier pendant qu'un processu
    python -c "import sqlite3; print(sqlite3.sqlite_version); assert sqlite3.sqlite_version_info >= (3, 51, 3)"
    ```
 
-7. Lancer le guard reel avec une configuration locale :
-
-   ```powershell
-   Copy-Item engram.example.toml engram.toml
-   uv run --python 3.14.3 engram reindex
-   ```
-
 Si Python ne demarre plus ou charge toujours l'ancienne version, restaurer la sauvegarde et utiliser
 le runtime `uv` recommande. Certains builds lient SQLite statiquement : la DLL ne peut alors pas
 les mettre a niveau ; il faut remplacer le runtime.
+
+La commande Python de l'etape 6 est le controle sans mutation. `engram reindex` est une operation de
+maintenance qui exige l'arret du daemon ; utilisez-la uniquement depuis le
+[guide operateur](operator-guide.md#reindexer-engram).
 
 ## Serveur HTTP
 

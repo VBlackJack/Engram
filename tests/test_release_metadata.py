@@ -31,9 +31,12 @@ def test_documentation_trees_are_mirrored() -> None:
     assert french == {
         "architecture.md",
         "client-protocol.md",
+        "datacron-cortex.md",
         "faq.md",
         "index.md",
         "installation-windows.md",
+        "operator-guide.md",
+        "quick-start.md",
         "security.md",
         "setup.md",
         "spec.md",

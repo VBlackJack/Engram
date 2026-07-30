@@ -2,6 +2,9 @@
 
 [Francais](../fr/security.md) | [English](security.md)
 
+> **Reference document:** to start, remember only that the server stays local, `own_pending` is
+> untrusted, and human review precedes every promotion. See the [user guide](user-guide.md).
+
 ## Trust boundary
 
 The MCP client is untrusted for provenance. `remember` accepts neither `source_type`,

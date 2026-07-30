@@ -2,11 +2,24 @@
 
 [Francais](client-protocol.md) | [English](../en/client-protocol.md)
 
+> **Objectif :** apprendre au client quand appeler Engram.<br>
+> **A faire :** copier le [bloc pret a coller](#texte-dinstruction-pret-a-coller), puis revenir au
+> [guide utilisateur](user-guide.md).<br>
+> **Temps :** 2 minutes.
+
 ## Pourquoi ce protocole existe
 
 MCP transmet des appels d'outils ; Engram ne voit pas passivement la conversation, les fichiers
 ouverts ou la fin d'une session. Chaque client doit donc decider quand rappeler et quand proposer
 un souvenir. Ce contrat rend ce comportement identique dans Claude, Codex et Gemini.
+
+Exemple minimal de debut de tache :
+
+```text
+recall
+query = "nom-du-projet tache sujets-utiles"
+scope = "project/nom-du-projet"
+```
 
 ## Les trois moments
 
@@ -23,7 +36,9 @@ preference confirmee, fait verifie ou changement d'etat. Choisir le kind et des 
 stables. Ne pas enregistrer les raisonnements intermediaires, suppositions, secrets, transcripts,
 sorties volumineuses ou faits deja presents.
 
-## Rappel incomplet
+## Reference : rappel incomplet
+
+Vous pouvez ignorer cette table tant que `notes.recall_complete` vaut `true`.
 
 Toujours inspecter `notes.recall_complete`. S'il vaut `false`, ne pas conclure qu'un souvenir absent
 n'existe pas. `notes.warnings` contient des codes stables et bornes :
@@ -51,6 +66,16 @@ Quand l'etat a change de maniere utile pour la prochaine session, appeler `remem
 `project_state` concis : ce qui est termine, l'etat actuel, le blocage confirme eventuel et la
 prochaine action concrete. Ajouter un `episode` uniquement si l'evenement lui-meme aura une valeur
 a court terme.
+
+Exemple minimal :
+
+```text
+remember
+statement = "Termine: X. Etat: Y. Blocage: aucun. Prochaine action: Z."
+kind = "project_state"
+scope = "project/nom-du-projet"
+subject_keys = ["project:nom-du-projet"]
+```
 
 ## Texte d'instruction pret a coller
 

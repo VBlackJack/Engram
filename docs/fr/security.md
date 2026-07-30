@@ -2,6 +2,10 @@
 
 [Francais](security.md) | [English](../en/security.md)
 
+> **Document de reference :** pour demarrer, retenez seulement que le serveur reste local, que
+> `own_pending` n'est pas fiable et qu'une revue humaine precede toute promotion. Voir le
+> [guide utilisateur](user-guide.md).
+
 ## Frontiere de confiance
 
 Le client MCP est non fiable pour la provenance. `remember` n'accepte ni `source_type`, ni

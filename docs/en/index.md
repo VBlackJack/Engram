@@ -2,35 +2,51 @@
 
 [Francais](../fr/index.md) | [English](index.md)
 
-Engram is the local operational memory in the Datacron, Cortex, Engram trilogy. This hub points to
-the shortest path for each need.
+Engram is the local operational memory in the Datacron, Cortex, and Engram trilogy.
 
-## Start
+## I want to...
 
-| Guide | Contents |
+| Goal | Open |
 | --- | --- |
-| [Setup](setup.md) | Installation, configuration, and Claude, Codex, Gemini connections |
-| [Windows and SQLite](installation-windows.md) | SQLite DLL upgrade and verification |
-| [User guide](user-guide.md) | Daily use, reindexing, evaluation, and consolidation |
-| [Client protocol](client-protocol.md) | Ready-to-paste session instructions |
+| Start Engram without reading everything | [Five-minute quick start](quick-start.md) |
+| Use `recall` and `remember` every day | [User guide](user-guide.md) |
+| Choose between Engram, Datacron, and Cortex | [Trilogy guide](datacron-cortex.md) |
+| Connect Claude, Codex, or Gemini | [Setup](setup.md) |
+| Install automatic client behavior | [Client protocol](client-protocol.md) |
+| Attest, migrate, reindex, or consolidate | [Operator guide](operator-guide.md) |
+| Fix a specific symptom | [FAQ](faq.md) |
 
-## Understand
+If you do not know which one to choose, open only the
+[five-minute quick start](quick-start.md).
+
+## Short path
+
+```text
+Five-minute quick start
+  -> User guide
+  -> Engram / Datacron / Cortex guide
+```
+
+The [operator guide](operator-guide.md) is needed only to change trust, the database, or the
+Datacron vault.
+
+## Technical references
+
+These pages help readers understand or audit the product. They are not required to start.
 
 | Reference | Contents |
 | --- | --- |
-| [Data contract](spec.md) | Kinds, fields, provenance, lifecycle, TTL, and freshness |
+| [Data contract](spec.md) | Types, fields, provenance, lifecycle, TTL, and freshness |
 | [Architecture](architecture.md) | SQLite, HTTP MCP, retrieval, capsule, and Datacron gateway |
-| [README](../../README.en.md) | Overview, commands, and configuration |
+| [Security](security.md) | Trust boundaries, quarantine, and confinement |
+| [Windows and SQLite](installation-windows.md) | SQLite runtime upgrade |
+| [README](../../README.en.md) | Overview and release reference |
 | [Changelog](../../CHANGELOG.md) | CalVer release history |
-
-## Security
-
-| Guide | Contents |
-| --- | --- |
-| [Security model](security.md) | Trust boundaries, quarantine, and confinement |
-| [FAQ](faq.md) | Symptom-based diagnostics and corrective actions |
 | [Third-party notices](../../THIRD_PARTY_NOTICES.md) | Dependencies and licenses |
 
-Start with [setup.md](setup.md), then install the [client protocol](client-protocol.md) in every
-connected client. Without this protocol the MCP transport works, but Engram cannot know when to
-capture or recall context.
+## Reading rule
+
+- Follow one procedure at a time.
+- Stop at the first missing **Expected result**.
+- Use the FAQ before changing several settings.
+- Never run an operator command on an existing database without a backup.

@@ -2,6 +2,9 @@
 
 [Francais](../fr/spec.md) | [English](spec.md)
 
+> **Reference document:** useful when implementing or auditing a client. For daily use, read the
+> [user guide](user-guide.md).
+
 This document defines Engram's persistent contract. Trust and provenance fields are server
 decisions, not free-form client claims.
 
@@ -94,10 +97,11 @@ coordination file is not ownership, so stale PID metadata cannot block recovery.
 an existing migrated database in SQLite read-only mode and remains available while the daemon runs.
 
 The CLI error contract reserves exit code `2` for usage/configuration, `3` for unavailable local
-resources, `4` for Datacron transport failures, `5` for transient store contention, `6` for an
-apply report containing failed or stale propositions, and `130` for an operator interruption
-propagated to the CLI. Known failures omit tracebacks unless the global `--debug` flag or
-`ENGRAM_DEBUG=1` is active. Port availability is checked before SQLite or the process lock is opened.
+resources, `4` for unavailable external dependencies (Datacron transport or the embedding
+endpoint), `5` for transient store contention, `6` for an apply report containing failed or stale
+propositions, and `130` for an operator interruption propagated to the CLI. Known failures omit
+tracebacks unless the global `--debug` flag or `ENGRAM_DEBUG=1` is active. Port availability is
+checked before SQLite or the process lock is opened.
 
 ## Idempotency
 

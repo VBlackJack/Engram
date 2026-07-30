@@ -2,11 +2,24 @@
 
 [Francais](../fr/client-protocol.md) | [English](client-protocol.md)
 
+> **Goal:** teach the client when to call Engram.<br>
+> **Action:** copy the [ready-to-paste block](#ready-to-paste-instruction), then return to the
+> [user guide](user-guide.md).<br>
+> **Time:** 2 minutes.
+
 ## Why this protocol exists
 
 MCP carries tool calls; Engram cannot passively observe the conversation, open files, or the end of
 a session. Each client must decide when to recall and when to propose a memory. This contract keeps
 that behavior consistent across Claude, Codex, and Gemini.
+
+Minimal start-of-task example:
+
+```text
+recall
+query = "project-name task relevant-subjects"
+scope = "project/project-name"
+```
 
 ## The three moments
 
@@ -22,7 +35,9 @@ Call `remember` only after durable, explicit information: a decision, correction
 preference, verified fact, or state change. Choose the kind and stable `subject_keys`. Do not store
 intermediate reasoning, assumptions, secrets, transcripts, large outputs, or facts already present.
 
-## Incomplete recall
+## Reference: incomplete recall
+
+You can skip this table while `notes.recall_complete` is `true`.
 
 Always inspect `notes.recall_complete`. When it is `false`, do not infer that an absent memory does
 not exist. `notes.warnings` contains stable, bounded codes:
@@ -49,6 +64,16 @@ not exist. `notes.warnings` contains stable, bounded codes:
 When state changed in a way useful to the next session, call `remember` with a concise
 `project_state`: completed work, current state, any confirmed blocker, and the next concrete action.
 Add an `episode` only when the event itself has short-term future value.
+
+Minimal example:
+
+```text
+remember
+statement = "Completed: X. State: Y. Blocker: none. Next action: Z."
+kind = "project_state"
+scope = "project/project-name"
+subject_keys = ["project:project-name"]
+```
 
 ## Ready-to-paste instruction
 

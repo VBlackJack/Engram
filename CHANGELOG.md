@@ -7,6 +7,16 @@ project uses date-derived CalVer releases in the form `YYYY.MMDD.NN`.
 
 ## [Unreleased]
 
+### Added
+
+- Add task-oriented French and English quick-start, operator, and
+  Engram-Datacron-Cortex guides, with short ADHD-friendly paths and expected results.
+
+### Changed
+
+- Separate daily memory use from privileged maintenance, route both READMEs through goal-based
+  documentation, and clarify that Cortex synchronization is explicit rather than automatic.
+
 ## [2026.0730.02] - 2026-07-30
 
 ### Added

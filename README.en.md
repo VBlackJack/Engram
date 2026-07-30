@@ -15,6 +15,18 @@ ranked by trust. In the trilogy, **Datacron** is the durable Markdown notebook a
 **Cortex** is the librarian for broad documentation, and **Engram** is the hippocampus: it keeps
 operational memory across clients and proposes reviewed consolidation into Datacron.
 
+## Choose your path
+
+| I want to... | Guide |
+| --- | --- |
+| Start Engram now | [Five-minute quick start](docs/en/quick-start.md) |
+| Use memory every day | [User guide](docs/en/user-guide.md) |
+| Understand Engram, Datacron, and Cortex | [Trilogy guide](docs/en/datacron-cortex.md) |
+| Administer, migrate, or consolidate | [Operator guide](docs/en/operator-guide.md) |
+
+The rest of this README is a release reference. You do not need to read it all before starting.
+Documentation verified with Engram `2026.0730.02` on 2026-07-30.
+
 ## What is in place
 
 | Capability | Status |
@@ -33,6 +45,7 @@ operational memory across clients and proposes reviewed consolidation into Datac
 
 Requirements:
 
+- Git for source installation;
 - Python 3.13 or newer;
 - `uv` 0.11.3 or newer recommended;
 - **SQLite 3.51.3 or newer in the Python runtime**.
@@ -46,13 +59,15 @@ the [3.53.3 binaries](https://www.sqlite.org/download.html).
 ```powershell
 git clone https://github.com/VBlackJack/Engram.git
 cd Engram
-uv sync --extra dev --python 3.14.3
+uv sync --python 3.14.3
 uv run --python 3.14.3 python -c "import sqlite3; print(sqlite3.sqlite_version)"
-Copy-Item engram.example.toml engram.toml
+if (Test-Path -LiteralPath "engram.toml") { throw "Existing Engram configuration: stop" }
+if (Test-Path -LiteralPath "engram.db") { throw "Existing Engram database: stop" }
+Copy-Item engram.example.toml engram.toml -ErrorAction Stop
 ```
 
-The PyPI package is not published in this release. Install from source or from the wheel/sdist
-attached to the GitHub release.
+The PyPI package is not published. Before this GitHub release is published, use the current source
+checkout; after publication, the wheel/sdist attached to the release can also be used.
 
 ## Quick start
 
@@ -162,9 +177,9 @@ incompatible historical data without truncating it.
 
 Known CLI failures never print a traceback by default. Exit code `2` means usage or configuration,
 `3` means a local resource is unavailable (port, process lock, database, or SQLite runtime), `4`
-means Datacron could not be reached, `5` means transient store contention, and `6` means an apply
-report contains failed or stale propositions. Use global `--debug` before the command, or
-`ENGRAM_DEBUG=1`, only when a traceback is needed.
+means an external dependency is unavailable (Datacron or the embedding endpoint), `5` means
+transient store contention, and `6` means an apply report contains failed or stale propositions.
+Use global `--debug` before the command, or `ENGRAM_DEBUG=1`, only when a traceback is needed.
 
 ## Current limitations
 
@@ -173,8 +188,9 @@ report contains failed or stale propositions. Use global `--debug` before the co
 - The transport is local HTTP. Claude Desktop remote connectors require a public HTTPS URL;
   Claude Code connects directly to localhost.
 - Hybrid mode is experimental and depends on a local OpenAI-compatible endpoint. It explicitly
-  falls back to FTS when unavailable or when the bounded exact vector scan exceeds its configured
-  candidate cap.
+  falls back to FTS when the provider is unavailable or returns an invalid vector, or when the
+  exact scan exceeds fixed candidate, dimension, or byte budgets. Incomplete vector coverage marks
+  recall incomplete.
 - PyPI publication and MCP Registry submission are deferred. The manifest describes the package
   and its local HTTP endpoint.
 - FTS remains lexical: bounded fallbacks handle noise, term order, and controlled prefixes, but
@@ -183,11 +199,11 @@ report contains failed or stale propositions. Use global `--debug` before the co
 
 ## Documentation
 
-| Start | Understand | Operate safely |
+| Start | Use | Operate safely |
 | --- | --- | --- |
-| [Installation](docs/en/setup.md) | [Data contract](docs/en/spec.md) | [Security](docs/en/security.md) |
-| [Windows and SQLite](docs/en/installation-windows.md) | [Architecture](docs/en/architecture.md) | [FAQ](docs/en/faq.md) |
-| [User guide](docs/en/user-guide.md) | [Client protocol](docs/en/client-protocol.md) | [Documentation hub](docs/en/index.md) |
+| [Five-minute path](docs/en/quick-start.md) | [User guide](docs/en/user-guide.md) | [Operator guide](docs/en/operator-guide.md) |
+| [Installation](docs/en/setup.md) | [Engram, Datacron, and Cortex](docs/en/datacron-cortex.md) | [Security](docs/en/security.md) |
+| [Client protocol](docs/en/client-protocol.md) | [Architecture](docs/en/architecture.md) | [FAQ and hub](docs/en/index.md) |
 
 ## Development
 

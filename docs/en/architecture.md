@@ -2,6 +2,14 @@
 
 [Francais](../fr/architecture.md) | [English](architecture.md)
 
+> **Reference document:** not required to start. Use the
+> [quick start](quick-start.md) or the
+> [Engram-Datacron-Cortex diagram](datacron-cortex.md) for a short path.
+
+In five points: Engram is a stateful local HTTP server, SQLite is canonical, one process writes,
+search indexes are derived, and every Datacron consolidation remains reviewed. Cortex is not an
+internal Engram component.
+
 ## Overview
 
 ```text
@@ -98,6 +106,11 @@ quarantined entry cannot enter `current`.
 
 The gateway talks to the Datacron server over stdio MCP and enforces configured allowlists. The
 flow is deliberately split:
+
+The Datacron subprocess lives in a non-daemon owner thread. `startup_timeout_ms`,
+`request_timeout_ms`, and `shutdown_timeout_ms` bound each boundary. On close, the transport closes
+stdin and then terminates the process tree through a Windows Job Object or a POSIX process group; a
+timeout poisons the session and forbids implicit replay.
 
 1. `--plan` rereads the canonical path, searches several neighboring-section variants, classifies
    create/link/skip, anchors an immutable SQLite snapshot, and writes JSON + Markdown;

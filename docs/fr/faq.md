@@ -2,6 +2,13 @@
 
 [Francais](faq.md) | [English](../en/faq.md)
 
+Acces rapide :
+
+- [Le client ne se connecte pas](#le-client-ne-se-connecte-pas)
+- [Le candidat reste dans own_pending](#le-candidat-est-dans-own_pending-pas-dans-current)
+- [La consolidation dit stale](#la-consolidation-dit-stale)
+- [Cortex ne voit pas une note recente](#cortex-ne-voit-pas-une-note-datacron-recente)
+
 ## `Configuration file does not exist`
 
 Copier `engram.example.toml` vers `engram.toml`, ou definir `ENGRAM_CONFIG` avec un chemin absolu.
@@ -75,3 +82,20 @@ rapport JSON/Markdown sous `local/consolidation`, puis refaire une revue.
 
 Lire `notes.why_returned`. Si une note indique des omissions budget, demander un `token_budget` plus
 grand, dans les bornes `[capsule]`, ou preciser `scope`, `kinds` et `query`.
+
+## Cortex ne voit pas une note Datacron recente
+
+Cortex n'a pas de watcher et Datacron ne l'appelle pas. Lancez :
+
+```powershell
+cortex sync
+```
+
+Puis verifiez `cortex_freshness` depuis le client MCP. La note Datacron reste canonique pendant que
+l'index Cortex est en retard. Voir le [guide de la trilogie](datacron-cortex.md).
+
+## La CLI renvoie le code `4`
+
+Une dependance externe est indisponible : Datacron pendant une consolidation, ou l'endpoint
+d'embeddings pendant une operation hybride. Relancez avec le flag global `--debug` uniquement
+apres avoir verifie la configuration et la disponibilite de la dependance concernee.

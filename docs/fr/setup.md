@@ -2,56 +2,72 @@
 
 [Francais](setup.md) | [English](../en/setup.md)
 
+> **Objectif :** installer Engram et connecter un seul client MCP.<br>
+> **Temps :** 10 a 20 minutes.<br>
+> **Resultat :** le client affiche `recall` et `remember`.<br>
+> **Verifie avec :** Engram `2026.0730.02`, le 2026-07-30.
+
 ## 1. Installer Engram
 
-Engram exige Python 3.13+ et SQLite 3.51.3+ dans le module `sqlite3` de ce Python. Installer avec le
-runtime Python 3.14.3 gere par `uv`, puis verifier SQLite : un build Python peut encore embarquer
-une bibliotheque plus ancienne. La CI remplace explicitement celle-ci par SQLite officiel 3.53.3.
+Engram exige Git, `uv`, Python 3.13+ et SQLite 3.51.3+ dans le module `sqlite3` de ce Python.
+
+```powershell
+git --version
+uv --version
+```
+
+**Resultat attendu :** les deux commandes affichent une version. Sinon, installez
+[Git](https://git-scm.com/downloads) ou
+[`uv`](https://docs.astral.sh/uv/getting-started/installation/).
 
 ```powershell
 git clone https://github.com/VBlackJack/Engram.git
 Set-Location Engram
-uv sync --extra dev --python 3.14.3
+uv sync --python 3.14.3
 uv run --python 3.14.3 python -c "import sqlite3; print(sqlite3.sqlite_version)"
-Copy-Item engram.example.toml engram.toml
+if (Test-Path -LiteralPath "engram.toml") { throw "Existing Engram configuration: stop" }
+if (Test-Path -LiteralPath "engram.db") { throw "Existing Engram database: stop" }
+Copy-Item engram.example.toml engram.toml -ErrorAction Stop
 ```
 
-Si la version affichee est inferieure a `3.51.3`, suivre
-[installation-windows.md](installation-windows.md) ou choisir un runtime Python plus recent.
+**Resultat attendu :** SQLite affiche `3.51.3` ou plus recent et `engram.toml` existe.
+
+Si la version est trop ancienne, arretez-vous et suivez
+[Windows et SQLite](installation-windows.md). Un `sqlite3.exe` recent dans le PATH ne remplace pas
+la bibliotheque chargee par Python.
 
 ## 2. Configurer et lancer
 
-Editer `engram.toml`. Le serveur accepte uniquement des literals IP loopback (`127.0.0.1` ou
-`::1`), conserve la base dans `engram.db`, utilise FTS et desactive les ecritures Datacron par
-defaut.
+Avec une nouvelle installation, les valeurs sures de `engram.example.toml` suffisent :
 
-Pour mettre a niveau une configuration existante, ajuster les limites capsule avant de
-redemarrer :
+- endpoint IP loopback `127.0.0.1:8377/mcp` ;
+- base locale `engram.db` ;
+- retrieval FTS ;
+- ecritures Datacron desactivees.
 
-```toml
-[capsule]
-default_token_budget = 4800
-min_token_budget = 1200
-max_token_budget = 6000
-```
+> **STOP reprise :** si vous mettez a niveau ou reutilisez une base anterieure, ne lancez pas la
+> commande suivante. Le `engram.toml` neuf cree a l'etape 1 est normal. Pour une ancienne base,
+> sauvegardez puis suivez
+> [Migrer une base existante](operator-guide.md#migrer-une-base-existante).
 
-Le minimum doit valoir au moins 1200 et le maximum doit etre superieur ou egal au budget par
-defaut. Engram refuse au demarrage les anciennes limites plus petites, car elles ne peuvent pas
-contenir l'enveloppe de reponse bornee obligatoire.
+Pour une nouvelle base uniquement, lancez :
 
 ```powershell
 uv run --python 3.14.3 engram serve
 ```
 
-L'endpoint est `http://127.0.0.1:8377/mcp`. Un seul processus Engram doit utiliser cette base comme
-writer. Tester la connexion avec un client MCP, pas avec un navigateur : l'endpoint parle le
-protocole MCP Streamable HTTP.
+**Resultat attendu :** le processus reste actif sans erreur. Gardez ce terminal ouvert.
 
-## 3. Brancher Claude
+Un seul processus Engram doit ecrire cette base. Testez avec un client MCP, pas avec un navigateur.
 
-### Claude Code
+## 3. Choisir un seul client
 
-La commande officielle accepte le transport HTTP :
+Les options suivantes sont independantes. Configurez-en une, puis passez directement a la
+[verification](#4-verification-fonctionnelle).
+
+### Option A : Claude
+
+#### Claude Code
 
 ```powershell
 claude mcp add --transport http engram http://127.0.0.1:8377/mcp --scope user
@@ -71,25 +87,27 @@ Equivalent dans un `.mcp.json` de projet :
 }
 ```
 
-Ajouter le texte de [client-protocol.md](client-protocol.md) aux instructions utilisateur de
-Claude Code, ou dans un `CLAUDE.md` local non commite. La syntaxe est documentee dans le
+Ajoutez le [protocole client](client-protocol.md) aux instructions utilisateur de Claude Code ou
+dans un `CLAUDE.md` local non commite.
+
+**Resultat attendu :** `claude mcp list` affiche `engram` connecte. Reference :
 [guide MCP Claude Code](https://code.claude.com/docs/en/mcp).
 
-### Claude Desktop
+#### Claude Desktop
 
-Claude Desktop configure les serveurs HTTP distants dans **Settings > Connectors > Add custom
-connector**. Ce connecteur est resolu par l'infrastructure distante de Claude : `127.0.0.1` sur
-votre PC n'est donc pas joignable. Pour Desktop, publier Engram derriere un proxy HTTPS
-authentifie (tunnel prive/VPN avec controle d'acces), puis enregistrer
-`https://engram.example/mcp`. Le fichier historique `claude_desktop_config.json` n'est pas le
-mecanisme des connecteurs distants. Voir le
-[guide des connecteurs MCP distants](https://support.claude.com/en/articles/11503834-build-custom-connectors-via-remote-mcp-servers).
+Claude Desktop resout ses connecteurs HTTP depuis une infrastructure distante : `127.0.0.1` sur
+votre PC n'est pas joignable. Pour Desktop, placez Engram derriere un proxy HTTPS authentifie, puis
+ajoutez cette URL dans **Settings > Connectors > Add custom connector**.
 
-Pour un usage strictement local, Claude Code est le chemin direct.
+Les extensions Desktop et les serveurs MCP locaux sont un mecanisme distinct. Engram ne livre pas
+encore d'extension Desktop ni de transport stdio ; pour cette release HTTP, choisissez Claude Code
+en local ou un connecteur distant securise. References :
+[connecteurs MCP distants](https://support.claude.com/en/articles/11175166-get-started-with-custom-connectors-using-remote-mcp) et
+[connecteurs Desktop ou web](https://support.claude.com/en/articles/11725091-when-to-use-desktop-and-web-connectors).
 
-## 4. Brancher Codex
+### Option B : Codex
 
-Ajouter le serveur dans `~/.codex/config.toml` :
+Ajoutez dans `~/.codex/config.toml` :
 
 ```toml
 [mcp_servers.engram]
@@ -100,12 +118,14 @@ startup_timeout_sec = 10
 tool_timeout_sec = 30
 ```
 
-Redemarrer Codex. Dans l'application desktop, l'equivalent se trouve dans **Settings > MCP
-servers > Add server > Streamable HTTP**. Ajouter le texte de
-[client-protocol.md](client-protocol.md) aux instructions utilisateur ou dans un `AGENTS.md` local
-approprie. La reference officielle est le [guide MCP Codex](https://developers.openai.com/codex/mcp/).
+Redemarrez Codex, puis ajoutez le [protocole client](client-protocol.md) aux instructions
+utilisateur ou a un `AGENTS.md` de portee adaptee.
 
-## 5. Brancher Gemini
+**Resultat attendu :** Codex voit `recall` et `remember` sous `engram`. Dans l'application desktop,
+le meme reglage se trouve dans **Settings > MCP servers > Add server > Streamable HTTP**.
+Reference : [guide MCP Codex](https://developers.openai.com/codex/mcp/).
+
+### Option C : Gemini
 
 Gemini CLI et Gemini Code Assist pour VS Code partagent `~/.gemini/settings.json` :
 
@@ -119,20 +139,25 @@ Gemini CLI et Gemini Code Assist pour VS Code partagent `~/.gemini/settings.json
 }
 ```
 
-Dans Gemini CLI, executer `/mcp`. Dans VS Code, recharger la fenetre si le serveur n'apparait pas.
-Placer le texte de [client-protocol.md](client-protocol.md) dans le `GEMINI.md` utilisateur ou de
-projet. Le mode agent Gemini Code Assist pour IntelliJ ne supporte pas actuellement ces outils MCP ;
-utiliser Gemini CLI ou VS Code. Voir la
-[documentation Gemini Code Assist](https://developers.google.com/gemini-code-assist/docs/use-agentic-chat-pair-programmer).
+Placez le [protocole client](client-protocol.md) dans le `GEMINI.md` utilisateur ou projet, puis
+executez `/mcp`. Rechargez VS Code si necessaire.
 
-## 6. Verification fonctionnelle
+**Resultat attendu :** `/mcp` affiche Engram et ses deux outils. Gemini Code Assist pour IntelliJ
+prend aussi en charge MCP, mais utilise un fichier `mcp.json` separe dans le dossier de
+configuration de l'IDE ; ne reutilisez pas automatiquement `~/.gemini/settings.json`.
+Reference : [documentation Gemini Code Assist](https://developers.google.com/gemini-code-assist/docs/use-agentic-chat-pair-programmer).
 
-Dans chaque client :
+## 4. Verification fonctionnelle
 
-1. appeler `recall` avec une requete de contexte et `scope="user"` ;
-2. appeler `remember` avec un fait de test non sensible ;
-3. rappeler la meme requete depuis le meme client et verifier `own_pending` ;
-4. rappeler depuis un autre client et verifier que ce candidat n'apparait pas dans son
-   `own_pending`.
+Dans le client choisi :
 
-Le candidat n'apparait pas dans `current` tant qu'il n'a pas suivi le chemin d'attestation.
+1. appelez `recall` avec une requete de contexte et `scope="user"` ;
+2. appelez `remember` avec un episode de test non sensible ;
+3. rappelez la meme requete depuis le meme client ;
+4. verifiez que le candidat apparait dans `own_pending`, pas dans `current`.
+
+Le candidat est volontairement en quarantaine. Un autre client ne doit pas le voir dans son propre
+`own_pending`.
+
+**Etape suivante :** suivez le [guide utilisateur](user-guide.md). Si un resultat manque, ouvrez
+la [FAQ](faq.md) avant de modifier plusieurs reglages.
