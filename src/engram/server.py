@@ -8,10 +8,11 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
-from typing import Annotated, Literal, cast
+from types import MappingProxyType
+from typing import Annotated, Any, Literal, cast
 
 import anyio
 from mcp.server.fastmcp import Context, FastMCP
@@ -20,7 +21,7 @@ from mcp.server.fastmcp.tools import Tool
 from mcp.server.fastmcp.utilities.func_metadata import ArgModelBase
 from mcp.server.session import ServerSession
 from mcp.types import AnyFunction, CallToolResult, TextContent, ToolAnnotations
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, field_validator
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
@@ -58,6 +59,14 @@ MAX_HTTP_BODY_CHUNKS = 256
 MAX_CLIENT_COMPONENT_CHARS = MAX_MCP_CLIENT_COMPONENT_CHARS
 ASCII_ZERO = ord("0")
 ASCII_NINE = ord("9")
+DEFINITIONS_KEY = "$defs"
+DEFINITIONS_POINTER = f"#/{DEFINITIONS_KEY}/"
+NULLABLE_VARIANTS = 2
+NULL_TYPE = "null"
+OBSERVED_AT_EXAMPLES = ("2026-07-31T14:05:00+02:00", "2026-07-31T12:05:00Z")
+EMPTY_SCHEMA_OVERRIDES: Mapping[str, Mapping[str, object]] = MappingProxyType({})
+REMEMBER_TOOL = "remember"
+RECALL_TOOL = "recall"
 LOGGER = logging.getLogger(__name__)
 ToolContext = Context[ServerSession, object, Request]
 McpLogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
@@ -82,14 +91,36 @@ class RememberArguments(ArgModelBase):
     model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid")
 
     statement: str = Field(min_length=1, max_length=HARD_MAX_STATEMENT_CHARS)
-    kind: EntryKind
+    kind: EntryKind = Field(description="Memory entry kind, restricted to the published values.")
     scope: str = Field(default="user", min_length=1, max_length=MAX_SCOPE_CHARS)
     subject_keys: list[SubjectKeyInput] = Field(
         default_factory=list,
         max_length=HARD_MAX_SUBJECT_KEYS,
     )
-    observed_at: datetime | None = None
-    evidence: list[EvidenceInput] = Field(default_factory=list, max_length=MAX_EVIDENCE_ITEMS)
+    observed_at: AwareDatetime | None = Field(
+        default=None,
+        description=(
+            "Instant the statement was observed, as an RFC 3339 date-time carrying "
+            "a mandatory UTC offset. A value without an offset is rejected."
+        ),
+        examples=list(OBSERVED_AT_EXAMPLES),
+    )
+    evidence: list[EvidenceInput] = Field(
+        default_factory=list,
+        max_length=MAX_EVIDENCE_ITEMS,
+        description=(
+            "Opaque evidence references. Every item is an object carrying a type and "
+            "a ref; a bare string is rejected."
+        ),
+    )
+
+    @field_validator("observed_at", mode="before")
+    @classmethod
+    def _reject_non_textual_instant(cls, value: object) -> object:
+        """Keep accepted instants aligned with the published string schema."""
+        if value is None or isinstance(value, str | datetime):
+            return value
+        raise ValueError("observed_at must be an RFC 3339 date-time carrying a UTC offset")
 
 
 class RecallArguments(ArgModelBase):
@@ -360,11 +391,12 @@ def create_mcp_server(
             structuredContent=capsule.model_dump(mode="json"),
         )
 
+    schemas = publish_tool_schemas(config)
     tools = [
         _strict_tool(
             remember,
             arguments_model=RememberArguments,
-            name="remember",
+            name=REMEMBER_TOOL,
             description=(
                 "Resolve a memory observation as a new candidate, retry, "
                 "corroboration, trusted match, or renewal."
@@ -375,16 +407,18 @@ def create_mcp_server(
                 idempotentHint=True,
                 openWorldHint=False,
             ),
+            parameters=schemas[REMEMBER_TOOL],
         ),
         _strict_tool(
             recall,
             arguments_model=RecallArguments,
-            name="recall",
+            name=RECALL_TOOL,
             description="Recall a compact trust-aware memory capsule.",
             annotations=ToolAnnotations(
                 readOnlyHint=True,
                 openWorldHint=False,
             ),
+            parameters=schemas[RECALL_TOOL],
         ),
     ]
     return EngramFastMCP(config, store, tools)
@@ -408,13 +442,14 @@ def _expire_due(config: AppConfig, store: EngramStore) -> int:
         return store.expire_due()
 
 
-def _strict_tool(
+def _strict_tool(  # noqa: PLR0913
     function: AnyFunction,
     *,
     arguments_model: type[ArgModelBase],
     name: str,
     description: str,
     annotations: ToolAnnotations,
+    parameters: dict[str, Any],
 ) -> Tool:
     tool = Tool.from_function(
         function,
@@ -425,8 +460,113 @@ def _strict_tool(
         structured_output=True,
     )
     tool.fn_metadata.arg_model = arguments_model
-    tool.parameters = arguments_model.model_json_schema()
+    tool.parameters = parameters
     return tool
+
+
+def publish_tool_schemas(config: AppConfig) -> dict[str, dict[str, Any]]:
+    """Return the exact argument schemas both tools publish under one configuration."""
+    return {
+        REMEMBER_TOOL: _publish_schema(RememberArguments, EMPTY_SCHEMA_OVERRIDES),
+        RECALL_TOOL: _publish_schema(RecallArguments, _recall_schema_overrides(config)),
+    }
+
+
+def _recall_schema_overrides(config: AppConfig) -> Mapping[str, Mapping[str, object]]:
+    """Publish the configured capsule budget bounds the server actually enforces."""
+    capsule = config.capsule
+    return {
+        "token_budget": {
+            "minimum": capsule.min_token_budget,
+            "maximum": capsule.max_token_budget,
+            "description": (
+                f"Serialized capsule byte budget. Omitting it selects "
+                f"{capsule.default_token_budget}; a value outside "
+                f"{capsule.min_token_budget}..{capsule.max_token_budget} is rejected."
+            ),
+        }
+    }
+
+
+def _publish_schema(
+    arguments_model: type[ArgModelBase],
+    overrides: Mapping[str, Mapping[str, object]],
+) -> dict[str, Any]:
+    """Render one argument model as a schema a client can read without dereferencing."""
+    schema: dict[str, Any] = arguments_model.model_json_schema()
+    definitions = schema.pop(DEFINITIONS_KEY, {})
+    if not isinstance(definitions, dict):
+        raise TypeError(f"{arguments_model.__name__} declares a non-object {DEFINITIONS_KEY}")
+    published = _inline_schema_refs(schema, definitions, ())
+    if not isinstance(published, dict):
+        raise TypeError(f"{arguments_model.__name__} does not publish an object schema")
+    properties = published.get("properties")
+    if not isinstance(properties, dict):
+        raise TypeError(f"{arguments_model.__name__} does not publish properties")
+    for property_name, override in overrides.items():
+        declared = properties.get(property_name)
+        if not isinstance(declared, dict):
+            raise ValueError(f"{arguments_model.__name__} has no property {property_name}")
+        properties[property_name] = {**declared, **override}
+    return published
+
+
+def _inline_schema_refs(
+    node: object,
+    definitions: Mapping[str, object],
+    visiting: tuple[str, ...],
+) -> object:
+    """Replace every local reference by its definition and reject a cyclic model."""
+    if isinstance(node, list):
+        return [_inline_schema_refs(item, definitions, visiting) for item in node]
+    if not isinstance(node, dict):
+        return node
+    reference = node.get("$ref")
+    if isinstance(reference, str):
+        return _inline_reference(reference, node, definitions, visiting)
+    resolved = {
+        key: _inline_schema_refs(value, definitions, visiting) for key, value in node.items()
+    }
+    return _flatten_nullable(resolved)
+
+
+def _inline_reference(
+    reference: str,
+    node: Mapping[str, object],
+    definitions: Mapping[str, object],
+    visiting: tuple[str, ...],
+) -> dict[str, object]:
+    if not reference.startswith(DEFINITIONS_POINTER):
+        raise ValueError(f"unsupported schema reference {reference}")
+    definition_name = reference.removeprefix(DEFINITIONS_POINTER)
+    if definition_name in visiting:
+        raise ValueError(f"recursive schema reference {reference}")
+    target = definitions.get(definition_name)
+    if target is None:
+        raise ValueError(f"unresolved schema reference {reference}")
+    inlined = _inline_schema_refs(target, definitions, (*visiting, definition_name))
+    if not isinstance(inlined, dict):
+        raise TypeError(f"schema reference {reference} does not resolve to an object")
+    siblings = {key: value for key, value in node.items() if key != "$ref"}
+    return {**inlined, **siblings}
+
+
+def _flatten_nullable(node: dict[str, object]) -> dict[str, object]:
+    """Collapse an optional field so its format and bounds stay visible at one level."""
+    variants = node.get("anyOf")
+    if not isinstance(variants, list) or len(variants) != NULLABLE_VARIANTS:
+        return node
+    if not all(isinstance(variant, dict) for variant in variants):
+        return node
+    typed = cast("list[dict[str, object]]", variants)
+    present = [variant for variant in typed if variant.get("type") != NULL_TYPE]
+    if len(present) != 1 or len(typed) - len(present) != 1:
+        return node
+    value_type = present[0].get("type")
+    if not isinstance(value_type, str):
+        return node
+    siblings = {key: value for key, value in node.items() if key != "anyOf"}
+    return {**present[0], **siblings, "type": [value_type, NULL_TYPE]}
 
 
 def _client_identity(context: ToolContext) -> str:

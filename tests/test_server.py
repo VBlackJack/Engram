@@ -128,7 +128,7 @@ async def test_remember_round_trip_is_strict_owned_and_idempotent(  # noqa: PLR0
             assert "writer_model" not in tools["remember"].inputSchema["properties"]
             assert "status" not in tools["remember"].inputSchema["properties"]
             assert "source_type" not in tools["remember"].inputSchema["properties"]
-            evidence_schema = tools["remember"].inputSchema["$defs"]["EvidenceInput"]
+            evidence_schema = tools["remember"].inputSchema["properties"]["evidence"]["items"]
             assert evidence_schema["additionalProperties"] is False
             output_schema = tools["remember"].outputSchema
             assert output_schema is not None

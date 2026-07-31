@@ -70,7 +70,9 @@ inherited. A mutation requires the expected CAS hash and a reread before promoti
 
 ## Bounded capsule
 
-`token_budget` is constrained by server-side minimum and maximum values. Engram interprets it
+`token_budget` is constrained by server-side minimum and maximum values, published as `minimum`
+and `maximum` on the `recall` tool schema so a client sees the bound before calling. Engram
+interprets it
 conservatively as the maximum UTF-8 byte count of the complete serialized tool result: one byte per
 possible byte-level subword token. This is an absolute payload-size cap, not a promise of exact
 tokenization for every model. The builder measures fallback and structured content together,

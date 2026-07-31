@@ -78,7 +78,9 @@ marquer la promotion.
 
 ## Capsule bornee
 
-`token_budget` est contraint par un minimum et un maximum serveur. Engram l'interprete de facon
+`token_budget` est contraint par un minimum et un maximum serveur, publies comme `minimum` et
+`maximum` dans le schema de l'outil `recall` afin qu'un client voie la borne avant d'appeler.
+Engram l'interprete de facon
 conservatrice comme le nombre maximal d'octets UTF-8 du resultat d'outil complet serialise : un
 octet par token subword byte-level possible. C'est une limite absolue de taille du payload, pas une
 promesse de tokenisation exacte pour chaque modele. Le builder mesure ensemble fallback et contenu

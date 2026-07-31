@@ -34,10 +34,9 @@ from engram.normalization import (
 )
 from engram.server import (
     MAX_CLIENT_COMPONENT_CHARS,
-    RecallArguments,
-    RememberArguments,
     RequestBodyLimitMiddleware,
     create_mcp_server,
+    publish_tool_schemas,
 )
 from engram.store import EngramStore, StoreValidationError
 
@@ -142,26 +141,22 @@ def _hard_limit_config(app_config: AppConfig) -> AppConfig:
     )
 
 
-def test_public_argument_schemas_publish_every_hard_input_limit() -> None:
-    remember = RememberArguments.model_json_schema()
-    recall = RecallArguments.model_json_schema()
-    remember_properties = remember["properties"]
-    recall_properties = recall["properties"]
+def test_public_argument_schemas_publish_every_hard_input_limit(app_config: AppConfig) -> None:
+    schemas = publish_tool_schemas(app_config)
+    remember_properties = schemas["remember"]["properties"]
+    recall_properties = schemas["recall"]["properties"]
 
     assert remember_properties["statement"]["maxLength"] == HARD_MAX_STATEMENT_CHARS
     assert remember_properties["scope"]["maxLength"] == MAX_SCOPE_CHARS
     assert remember_properties["subject_keys"]["maxItems"] == HARD_MAX_SUBJECT_KEYS
     assert remember_properties["subject_keys"]["items"]["maxLength"] == MAX_SUBJECT_KEY_CHARS
     assert remember_properties["evidence"]["maxItems"] == MAX_EVIDENCE_ITEMS
-    assert (
-        remember["$defs"]["EvidenceInput"]["properties"]["ref"]["maxLength"]
-        == MAX_EVIDENCE_REF_CHARS
+    assert remember_properties["evidence"]["items"]["properties"]["ref"]["maxLength"] == (
+        MAX_EVIDENCE_REF_CHARS
     )
     assert recall_properties["query"]["maxLength"] == MAX_FTS_QUERY_CHARS
-    scope_string_schema = next(
-        item for item in recall_properties["scope"]["anyOf"] if item.get("type") == "string"
-    )
-    assert scope_string_schema["maxLength"] == MAX_SCOPE_CHARS
+    assert recall_properties["scope"]["maxLength"] == MAX_SCOPE_CHARS
+    assert recall_properties["scope"]["type"] == ["string", "null"]
     assert recall_properties["kinds"]["maxItems"] == 5
 
 

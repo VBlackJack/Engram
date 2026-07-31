@@ -11,11 +11,19 @@ project uses date-derived CalVer releases in the form `YYYY.MMDD.NN`.
 
 - Add task-oriented French and English quick-start, operator, and
   Engram-Datacron-Cortex guides, with short ADHD-friendly paths and expected results.
+- Add contract tests binding every published input constraint to the enforcement the server
+  performs, including a proof that each published keyword is what rejects the invalid value.
 
 ### Changed
 
 - Separate daily memory use from privileged maintenance, route both READMEs through goal-based
   documentation, and clarify that Cortex synchronization is explicit rather than automatic.
+- Publish both tool schemas without local references so a client that does not dereference still
+  sees the `kind` enum and the `evidence` object structure instead of unknown types.
+- Publish the configured `token_budget` bounds and default on the `recall` schema, and flatten
+  optional fields so their format and length limits stay visible at one level.
+- Reject an `observed_at` value carrying no UTC offset, and a non-textual instant, at argument
+  validation instead of deeper in storage.
 
 ## [2026.0730.02] - 2026-07-30
 
