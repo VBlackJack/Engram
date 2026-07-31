@@ -78,7 +78,7 @@ ignore = [
 [tool.mypy]
 python_version = "3.13"
 strict = true
-files = ["src", "tests"]
+files = ["ci", "src", "tests"]
 
 [tool.pytest.ini_options]
 addopts = "-ra --strict-config --strict-markers"
