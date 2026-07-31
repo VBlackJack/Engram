@@ -144,6 +144,54 @@ def test_main_refuses_an_overlapping_workspace_without_writing(
     assert not isolated.exists()
 
 
+def test_omitting_the_protection_declaration_is_refused_by_the_parser(tmp_path: Path) -> None:
+    """Keep the silent-empty-list failure unreachable: the declaration is mandatory."""
+    with pytest.raises(SystemExit) as refusal:
+        main(["--workspace", str(tmp_path), "prepare", "--directory", str(tmp_path / "isolated")])
+
+    assert refusal.value.code == 2
+    assert not (tmp_path / "isolated").exists()
+
+
+def test_declaring_both_protection_forms_is_refused_by_the_parser(tmp_path: Path) -> None:
+    with pytest.raises(SystemExit):
+        main(
+            [
+                "--workspace",
+                str(tmp_path / "workspace"),
+                "--protected",
+                str(tmp_path / "installation"),
+                "--no-protected-paths",
+                "prepare",
+                "--directory",
+                str(tmp_path / "isolated"),
+            ]
+        )
+
+
+def test_explicitly_declaring_no_protected_path_is_recorded(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Allow a hosted runner to declare the absence, and keep that choice auditable."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    code = main(
+        [
+            "--workspace",
+            str(workspace),
+            "--no-protected-paths",
+            "prepare",
+            "--directory",
+            str(tmp_path / "isolated"),
+        ]
+    )
+
+    assert code == 0
+    assert "protected=none-declared" in capsys.readouterr().out
+
+
 def test_main_prepare_reports_the_configuration_it_wrote(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],

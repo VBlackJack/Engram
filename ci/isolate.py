@@ -150,7 +150,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     except IsolationError as exc:
         sys.stderr.write(f"engram-ci: error: {exc}\n")
         return REFUSED_EXIT_CODE
-    sys.stdout.write(f"sqlite={version}\n{CONFIG_ENVIRONMENT_KEY}={config_path}\n")
+    sys.stdout.write(
+        f"protected={_protection_text(arguments.protected)}\n"
+        f"sqlite={version}\n"
+        f"{CONFIG_ENVIRONMENT_KEY}={config_path}\n"
+    )
     return 0
 
 
@@ -165,12 +169,18 @@ def _build_parser() -> argparse.ArgumentParser:
         required=True,
         help="Checkout directory the run must never write into",
     )
-    parser.add_argument(
+    protection = parser.add_mutually_exclusive_group(required=True)
+    protection.add_argument(
         "--protected",
         type=Path,
         action="append",
         default=[],
         help="Installation directory that must not overlap the workspace; repeatable",
+    )
+    protection.add_argument(
+        "--no-protected-paths",
+        action="store_true",
+        help="Declare that no installation shares this machine, as on a hosted runner",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
     prepare = subparsers.add_parser("prepare", help="Write an isolated configuration")
@@ -188,6 +198,12 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     subparsers.add_parser("verify", help="Refuse the run unless every precondition holds")
     return parser
+
+
+def _protection_text(protected: Sequence[Path]) -> str:
+    if not protected:
+        return "none-declared"
+    return ";".join(str(_resolved(candidate)) for candidate in protected)
 
 
 def _resolved(path: Path) -> Path:
