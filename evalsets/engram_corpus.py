@@ -1,7 +1,7 @@
 # Copyright 2026 Julien Bombled
 # SPDX-License-Identifier: Apache-2.0
 
-"""Hand-authored deterministic OM-04 corpus and gold tasks."""
+"""Hand-authored deterministic evaluation corpus and gold tasks."""
 
 from __future__ import annotations
 
@@ -995,7 +995,7 @@ CONSOLIDATION_TASKS = (
 
 
 def validate_corpus() -> None:
-    """Fail fast if the checked-in corpus no longer satisfies the OM-04 contract."""
+    """Fail fast if the checked-in corpus no longer satisfies the evaluation contract."""
     _validate_dimensions()
     _validate_coverage()
     _validate_scenarios()
@@ -1079,7 +1079,7 @@ def _benchmark_fingerprint(
 
 def _validate_dimensions() -> None:
     if len(SEED_ENTRIES) != EXPECTED_ENTRY_COUNT:
-        raise ValueError("The OM-04 corpus must contain exactly 72 entries")
+        raise ValueError("The evaluation corpus must contain exactly 72 entries")
     if len(RECALL_TASKS) != EXPECTED_RECALL_TASK_COUNT:
         raise ValueError("The corpus must contain exactly 88 recall tasks")
     if (

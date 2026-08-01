@@ -1,7 +1,7 @@
 # Copyright 2026 Julien Bombled
 # SPDX-License-Identifier: Apache-2.0
 
-"""Pure read-only consolidation proposal logic for the OM-04 spike."""
+"""Pure read-only consolidation proposal logic for the evaluation spike."""
 
 from __future__ import annotations
 

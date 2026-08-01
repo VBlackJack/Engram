@@ -318,7 +318,7 @@ class P2Measures(BaseModel):
 
 
 class P2Thresholds(BaseModel):
-    """Fixed OM-03 thresholds, serialized to make the decision auditable."""
+    """Fixed release thresholds, serialized to make the decision auditable."""
 
     model_config = ConfigDict(extra="forbid")
 

@@ -1,7 +1,7 @@
 # Copyright 2026 Julien Bombled
 # SPDX-License-Identifier: Apache-2.0
 
-"""Mechanical P2 decision using the fixed OM-03 thresholds."""
+"""Mechanical P2 decision using the fixed release thresholds."""
 
 from __future__ import annotations
 

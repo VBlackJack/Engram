@@ -1,7 +1,7 @@
 # Copyright 2026 Julien Bombled
 # SPDX-License-Identifier: Apache-2.0
 
-"""Execute the deterministic OM-04 suite and write its two artifacts."""
+"""Execute the deterministic evaluation suite and write its two artifacts."""
 
 from __future__ import annotations
 
