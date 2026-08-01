@@ -19,7 +19,7 @@ TOML paths resolve from the selected file's directory.
 The active Python's `sqlite3` is too old, even if a newer `sqlite3.exe` is on PATH. Verify with:
 
 ```powershell
-uv run --python 3.14.3 python -c "import sys, sqlite3; print(sys.executable); print(sqlite3.sqlite_version)"
+uv run --python 3.14.6 python -c "import sys, sqlite3; print(sys.executable); print(sqlite3.sqlite_version)"
 ```
 
 Use the `uv`-managed Python or follow [installation-windows.md](installation-windows.md).

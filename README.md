@@ -48,7 +48,7 @@ Prerequis :
 
 - Git pour l'installation depuis les sources ;
 - Python 3.13 ou plus recent ;
-- `uv` 0.11.3 ou plus recent recommande ;
+- `uv` 0.12.1 ou plus recent recommande ;
 - **SQLite 3.51.3 ou plus recent dans le runtime Python**.
 
 Le plancher SQLite est dur. Les versions 3.7.0 a 3.51.2 sont affectees par le bug WAL-reset
@@ -61,8 +61,8 @@ SQLite 3.53.x officielle. La page SQLite decrit le
 ```powershell
 git clone https://github.com/VBlackJack/Engram.git
 cd Engram
-uv sync --python 3.14.3
-uv run --python 3.14.3 python -c "import sqlite3; print(sqlite3.sqlite_version)"
+uv sync --python 3.14.6
+uv run --python 3.14.6 python -c "import sqlite3; print(sqlite3.sqlite_version)"
 if (Test-Path -LiteralPath "engram.toml") { throw "Existing Engram configuration: stop" }
 if (Test-Path -LiteralPath "engram.db") { throw "Existing Engram database: stop" }
 Copy-Item engram.example.toml engram.toml -ErrorAction Stop
@@ -75,7 +75,7 @@ utilisables.
 ## Demarrage rapide
 
 ```powershell
-uv run --python 3.14.3 engram serve
+uv run --python 3.14.6 engram serve
 ```
 
 Le point MCP par defaut est `http://127.0.0.1:8377/mcp`. Engram refuse toute adresse d'ecoute qui
@@ -217,12 +217,12 @@ obtenir un traceback.
 ## Developpement
 
 ```powershell
-uv sync --extra dev --python 3.14.3
-uv run --python 3.14.3 ruff check .
-uv run --python 3.14.3 ruff format --check .
-uv run --python 3.14.3 mypy
-uv run --python 3.14.3 pytest
-uv build --python 3.14.3
+uv sync --extra dev --python 3.14.6
+uv run --python 3.14.6 ruff check .
+uv run --python 3.14.6 ruff format --check .
+uv run --python 3.14.6 mypy
+uv run --python 3.14.6 pytest
+uv build --python 3.14.6
 ```
 
 ## Licence

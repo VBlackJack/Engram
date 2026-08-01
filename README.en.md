@@ -47,7 +47,7 @@ Requirements:
 
 - Git for source installation;
 - Python 3.13 or newer;
-- `uv` 0.11.3 or newer recommended;
+- `uv` 0.12.1 or newer recommended;
 - **SQLite 3.51.3 or newer in the Python runtime**.
 
 The SQLite floor is mandatory. Versions 3.7.0 through 3.51.2 are affected by SQLite's documented
@@ -59,8 +59,8 @@ the [3.53.3 binaries](https://www.sqlite.org/download.html).
 ```powershell
 git clone https://github.com/VBlackJack/Engram.git
 cd Engram
-uv sync --python 3.14.3
-uv run --python 3.14.3 python -c "import sqlite3; print(sqlite3.sqlite_version)"
+uv sync --python 3.14.6
+uv run --python 3.14.6 python -c "import sqlite3; print(sqlite3.sqlite_version)"
 if (Test-Path -LiteralPath "engram.toml") { throw "Existing Engram configuration: stop" }
 if (Test-Path -LiteralPath "engram.db") { throw "Existing Engram database: stop" }
 Copy-Item engram.example.toml engram.toml -ErrorAction Stop
@@ -72,7 +72,7 @@ checkout; after publication, the wheel/sdist attached to the release can also be
 ## Quick start
 
 ```powershell
-uv run --python 3.14.3 engram serve
+uv run --python 3.14.6 engram serve
 ```
 
 The default MCP endpoint is `http://127.0.0.1:8377/mcp`. Keep this loopback address: the server
@@ -208,12 +208,12 @@ Use global `--debug` before the command, or `ENGRAM_DEBUG=1`, only when a traceb
 ## Development
 
 ```powershell
-uv sync --extra dev --python 3.14.3
-uv run --python 3.14.3 ruff check .
-uv run --python 3.14.3 ruff format --check .
-uv run --python 3.14.3 mypy
-uv run --python 3.14.3 pytest
-uv build --python 3.14.3
+uv sync --extra dev --python 3.14.6
+uv run --python 3.14.6 ruff check .
+uv run --python 3.14.6 ruff format --check .
+uv run --python 3.14.6 mypy
+uv run --python 3.14.6 pytest
+uv build --python 3.14.6
 ```
 
 ## License

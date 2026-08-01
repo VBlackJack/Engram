@@ -16,8 +16,7 @@ Reference : [WAL-reset bug](https://sqlite.org/wal.html#walreset).
 
 ## La seule methode clef en main : Python gere par uv
 
-Il ne s'agit pas d'une preference entre deux chemins supportes. Sur les distributions Windows
-mesurees le 2026-07-31, une seule satisfait le prerequis sans etre modifiee :
+Il ne s'agit pas d'une preference entre deux chemins supportes. Mesures sous Windows :
 
 | Distribution | SQLite lie | Satisfait `3.51.3` |
 | --- | --- | --- |
@@ -25,19 +24,30 @@ mesurees le 2026-07-31, une seule satisfait le prerequis sans etre modifiee :
 | python.org 3.13.6 | 3.50.4 | non |
 | python.org 3.14.6 | 3.50.4 | non |
 | uv-managed 3.13.12 | 3.50.4 | non |
-| **uv-managed 3.14.3** | **3.53.3** | **oui** |
+| uv-managed 3.14.3 | 3.53.3 | oui |
+| uv-managed 3.14.4 | 3.50.4 | non |
+| **uv-managed 3.14.6** | **3.53.1** | **oui** |
+
+**Le SQLite lie par un runtime se decide par build, pas par version de Python.** La ligne 3.14.4
+n'est pas une coquille : ce build est repasse sous le plancher avant que les suivants ne repassent
+au-dessus, et un meme numero de version lie des SQLite differents selon le systeme d'exploitation.
+Ne jamais deduire la version liee de la version de Python, sur aucune plateforme. Lancez le
+controle.
 
 Tout autre chemin de cette page repare un runtime qui echouerait autrement. Installez plutot celui
 qui fonctionne ; il ne modifie pas un runtime existant :
 
 ```powershell
-uv python install 3.14.3
-uv sync --python 3.14.3
-uv run --python 3.14.3 python -c "import sys, sqlite3; print(sys.executable); print(sqlite3.sqlite_version)"
+uv python install 3.14.6
+uv sync --python 3.14.6
+uv run --python 3.14.6 python -c "import sys, sqlite3; print(sys.executable); print(sqlite3.sqlite_version)"
 ```
 
+Installer `3.14.6` exige `uv` 0.12.1 ou plus recent : les versions anterieures ne connaissent que
+les builds jusqu'a `3.14.3`.
+
 La commande doit afficher une version SQLite au moins egale a `3.51.3` (le build teste pour cette
-release affiche `3.53.3`). Utiliser le meme `--python 3.14.3` pour `serve` et les autres commandes.
+release affiche `3.53.1`). Utiliser le meme `--python 3.14.6` pour `serve` et les autres commandes.
 Les contributeurs installent separement `--extra dev` avant les tests.
 
 **Un `pip install` qui passe ne prouve rien ici.** Il passe sur toutes les distributions du tableau

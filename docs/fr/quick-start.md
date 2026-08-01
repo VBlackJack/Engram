@@ -33,8 +33,8 @@ Dans PowerShell, pour une nouvelle installation :
 ```powershell
 git clone https://github.com/VBlackJack/Engram.git
 Set-Location Engram
-uv sync --python 3.14.3
-uv run --python 3.14.3 python -c "import sqlite3; print(sqlite3.sqlite_version)"
+uv sync --python 3.14.6
+uv run --python 3.14.6 python -c "import sqlite3; print(sqlite3.sqlite_version)"
 if (Test-Path -LiteralPath "engram.toml") { throw "Existing Engram configuration: stop" }
 if (Test-Path -LiteralPath "engram.db") { throw "Existing Engram database: stop" }
 Copy-Item engram.example.toml engram.toml -ErrorAction Stop
@@ -43,10 +43,12 @@ Copy-Item engram.example.toml engram.toml -ErrorAction Stop
 **Vous devez voir :** une version SQLite egale ou superieure a `3.51.3`, puis un fichier
 `engram.toml`.
 
-L'epinglage `3.14.3` n'est pas un choix de style. C'est la seule distribution Windows mesuree qui
-lie un SQLite assez recent pour faire tourner Engram ; substituer un interpreteur deja en place
+L'epinglage `3.14.6` n'est pas un choix de style. Le SQLite lie par un runtime se decide par build,
+pas par version de Python, et la plupart des distributions en lient un trop ancien pour Engram ;
+`3.14.6` est mesure conforme sous Windows et sous Linux. Substituer un interpreteur deja en place
 echouera tres probablement au controle de version de la ligne suivante. Voir
-[Windows et SQLite](installation-windows.md) pour les mesures.
+[Windows et SQLite](installation-windows.md) pour les mesures. L'installer exige `uv` 0.12.1 ou plus
+recent.
 
 **Sinon :** suivez uniquement le
 [depannage Windows et SQLite](installation-windows.md).
@@ -54,7 +56,7 @@ echouera tres probablement au controle de version de la ligne suivante. Voir
 ## 2. Lancer
 
 ```powershell
-uv run --python 3.14.3 engram serve
+uv run --python 3.14.6 engram serve
 ```
 
 **Vous devez voir :** le processus reste actif et l'endpoint local est

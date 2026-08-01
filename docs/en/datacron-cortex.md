@@ -157,7 +157,7 @@ cannot be consolidated.
 4. If Engram contains a conflicting active version, follow
    [Attest a candidate](operator-guide.md#attest-a-candidate) to identify the replaced entry or
    link both entries.
-5. Run `uv run --python 3.14.3 engram consolidate --check-freshness`, then restart the daemon.
+5. Run `uv run --python 3.14.6 engram consolidate --check-freshness`, then restart the daemon.
 
 ## If one component fails
 

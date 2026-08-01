@@ -17,7 +17,7 @@ env:
   # The one distribution measured to link a SQLite above the fail-closed floor
   # without being patched. Every other channel measured, including uv-managed
   # 3.13, links a version the WAL-reset guard rejects.
-  SUPPORTED_PYTHON: "3.14.3"
+  SUPPORTED_PYTHON: "3.14.6"
   # Stock runtime for the turnkey job. Never patched, never pinned to a patch
   # release: this is whatever a user would get from the same channel.
   STOCK_PYTHON: "3.14"
@@ -42,7 +42,7 @@ jobs:
           python-version: "3.13"
 
       - name: Install uv
-        run: python -m pip install uv==0.11.3
+        run: python -m pip install uv==0.12.1
 
       # The supported line is the uv-managed interpreter, the only measured
       # distribution linking a SQLite above the floor without being patched.

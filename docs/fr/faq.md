@@ -20,7 +20,7 @@ Le `sqlite3` du Python actif est trop ancien, meme si l'executable `sqlite3.exe`
 Verifier avec :
 
 ```powershell
-uv run --python 3.14.3 python -c "import sys, sqlite3; print(sys.executable); print(sqlite3.sqlite_version)"
+uv run --python 3.14.6 python -c "import sys, sqlite3; print(sys.executable); print(sqlite3.sqlite_version)"
 ```
 
 Utiliser le Python gere par `uv` ou suivre [installation-windows.md](installation-windows.md).

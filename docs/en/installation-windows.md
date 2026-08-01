@@ -16,8 +16,7 @@ Reference: [WAL-reset bug](https://sqlite.org/wal.html#walreset).
 
 ## The only turnkey method: uv-managed Python
 
-This is not a preference between two supported paths. Of the Windows distributions measured on
-2026-07-31, one clears the requirement without being modified:
+This is not a preference between two supported paths. Measured on Windows:
 
 | Distribution | SQLite linked | Clears `3.51.3` |
 | --- | --- | --- |
@@ -25,19 +24,28 @@ This is not a preference between two supported paths. Of the Windows distributio
 | python.org 3.13.6 | 3.50.4 | no |
 | python.org 3.14.6 | 3.50.4 | no |
 | uv-managed 3.13.12 | 3.50.4 | no |
-| **uv-managed 3.14.3** | **3.53.3** | **yes** |
+| uv-managed 3.14.3 | 3.53.3 | yes |
+| uv-managed 3.14.4 | 3.50.4 | no |
+| **uv-managed 3.14.6** | **3.53.1** | **yes** |
+
+**The SQLite a runtime links is decided per build, not per Python version.** The 3.14.4 row is not a
+typo: that build went back below the floor before later ones went above it, and the same version
+number links different SQLite versions on different operating systems. Never infer the linked
+version from the Python version, on any platform. Run the check.
 
 Every other path on this page repairs a runtime that would otherwise fail. Install the working one
 instead; it does not modify an existing runtime:
 
 ```powershell
-uv python install 3.14.3
-uv sync --python 3.14.3
-uv run --python 3.14.3 python -c "import sys, sqlite3; print(sys.executable); print(sqlite3.sqlite_version)"
+uv python install 3.14.6
+uv sync --python 3.14.6
+uv run --python 3.14.6 python -c "import sys, sqlite3; print(sys.executable); print(sqlite3.sqlite_version)"
 ```
 
+Installing `3.14.6` needs `uv` 0.12.1 or newer; earlier releases only know builds up to `3.14.3`.
+
 The command must display SQLite `3.51.3` or newer (the build tested for this release displays
-`3.53.3`). Use the same `--python 3.14.3` for `serve` and other commands. Contributors install
+`3.53.1`). Use the same `--python 3.14.6` for `serve` and other commands. Contributors install
 `--extra dev` separately before running tests.
 
 **`pip install` succeeding proves nothing here.** It succeeds on every distribution in the table

@@ -159,7 +159,7 @@ confirme et ne peut pas etre consolide.
 4. Si Engram contient une version active contraire, suivez
    [Attester un candidat](operator-guide.md#attester-un-candidat) pour indiquer l'entree remplacee
    ou relier les deux entrees.
-5. Executez `uv run --python 3.14.3 engram consolidate --check-freshness`, puis redemarrez le
+5. Executez `uv run --python 3.14.6 engram consolidate --check-freshness`, puis redemarrez le
    daemon.
 
 ## Si un composant tombe en panne

@@ -17,6 +17,15 @@ project uses date-derived CalVer releases in the form `YYYY.MMDD.NN`.
   asserts the outcome that runtime actually produces: a working command when its SQLite clears the
   fail-closed minimum, and the documented exit code and message when it does not.
 
+### Fixed
+
+- Pin the interpreter to a build measured to link a recent enough SQLite on Windows **and** Linux.
+  The previously pinned build cleared the requirement on one platform only, so the Linux leg would
+  have refused every storage operation.
+- Assert the shared `OSError` contract, not the Windows-specific subclass, when configuration
+  refuses an unusable rotation lock. The narrower assertion failed on Linux, where the same
+  condition is reported as `IsADirectoryError`.
+
 ### Changed
 
 - Run continuous integration and release builds on the uv-managed interpreter the documentation

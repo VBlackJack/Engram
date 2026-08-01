@@ -23,8 +23,8 @@ uv --version
 ```powershell
 git clone https://github.com/VBlackJack/Engram.git
 Set-Location Engram
-uv sync --python 3.14.3
-uv run --python 3.14.3 python -c "import sqlite3; print(sqlite3.sqlite_version)"
+uv sync --python 3.14.6
+uv run --python 3.14.6 python -c "import sqlite3; print(sqlite3.sqlite_version)"
 if (Test-Path -LiteralPath "engram.toml") { throw "Existing Engram configuration: stop" }
 if (Test-Path -LiteralPath "engram.db") { throw "Existing Engram database: stop" }
 Copy-Item engram.example.toml engram.toml -ErrorAction Stop
@@ -53,7 +53,7 @@ For a new installation, the safe values in `engram.example.toml` are enough:
 For a new database only, start:
 
 ```powershell
-uv run --python 3.14.3 engram serve
+uv run --python 3.14.6 engram serve
 ```
 
 **Expected result:** the process stays active without errors. Keep this terminal open.

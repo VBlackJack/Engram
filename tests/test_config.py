@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import subprocess
 import sys
 from collections.abc import Callable
@@ -422,7 +423,8 @@ console_level = "ERROR"
 
 def test_file_logger_validates_rotation_lock_before_returning(tmp_path: Path) -> None:
     log_path = tmp_path / "engram.log"
-    Path(f"{log_path}.rotate.lock").mkdir()
+    lock_path = Path(f"{log_path}.rotate.lock")
+    lock_path.mkdir()
     config_path = tmp_path / "engram.toml"
     config_path.write_text(
         f'[logging]\npath = "{log_path.as_posix()}"\n',
@@ -430,8 +432,14 @@ def test_file_logger_validates_rotation_lock_before_returning(tmp_path: Path) ->
     )
     config = load_config(config_path, environ={})
 
-    with pytest.raises(PermissionError):
+    # The contract is that configuration refuses rather than returning a logger that
+    # cannot rotate. Which OSError subclass carries the refusal is the operating
+    # system's choice: Windows reports PermissionError, Linux IsADirectoryError.
+    # Naming the path keeps the assertion from passing on an unrelated failure.
+    with pytest.raises(OSError, match=re.escape(lock_path.name)) as failure:
         FileLogger(config.logging, name="engram.invalid-log-lock").configure()
+
+    assert str(failure.value.filename) == str(lock_path)
 
 
 def test_file_logger_contains_rotation_lock_failure_after_configuration(

@@ -23,8 +23,8 @@ uv --version
 ```powershell
 git clone https://github.com/VBlackJack/Engram.git
 Set-Location Engram
-uv sync --python 3.14.3
-uv run --python 3.14.3 python -c "import sqlite3; print(sqlite3.sqlite_version)"
+uv sync --python 3.14.6
+uv run --python 3.14.6 python -c "import sqlite3; print(sqlite3.sqlite_version)"
 if (Test-Path -LiteralPath "engram.toml") { throw "Existing Engram configuration: stop" }
 if (Test-Path -LiteralPath "engram.db") { throw "Existing Engram database: stop" }
 Copy-Item engram.example.toml engram.toml -ErrorAction Stop
@@ -53,7 +53,7 @@ Avec une nouvelle installation, les valeurs sures de `engram.example.toml` suffi
 Pour une nouvelle base uniquement, lancez :
 
 ```powershell
-uv run --python 3.14.3 engram serve
+uv run --python 3.14.6 engram serve
 ```
 
 **Resultat attendu :** le processus reste actif sans erreur. Gardez ce terminal ouvert.

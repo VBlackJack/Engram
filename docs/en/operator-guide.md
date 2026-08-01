@@ -13,7 +13,7 @@ Only need to recall or propose a memory? Return to the [user guide](user-guide.m
 
 | I want to... | Procedure | Daemon |
 | --- | --- | --- |
-| View candidates | `uv run --python 3.14.3 engram list --status quarantined` | May stay active |
+| View candidates | `uv run --python 3.14.6 engram list --status quarantined` | May stay active |
 | Trust a reviewed candidate | [Attest](#attest-a-candidate) | Stopped |
 | Upgrade a database | [Migrate](#migrate-an-existing-database) | Stopped |
 | Rebuild Engram indexes | [Reindex](#reindex-engram) | Stopped |
@@ -27,7 +27,7 @@ same writer lock as the daemon. They refuse to start while it is running.
 
 ### 1. Stop the daemon
 
-Cleanly interrupt the terminal running `uv run --python 3.14.3 engram serve`.
+Cleanly interrupt the terminal running `uv run --python 3.14.6 engram serve`.
 
 **You should see:** the process exits. If a command still reports an owner PID, do not delete the
 lock file; identify that process first.
@@ -46,7 +46,7 @@ $engramBackupPath = Join-Path $engramBackupDir ("engram-" + (Get-Date -Format "y
 if (Test-Path -LiteralPath $engramBackupPath) { throw "Backup destination already exists" }
 $env:ENGRAM_BACKUP_SOURCE = $engramDbPath
 $env:ENGRAM_BACKUP_DESTINATION = $engramBackupPath
-uv run --python 3.14.3 python -c "from os import environ; from pathlib import Path; import sqlite3; source=Path(environ['ENGRAM_BACKUP_SOURCE']); destination=Path(environ['ENGRAM_BACKUP_DESTINATION']); assert source.is_file(), f'source missing: {source}'; assert not destination.exists(), f'destination exists: {destination}'; source_db=sqlite3.connect(source.resolve().as_uri() + '?mode=ro', uri=True); assert source_db.execute('PRAGMA quick_check').fetchone()[0] == 'ok'; backup_db=sqlite3.connect(destination); source_db.backup(backup_db); assert backup_db.execute('PRAGMA quick_check').fetchone()[0] == 'ok'; backup_db.close(); source_db.close(); print(destination)"
+uv run --python 3.14.6 python -c "from os import environ; from pathlib import Path; import sqlite3; source=Path(environ['ENGRAM_BACKUP_SOURCE']); destination=Path(environ['ENGRAM_BACKUP_DESTINATION']); assert source.is_file(), f'source missing: {source}'; assert not destination.exists(), f'destination exists: {destination}'; source_db=sqlite3.connect(source.resolve().as_uri() + '?mode=ro', uri=True); assert source_db.execute('PRAGMA quick_check').fetchone()[0] == 'ok'; backup_db=sqlite3.connect(destination); source_db.backup(backup_db); assert backup_db.execute('PRAGMA quick_check').fetchone()[0] == 'ok'; backup_db.close(); source_db.close(); print(destination)"
 Remove-Item Env:ENGRAM_BACKUP_SOURCE
 Remove-Item Env:ENGRAM_BACKUP_DESTINATION
 ```
@@ -59,7 +59,7 @@ working folder for a critical operation.
 ### 1. Inventory
 
 ```powershell
-uv run --python 3.14.3 engram list --status quarantined
+uv run --python 3.14.6 engram list --status quarantined
 ```
 
 Review the statement, type (`kind`), scope, subjects, and evidence. Do not automatically copy a
@@ -68,7 +68,7 @@ batch into the trusted area.
 ### 2. Attest the exact content
 
 ```powershell
-uv run --python 3.14.3 engram attest "The service listens on port 8377." fact user `
+uv run --python 3.14.6 engram attest "The service listens on port 8377." fact user `
   --subject-key "engram/server-port" `
   --claim-key "engram/server-port" `
   --evidence "review=change-42"
@@ -80,7 +80,7 @@ match the candidate, Engram promotes its existing identifier.
 To correct an entry, pass the replaced identifier:
 
 ```powershell
-uv run --python 3.14.3 engram attest "The service listens on port 9000." fact user `
+uv run --python 3.14.6 engram attest "The service listens on port 9000." fact user `
   --subject-key "engram/server-port" `
   --claim-key "engram/server-port" `
   --supersedes 01AAAAAAAAAAAAAAAAAAAAAAAA
@@ -89,13 +89,13 @@ uv run --python 3.14.3 engram attest "The service listens on port 9000." fact us
 To link two existing entries:
 
 ```powershell
-uv run --python 3.14.3 engram supersede --old OLD_ID --new NEW_ID
+uv run --python 3.14.6 engram supersede --old OLD_ID --new NEW_ID
 ```
 
 ### 3. Restart
 
 ```powershell
-uv run --python 3.14.3 engram serve
+uv run --python 3.14.6 engram serve
 ```
 
 Recall the subject and verify it appears in `current`. Human attestation does not remove the need
@@ -108,7 +108,7 @@ to review a conflict returned by Engram.
 Before replacing the `2026.0730.01` environment, preserve it and run:
 
 ```powershell
-uv run --python 3.14.3 engram list --status quarantined
+uv run --python 3.14.6 engram list --status quarantined
 ```
 
 Review or export candidates whose MCP client identity was missing/empty, contained `%`, `/`, outer
@@ -133,7 +133,7 @@ max_token_budget = 6000
 After backup and daemon shutdown:
 
 ```powershell
-uv run --python 3.14.3 engram preflight
+uv run --python 3.14.6 engram preflight
 ```
 
 `preflight` opens the source read-only, pins one snapshot, and tests the full migration on a
@@ -154,15 +154,15 @@ Also interpret the derived indexes:
 ### 4. Migrate and classify
 
 ```powershell
-uv run --python 3.14.3 engram migrate
-uv run --python 3.14.3 engram list --unclassified
+uv run --python 3.14.6 engram migrate
+uv run --python 3.14.6 engram list --unclassified
 ```
 
 For each historical `preference`, `decision`, or `fact`, choose a semantic family manually:
 
 ```powershell
-uv run --python 3.14.3 engram classify ENTRY_ID --claim-key "engram/server-port"
-uv run --python 3.14.3 engram list --unclassified
+uv run --python 3.14.6 engram classify ENTRY_ID --claim-key "engram/server-port"
+uv run --python 3.14.6 engram list --unclassified
 ```
 
 Do not derive `claim_key` in bulk from `subject_keys`: subjects aid search, while the claim key
@@ -173,7 +173,7 @@ defines conflict identity.
 When `vector_rebuild_required` is `true` and hybrid mode is enabled:
 
 ```powershell
-uv run --python 3.14.3 engram reindex
+uv run --python 3.14.6 engram reindex
 ```
 
 Then restart the daemon and test one known recall.
@@ -183,7 +183,7 @@ Then restart the daemon and test one known recall.
 Stop the daemon, then run:
 
 ```powershell
-uv run --python 3.14.3 engram reindex
+uv run --python 3.14.6 engram reindex
 ```
 
 - In `fts` mode, Engram rebuilds FTS only.
@@ -191,13 +191,13 @@ uv run --python 3.14.3 engram reindex
 - `entries` and `audit_log` are unchanged.
 - The live index is replaced only after a successful rebuild.
 
-Restart `uv run --python 3.14.3 engram serve`, then recall a known query.
+Restart `uv run --python 3.14.6 engram serve`, then recall a known query.
 
 ## Evaluate retrieval
 
 ```powershell
-uv run --python 3.14.3 engram eval --mode fts --out local/eval
-uv run --python 3.14.3 engram eval --mode both --out local/eval
+uv run --python 3.14.6 engram eval --mode fts --out local/eval
+uv run --python 3.14.6 engram eval --mode both --out local/eval
 ```
 
 **You should see:** `metrics.json` and `rapport-eval.md` under `local/eval`. The seeded corpus and
@@ -215,7 +215,7 @@ Before starting:
 ### 1. Generate a plan
 
 ```powershell
-uv run --python 3.14.3 engram consolidate --plan --out local/consolidation/plan.json
+uv run --python 3.14.6 engram consolidate --plan --out local/consolidation/plan.json
 ```
 
 **You should see:** a JSON file and Markdown report. This step reads Datacron but does not write to
@@ -236,7 +236,7 @@ apply. Do not change the target, generated content, or hashes.
 ### 3. Apply once
 
 ```powershell
-uv run --python 3.14.3 engram consolidate --apply local/consolidation/plan.json
+uv run --python 3.14.6 engram consolidate --apply local/consolidation/plan.json
 ```
 
 The plan is consumed before writes and cannot be replayed. A result can be `applied`, `skipped`,
@@ -250,7 +250,7 @@ The plan is consumed before writes and cannot be replayed. A result can be `appl
 ### 4. Check freshness
 
 ```powershell
-uv run --python 3.14.3 engram consolidate --check-freshness
+uv run --python 3.14.6 engram consolidate --check-freshness
 ```
 
 A divergence removes the promotion from current recall. Engram does not rewrite Datacron to hide
@@ -259,7 +259,7 @@ the problem.
 ### 5. Restart and synchronize Cortex
 
 ```powershell
-uv run --python 3.14.3 engram serve
+uv run --python 3.14.6 engram serve
 ```
 
 In another terminal, when Cortex indexes this vault:
@@ -284,7 +284,7 @@ Datacron consolidation never synchronizes Cortex automatically.
 Known failures do not display tracebacks. For a focused diagnostic:
 
 ```powershell
-uv run --python 3.14.3 engram --debug COMMAND
+uv run --python 3.14.6 engram --debug COMMAND
 ```
 
 or set `ENGRAM_DEBUG=1`.
@@ -293,7 +293,7 @@ or set `ENGRAM_DEBUG=1`.
 
 1. Do not launch multiple writers to "unlock" the database.
 2. Preserve the database, possible WAL/SHM files, logs, and command report.
-3. Work on a copy and run `uv run --python 3.14.3 engram preflight`.
+3. Work on a copy and run `uv run --python 3.14.6 engram preflight`.
 4. Restore a backup only after stopping every Engram process and identifying the changes that
    would be lost.
 5. Use the [FAQ](faq.md) for the exact symptom.
