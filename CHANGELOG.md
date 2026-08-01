@@ -55,6 +55,9 @@ project uses date-derived CalVer releases in the form `YYYY.MMDD.NN`.
 - Publish a CycloneDX software bill of materials alongside every released distribution, generated
   from the lock so its component list does not depend on which platform the release was built on.
 - Attest the provenance of the exact files a release publishes.
+- Validate the MCP registry manifest against the schema it declares, offline and on both operating
+  systems, and require a bumped `$schema` to bring its schema with it rather than be checked against
+  the copy it was not written for.
 - Separate daily memory use from privileged maintenance, route both READMEs through goal-based
   documentation, and clarify that Cortex synchronization is explicit rather than automatic.
 - Publish both tool schemas without local references so a client that does not dereference still
