@@ -65,6 +65,36 @@ jobs:
       - name: Build wheel and source archive
         run: uv build --python ${{ env.SUPPORTED_PYTHON }}
 
+      # Built from the exported lock rather than from an installed environment.
+      # Measured both on 2026-08-01: an environment built here on Linux lists 29
+      # components, the lock lists 31 on either platform. The two missing ones
+      # are colorama and pywin32, which every Windows user of this wheel does
+      # install. A manifest that omits components because of where the release
+      # happened to be built is wrong about the artifact it travels with, and
+      # wrong in the direction that hides attack surface.
+      #
+      # The cost is a real one: this source leaves the root component's direct
+      # dependencies undeclared, and cyclonedx-py says so on standard error. The
+      # warning is expected. Component completeness is what an SBOM is consumed
+      # for; the graph is not worth two silently absent packages.
+      #
+      # The development extra is excluded by not being requested: it is an
+      # optional-dependency extra, so nothing has to be passed to leave it out.
+      #
+      # Rehearsable on the staging repository through workflow_dispatch, which
+      # runs this job without running the tag-gated one below.
+      - name: Build the software bill of materials
+        run: |
+          uv export --frozen --no-emit-project --format requirements.txt \
+            --output-file "$RUNNER_TEMP/runtime-requirements.txt"
+          uv run --no-project --python ${{ env.SUPPORTED_PYTHON }} --with cyclonedx-bom==7.3.1 \
+            cyclonedx-py requirements "$RUNNER_TEMP/runtime-requirements.txt" \
+            --pyproject pyproject.toml --of JSON --sv 1.6 --output-reproducible \
+            -o dist/engram-sbom.cdx.json
+
+      # The manifest travels with the artifacts it describes. A bill of
+      # materials published apart from its distribution is a document nobody can
+      # tie back to what they downloaded.
       - name: Upload build artifacts
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f  # v6
         with:
@@ -79,12 +109,28 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/')
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     steps:
       - name: Download build artifacts
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131  # v7
         with:
           name: engram-python-distributions
           path: dist
+
+      # Attests the exact files the next step publishes, not an earlier copy of
+      # them. Attesting in the build job would sign artifacts that still have an
+      # upload and a download to survive before anyone can fetch them.
+      #
+      # This step cannot be rehearsed on the private staging repository:
+      # artifact attestations are restricted to public repositories on the Free,
+      # Pro and Team plans, and a private repository needs Enterprise Cloud. It
+      # therefore runs for the first time on the first public tag, and verifying
+      # it is a post-publication step rather than a precondition of publishing.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373  # v4.1.1
+        with:
+          subject-path: dist/*
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228  # v3
