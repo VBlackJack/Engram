@@ -25,7 +25,11 @@ project uses date-derived CalVer releases in the form `YYYY.MMDD.NN`.
 - Exercise the documented Windows DLL repair where it can be observed to repair something, on a
   runtime that has just been proven to fail, and report explicitly when a run leaves that path
   unexercised.
-
+- State the uv-managed interpreter as the only turnkey Windows installation instead of one
+  recommendation among two, publish the measurements that make it the only one, and reframe the DLL
+  replacement as the repair of a runtime already in place.
+- Warn in both quick starts that a successful `pip install` is not evidence, and that substituting
+  an interpreter for the pinned one is expected to fail the version check.
 - Separate daily memory use from privileged maintenance, route both READMEs through goal-based
   documentation, and clarify that Cortex synchronization is explicit rather than automatic.
 - Publish both tool schemas without local references so a client that does not dereference still

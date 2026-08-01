@@ -42,6 +42,11 @@ Copy-Item engram.example.toml engram.toml -ErrorAction Stop
 
 **You should see:** SQLite `3.51.3` or newer, followed by an `engram.toml` file.
 
+The `3.14.3` pin is not a stylistic choice. It is the one Windows distribution measured to link a
+SQLite recent enough to run Engram; substituting an interpreter you already have will most likely
+fail the version check on the next line. See
+[Windows and SQLite](installation-windows.md) for the measurements.
+
 **If not:** follow only the
 [Windows and SQLite troubleshooting path](installation-windows.md).
 

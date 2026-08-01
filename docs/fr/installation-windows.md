@@ -4,7 +4,7 @@
 
 > **Utilisez cette page uniquement si** le controle SQLite du
 > [demarrage rapide](quick-start.md) affiche une version inferieure a `3.51.3`.<br>
-> **Verifie le :** 2026-07-30.
+> **Verifie le :** 2026-08-01.
 
 ## Pourquoi ce prerequis est dur
 
@@ -14,9 +14,21 @@ echoue ferme avant migration si le module Python charge une version plus ancienn
 
 Reference : [WAL-reset bug](https://sqlite.org/wal.html#walreset).
 
-## Methode recommandee : Python gere par uv
+## La seule methode clef en main : Python gere par uv
 
-Cette methode ne modifie pas un runtime existant :
+Il ne s'agit pas d'une preference entre deux chemins supportes. Sur les distributions Windows
+mesurees le 2026-07-31, une seule satisfait le prerequis sans etre modifiee :
+
+| Distribution | SQLite lie | Satisfait `3.51.3` |
+| --- | --- | --- |
+| python.org 3.12.10 | 3.49.1 | non |
+| python.org 3.13.6 | 3.50.4 | non |
+| python.org 3.14.6 | 3.50.4 | non |
+| uv-managed 3.13.12 | 3.50.4 | non |
+| **uv-managed 3.14.3** | **3.53.3** | **oui** |
+
+Tout autre chemin de cette page repare un runtime qui echouerait autrement. Installez plutot celui
+qui fonctionne ; il ne modifie pas un runtime existant :
 
 ```powershell
 uv python install 3.14.3
@@ -28,10 +40,19 @@ La commande doit afficher une version SQLite au moins egale a `3.51.3` (le build
 release affiche `3.53.3`). Utiliser le meme `--python 3.14.3` pour `serve` et les autres commandes.
 Les contributeurs installent separement `--extra dev` avant les tests.
 
-## Methode DLL SQLite 3.53.x
+**Un `pip install` qui passe ne prouve rien ici.** Il passe sur toutes les distributions du tableau
+ci-dessus, y compris les quatre qui ne peuvent pas faire tourner Engram. Le controle de version est
+le seul signal.
 
-Utiliser cette methode uniquement pour un runtime CPython Windows dont `_sqlite3.pyd` charge une
-DLL `sqlite3.dll` separee. Ne jamais remplacer un fichier pendant qu'un processus Python tourne.
+Le prerequis porte sur SQLite, pas sur Python : un runtime 3.13 dont la DLL a ete remplacee
+fonctionne, et c'est pourquoi le paquet ne refuse pas de s'installer sur 3.13.
+
+## Reparer un runtime existant : remplacement de la DLL SQLite
+
+A utiliser uniquement s'il faut conserver un runtime CPython Windows deja en place, et seulement si
+son `_sqlite3.pyd` charge une DLL `sqlite3.dll` separee. Preferez l'interpreteur gere par uv
+ci-dessus des que le choix est libre. Ne jamais remplacer un fichier pendant qu'un processus Python
+tourne.
 
 1. Identifier l'interpreteur et la version chargee :
 
@@ -56,8 +77,12 @@ DLL `sqlite3.dll` separee. Ne jamais remplacer un fichier pendant qu'un processu
    ```
 
 Si Python ne demarre plus ou charge toujours l'ancienne version, restaurer la sauvegarde et utiliser
-le runtime `uv` recommande. Certains builds lient SQLite statiquement : la DLL ne peut alors pas
+le runtime gere par uv. Certains builds lient SQLite statiquement : la DLL ne peut alors pas
 les mettre a niveau ; il faut remplacer le runtime.
+
+Cette reparation est exercee a chaque execution d'integration continue, sur un runtime Windows non
+modifie dont l'echec vient d'etre constate : les etapes ci-dessus restent verifiees et pas seulement
+ecrites.
 
 La commande Python de l'etape 6 est le controle sans mutation. `engram reindex` est une operation de
 maintenance qui exige l'arret du daemon ; utilisez-la uniquement depuis le

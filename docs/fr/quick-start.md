@@ -43,6 +43,11 @@ Copy-Item engram.example.toml engram.toml -ErrorAction Stop
 **Vous devez voir :** une version SQLite egale ou superieure a `3.51.3`, puis un fichier
 `engram.toml`.
 
+L'epinglage `3.14.3` n'est pas un choix de style. C'est la seule distribution Windows mesuree qui
+lie un SQLite assez recent pour faire tourner Engram ; substituer un interpreteur deja en place
+echouera tres probablement au controle de version de la ligne suivante. Voir
+[Windows et SQLite](installation-windows.md) pour les mesures.
+
 **Sinon :** suivez uniquement le
 [depannage Windows et SQLite](installation-windows.md).
 
