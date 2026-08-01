@@ -14,9 +14,9 @@ echoue ferme avant migration si le module Python charge une version plus ancienn
 
 Reference : [WAL-reset bug](https://sqlite.org/wal.html#walreset).
 
-## La seule methode clef en main : Python gere par uv
+## Le chemin clef en main : un build uv precis
 
-Il ne s'agit pas d'une preference entre deux chemins supportes. Mesures sous Windows :
+Ce n'est pas `uv` qui fait fonctionner Engram, c'est un build particulier. Mesures sous Windows :
 
 | Distribution | SQLite lie | Satisfait `3.51.3` |
 | --- | --- | --- |
@@ -49,6 +49,18 @@ les builds jusqu'a `3.14.3`.
 La commande doit afficher une version SQLite au moins egale a `3.51.3` (le build teste pour cette
 release affiche `3.53.1`). Utiliser le meme `--python 3.14.6` pour `serve` et les autres commandes.
 Les contributeurs installent separement `--extra dev` avant les tests.
+
+### Demandez le patch, pas la mineure
+
+`uv python install 3.14` n'est pas cette methode. Sans numero de patch, `uv` installe le build 3.14
+le plus recent que **sa propre version** connait : le build obtenu est donc decide par le `uv` que
+vous avez sous la main, pas par ce que vous avez demande. Or certains de ces builds, dont `3.14.4`,
+lient un SQLite sous le plancher. Nommez `3.14.6`.
+
+Si vous utilisez deliberement un autre build, rien ne l'interdit ici, mais la troisieme commande
+ci-dessus est la seule preuve qu'il fonctionne. Lancez-la. Si elle affiche une version inferieure a
+`3.51.3`, ce build ne peut pas faire tourner Engram : installez `3.14.6`, ou reparez le runtime
+existant avec la methode DLL ci-dessous.
 
 **Un `pip install` qui passe ne prouve rien ici.** Il passe sur toutes les distributions du tableau
 ci-dessus, y compris les quatre qui ne peuvent pas faire tourner Engram. Le controle de version est

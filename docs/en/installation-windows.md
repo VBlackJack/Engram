@@ -14,9 +14,9 @@ when Python loads an older version.
 
 Reference: [WAL-reset bug](https://sqlite.org/wal.html#walreset).
 
-## The only turnkey method: uv-managed Python
+## The turnkey path: one specific uv-managed build
 
-This is not a preference between two supported paths. Measured on Windows:
+`uv` is not what makes this work. One particular build does. Measured on Windows:
 
 | Distribution | SQLite linked | Clears `3.51.3` |
 | --- | --- | --- |
@@ -47,6 +47,17 @@ Installing `3.14.6` needs `uv` 0.12.1 or newer; earlier releases only know build
 The command must display SQLite `3.51.3` or newer (the build tested for this release displays
 `3.53.1`). Use the same `--python 3.14.6` for `serve` and other commands. Contributors install
 `--extra dev` separately before running tests.
+
+### Ask for the patch, not the minor
+
+`uv python install 3.14` is not this method. Without a patch number, `uv` installs the newest 3.14
+build **its own release** knows about, so the build you get is decided by which `uv` you happen to
+have rather than by what you asked for — and some of those builds, `3.14.4` among them, link a
+SQLite below the floor. Name `3.14.6`.
+
+If you deliberately use a different build, nothing here forbids it, but the third command above is
+the only evidence that it works. Run it. If it prints a version below `3.51.3`, that build cannot
+run Engram: install `3.14.6`, or repair the runtime you have with the DLL method below.
 
 **`pip install` succeeding proves nothing here.** It succeeds on every distribution in the table
 above, including the four that cannot run Engram. The version check is the only signal.

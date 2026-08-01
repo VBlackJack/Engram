@@ -34,9 +34,11 @@ project uses date-derived CalVer releases in the form `YYYY.MMDD.NN`.
 - Exercise the documented Windows DLL repair where it can be observed to repair something, on a
   runtime that has just been proven to fail, and report explicitly when a run leaves that path
   unexercised.
-- State the uv-managed interpreter as the only turnkey Windows installation instead of one
-  recommendation among two, publish the measurements that make it the only one, and reframe the DLL
-  replacement as the repair of a runtime already in place.
+- State one specific uv-managed build as the turnkey Windows installation instead of one
+  recommendation among two, publish the measurements behind that claim, and reframe the DLL
+  replacement as the repair of a runtime already in place. The guarantee belongs to the build, not
+  to the installer: asking for a minor version leaves the choice of build to whichever `uv` release
+  is installed, and some of those builds link a SQLite below the floor.
 - Warn in both quick starts that a successful `pip install` is not evidence, and that substituting
   an interpreter for the pinned one is expected to fail the version check.
 - Measure test coverage on every run and fail below a whole-project floor of 85 percent, applied
