@@ -44,6 +44,12 @@ project uses date-derived CalVer releases in the form `YYYY.MMDD.NN`.
 - Measure test coverage on every run and fail below a whole-project floor of 85 percent, applied
   once to the union of both operating-system legs rather than to each leg in isolation, so a module
   that branches on the platform is not judged on code the other leg is the one to execute.
+- Require each module whose failure would lose or corrupt stored memory to clear 90 percent on its
+  own, and treat one of them going missing from the report as a violation rather than as a pass.
+- Cover the branches that decide whether memory survives: every failure path of both database open
+  routines closes its connection, migration to schema five refuses an unusable supersession edge and
+  carries a valid one forward, and the ownership lock refuses a second acquisition, survives an
+  operating-system refusal while releasing, and states who holds it for every role.
 - Audit the locked dependency set the run installed, rather than a fresh resolution describing a
   dependency tree the tested artifact never had.
 - Separate daily memory use from privileged maintenance, route both READMEs through goal-based

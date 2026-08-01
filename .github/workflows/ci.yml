@@ -162,9 +162,15 @@ jobs:
           uv run --frozen --extra dev --python ${{ env.SUPPORTED_PYTHON }}
           coverage combine coverage-data/coverage-data-Linux coverage-data/coverage-data-Windows
 
+      # Two floors, two mechanisms. coverage report enforces the project-wide
+      # one from the coverage configuration; the per-module one is separate
+      # because an average is not a floor, and a well-covered periphery would
+      # otherwise answer for a thin core.
       - name: Enforce the coverage floors
         run: |
           uv run --frozen --extra dev --python ${{ env.SUPPORTED_PYTHON }} coverage report
+          uv run --frozen --extra dev --python ${{ env.SUPPORTED_PYTHON }} coverage json -o coverage.json
+          uv run --frozen --extra dev --python ${{ env.SUPPORTED_PYTHON }} python -m ci.coverage_floors --report coverage.json
           uv run --frozen --extra dev --python ${{ env.SUPPORTED_PYTHON }} coverage xml
 
       - name: Upload the combined report

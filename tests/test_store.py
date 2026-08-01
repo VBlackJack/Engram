@@ -948,6 +948,186 @@ def test_migration_five_rejects_malformed_v4_content_atomically(  # noqa: PLR091
     assert canonical_column is None
 
 
+def test_the_recency_window_narrows_by_scope_and_by_kind(store: EngramStore) -> None:
+    """Both optional filters build SQL of their own; an unfiltered call exercises neither."""
+    for kind, scope, statement in (
+        (EntryKind.FACT, "project/engram", "The recency window keeps facts."),
+        (EntryKind.DECISION, "project/engram", "The recency window keeps decisions."),
+        (EntryKind.FACT, "user", "The recency window separates scopes."),
+    ):
+        store.add_candidate(
+            kind=kind,
+            scope=scope,
+            statement=statement,
+            writer_model="test-model",
+            confidence=Confidence.HIGH,
+            subject_keys=("recency",),
+        )
+
+    def _statements(**kwargs: object) -> set[str]:
+        entries = store.list_retrieval_entries(
+            writer_model="test-model",
+            limit=10,
+            **kwargs,  # type: ignore[arg-type]
+        )
+        return {entry.statement for entry in entries}
+
+    unfiltered = _statements(scope=None, kinds=None)
+    by_scope = _statements(scope="project/Engram", kinds=None)
+    by_kind = _statements(scope=None, kinds=frozenset({EntryKind.DECISION}))
+    by_both = _statements(scope="project/engram", kinds=frozenset({EntryKind.FACT}))
+
+    assert len(unfiltered) == 3
+    assert by_scope == {
+        "The recency window keeps facts.",
+        "The recency window keeps decisions.",
+    }
+    assert by_kind == {"The recency window keeps decisions."}
+    assert by_both == {"The recency window keeps facts."}
+
+
+@pytest.mark.parametrize(
+    ("supersedes", "expected"),
+    [
+        ("not-json", "invalid supersedes JSON"),
+        ('{"old": "01AAAAAAAAAAAAAAAAAAAAAAAA"}', "invalid supersedes list"),
+        ("[42]", "invalid supersedes list"),
+        ('[""]', "invalid supersedes list"),
+        (
+            '["01AAAAAAAAAAAAAAAAAAAAAAAA", "01AAAAAAAAAAAAAAAAAAAAAAAA"]',
+            "duplicate supersedes IDs",
+        ),
+        ('["not a normalized id"]', "field supersedes"),
+        ('["01SSSSSSSSSSSSSSSSSSSSSSSS"]', "self supersession"),
+    ],
+)
+def test_migration_five_refuses_an_unusable_supersession_edge(
+    app_config: AppConfig,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    supersedes: str,
+    expected: str,
+) -> None:
+    """A supersession edge decides which memory is current, so a bad one blocks the upgrade."""
+    database_path = tmp_path / "invalid-supersedes-v4.db"
+    config = replace(
+        app_config,
+        database=replace(app_config.database, path=database_path),
+    )
+    entry_id = "01SSSSSSSSSSSSSSSSSSSSSSSS"
+    migrations = db_module.MIGRATIONS
+    connection = sqlite3.connect(database_path, isolation_level=None)
+    connection.row_factory = sqlite3.Row
+    try:
+        connection.execute("PRAGMA foreign_keys = ON")
+        monkeypatch.setattr(db_module, "MIGRATIONS", migrations[:4])
+        db_module.apply_migrations(connection)
+        # The preflight bound on the supersedes column scales with the number of
+        # entries, so a lone row would be refused for its length before the
+        # migration ever inspects the edge. Seed a second row to clear it.
+        for identifier, statement, value in (
+            ("01FFFFFFFFFFFFFFFFFFFFFFFF", "Legacy unrelated content.", "[]"),
+            (entry_id, "Legacy normalized content.", supersedes),
+        ):
+            connection.execute(
+                """
+                INSERT INTO entries(
+                    id, kind, scope, statement, subject_keys, status, promotion_state,
+                    source_type, writer_model, confidence, observed_at, recorded_at,
+                    valid_from, valid_until, expires_at, idempotency_key, supersedes,
+                    evidence, is_stale, datacron_ref, datacron_hash, synced_at
+                ) VALUES (
+                    ?, 'fact', 'user', ?, '[]',
+                    'active', 'approved', 'human', NULL, 'high', NULL,
+                    '2026-07-21T12:00:00.000000Z', NULL, NULL, NULL, ?, ?, '[]',
+                    0, NULL, NULL, NULL
+                )
+                """,
+                (
+                    identifier,
+                    statement,
+                    canonical_key(EntryKind.FACT, "user", statement),
+                    value,
+                ),
+            )
+    finally:
+        connection.close()
+        monkeypatch.setattr(db_module, "MIGRATIONS", migrations)
+
+    with pytest.raises(DatabaseError, match=expected):
+        EngramStore(config)
+
+    connection = sqlite3.connect(database_path)
+    try:
+        version = connection.execute("SELECT version FROM schema_version").fetchone()
+    finally:
+        connection.close()
+    assert version == (4,), "a refused migration must leave the schema where it was"
+
+
+def test_migration_five_carries_a_valid_supersession_edge_forward(
+    app_config: AppConfig,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The refusals above only mean something if the accepted shape is exercised too."""
+    database_path = tmp_path / "valid-supersedes-v4.db"
+    config = replace(
+        app_config,
+        database=replace(app_config.database, path=database_path),
+    )
+    old_id = "01BBBBBBBBBBBBBBBBBBBBBBBB"
+    new_id = "01NEWNEWNEWNEWNEWNEWNEWNEW"
+    migrations = db_module.MIGRATIONS
+    connection = sqlite3.connect(database_path, isolation_level=None)
+    connection.row_factory = sqlite3.Row
+    try:
+        connection.execute("PRAGMA foreign_keys = ON")
+        monkeypatch.setattr(db_module, "MIGRATIONS", migrations[:4])
+        db_module.apply_migrations(connection)
+        # The replaced entry must already be terminal: migration v5 refuses an
+        # edge that would leave two entries current for the same claim.
+        for identifier, statement, status, supersedes in (
+            (old_id, "Legacy superseded content.", "superseded", "[]"),
+            (new_id, "Legacy replacement content.", "active", f'["{old_id}"]'),
+        ):
+            connection.execute(
+                """
+                INSERT INTO entries(
+                    id, kind, scope, statement, subject_keys, status, promotion_state,
+                    source_type, writer_model, confidence, observed_at, recorded_at,
+                    valid_from, valid_until, expires_at, idempotency_key, supersedes,
+                    evidence, is_stale, datacron_ref, datacron_hash, synced_at
+                ) VALUES (
+                    ?, 'fact', 'user', ?, '[]',
+                    ?, 'approved', 'human', NULL, 'high', NULL,
+                    '2026-07-21T12:00:00.000000Z', NULL, NULL, NULL, ?, ?, '[]',
+                    0, NULL, NULL, NULL
+                )
+                """,
+                (
+                    identifier,
+                    statement,
+                    status,
+                    canonical_key(EntryKind.FACT, "user", statement),
+                    supersedes,
+                ),
+            )
+    finally:
+        connection.close()
+        monkeypatch.setattr(db_module, "MIGRATIONS", migrations)
+
+    with EngramStore(config):
+        pass
+
+    connection = sqlite3.connect(database_path)
+    try:
+        version = connection.execute("SELECT version FROM schema_version").fetchone()
+    finally:
+        connection.close()
+    assert version == (len(migrations),)
+
+
 def test_migration_precheck_bounds_nul_terminated_text_before_materializing(
     app_config: AppConfig,
     tmp_path: Path,
