@@ -81,8 +81,8 @@ jobs:
       # The development extra is excluded by not being requested: it is an
       # optional-dependency extra, so nothing has to be passed to leave it out.
       #
-      # Rehearsable on the staging repository through workflow_dispatch, which
-      # runs this job without running the tag-gated one below.
+      # Rehearsable through workflow_dispatch, which runs this job without
+      # running the tag-gated one below.
       - name: Build the software bill of materials
         run: |
           uv export --frozen --no-emit-project --format requirements.txt \
@@ -122,11 +122,11 @@ jobs:
       # them. Attesting in the build job would sign artifacts that still have an
       # upload and a download to survive before anyone can fetch them.
       #
-      # This step cannot be rehearsed on the private staging repository:
-      # artifact attestations are restricted to public repositories on the Free,
-      # Pro and Team plans, and a private repository needs Enterprise Cloud. It
-      # therefore runs for the first time on the first public tag, and verifying
-      # it is a post-publication step rather than a precondition of publishing.
+      # Artifact attestations are restricted to public repositories on the Free,
+      # Pro and Team plans; a private repository would need Enterprise Cloud.
+      # This repository is public, so the step is exercisable rather than taken
+      # on trust, and verifying it belongs to the release itself instead of to
+      # whatever happens after publishing.
       - name: Attest build provenance
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373  # v4.1.1
         with:
