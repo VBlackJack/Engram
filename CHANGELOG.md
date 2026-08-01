@@ -39,7 +39,9 @@ project uses date-derived CalVer releases in the form `YYYY.MMDD.NN`.
   replacement as the repair of a runtime already in place.
 - Warn in both quick starts that a successful `pip install` is not evidence, and that substituting
   an interpreter for the pinned one is expected to fail the version check.
-- Measure test coverage on every run and fail below a whole-project floor of 85 percent.
+- Measure test coverage on every run and fail below a whole-project floor of 85 percent, applied
+  once to the union of both operating-system legs rather than to each leg in isolation, so a module
+  that branches on the platform is not judged on code the other leg is the one to execute.
 - Audit the locked dependency set the run installed, rather than a fresh resolution describing a
   dependency tree the tested artifact never had.
 - Separate daily memory use from privileged maintenance, route both READMEs through goal-based

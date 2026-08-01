@@ -87,6 +87,16 @@ testpaths = ["tests"]
 
 [tool.coverage.run]
 source = ["engram", "ci"]
+relative_files = true
+
+[tool.coverage.paths]
+# The two continuous-integration legs check out under different roots, and one
+# separates with backslashes. Without this remapping, combine has no reason to
+# believe two recordings describe the same file, so it keeps both and the
+# per-module totals double instead of merging. That failure is silent: the
+# report still renders, it just describes a project twice the size.
+engram = ["src/engram", "*/src/engram", "*\\src\\engram"]
+ci = ["ci", "*/ci", "*\\ci"]
 
 [tool.coverage.report]
 # Whole-project floor. Per-module floors for the modules that lose or corrupt
