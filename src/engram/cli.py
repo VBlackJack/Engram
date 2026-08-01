@@ -377,7 +377,11 @@ def _ensure_server_bind_available(host: str, port: int) -> None:
     address: tuple[str, int] | tuple[str, int, int, int]
     address = (host, port, 0, 0) if address_family == socket.AF_INET6 else (host, port)
     with socket.socket(address_family, socket.SOCK_STREAM) as listener:
-        if os.name == "nt":
+        # sys.platform rather than os.name, unlike the other platform branches in
+        # this project. Both are equivalent at run time, but only sys.platform is
+        # narrowed by the type checker, and this branch is the one that reaches a
+        # socket option which exists on Windows alone.
+        if sys.platform == "win32":
             listener.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
         else:
             listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
