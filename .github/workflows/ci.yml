@@ -71,7 +71,19 @@ jobs:
         run: uv run --frozen --extra dev --python ${{ env.SUPPORTED_PYTHON }} mypy
 
       - name: Pytest
-        run: uv run --frozen --extra dev --python ${{ env.SUPPORTED_PYTHON }} pytest
+        run: >-
+          uv run --frozen --extra dev --python ${{ env.SUPPORTED_PYTHON }}
+          pytest --cov --cov-report=term --cov-report=xml
+
+      # Audits the locked set this run installed, not whatever resolves today.
+      # An audit of a fresh resolution would describe a dependency tree the
+      # tested artifact never had. --strict fails on a skipped package too,
+      # so an unauditable dependency cannot pass as a clean report.
+      - name: Audit locked dependencies
+        shell: bash
+        run: |
+          uv export --frozen --extra dev --no-emit-project --format requirements.txt --output-file "$RUNNER_TEMP/requirements.txt"
+          uv run --frozen --python ${{ env.SUPPORTED_PYTHON }} --with pip-audit==2.10.1 pip-audit --strict --disable-pip --requirement "$RUNNER_TEMP/requirements.txt"
 
       - name: FTS evaluation contract
         env:

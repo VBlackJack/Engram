@@ -30,6 +30,9 @@ project uses date-derived CalVer releases in the form `YYYY.MMDD.NN`.
   replacement as the repair of a runtime already in place.
 - Warn in both quick starts that a successful `pip install` is not evidence, and that substituting
   an interpreter for the pinned one is expected to fail the version check.
+- Measure test coverage on every run and fail below a whole-project floor of 85 percent.
+- Audit the locked dependency set the run installed, rather than a fresh resolution describing a
+  dependency tree the tested artifact never had.
 - Separate daily memory use from privileged maintenance, route both READMEs through goal-based
   documentation, and clarify that Cortex synchronization is explicit rather than automatic.
 - Publish both tool schemas without local references so a client that does not dereference still

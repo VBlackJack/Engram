@@ -34,6 +34,7 @@ dev = [
   "jsonschema>=4.26.0",
   "mypy>=1.18.2",
   "pytest>=8.4.2",
+  "pytest-cov>=7.1.0",
   "ruff>=0.14.0",
   "types-jsonschema>=4.26.0",
 ]
@@ -83,3 +84,18 @@ files = ["ci", "src", "tests"]
 [tool.pytest.ini_options]
 addopts = "-ra --strict-config --strict-markers"
 testpaths = ["tests"]
+
+[tool.coverage.run]
+source = ["engram", "ci"]
+
+[tool.coverage.report]
+# Whole-project floor. Per-module floors for the modules that lose or corrupt
+# memory when they are wrong are enforced separately, because a project-wide
+# average lets a well-covered periphery hide an uncovered core.
+fail_under = 85
+show_missing = true
+exclude_also = [
+  "if TYPE_CHECKING:",
+  "raise NotImplementedError",
+  "if __name__ == .__main__.:",
+]
