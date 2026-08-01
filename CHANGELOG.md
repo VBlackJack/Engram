@@ -13,8 +13,18 @@ project uses date-derived CalVer releases in the form `YYYY.MMDD.NN`.
   Engram-Datacron-Cortex guides, with short ADHD-friendly paths and expected results.
 - Add contract tests binding every published input constraint to the enforcement the server
   performs, including a proof that each published keyword is what rejects the invalid value.
+- Add a turnkey contract job that installs the distribution on an unmodified Windows runtime and
+  asserts the outcome that runtime actually produces: a working command when its SQLite clears the
+  fail-closed minimum, and the documented exit code and message when it does not.
 
 ### Changed
+
+- Run continuous integration and release builds on the uv-managed interpreter the documentation
+  tells users to install, instead of building or replacing SQLite on the runner. A gate that
+  installs the version it is meant to require measures the runner, not the product.
+- Exercise the documented Windows DLL repair where it can be observed to repair something, on a
+  runtime that has just been proven to fail, and report explicitly when a run leaves that path
+  unexercised.
 
 - Separate daily memory use from privileged maintenance, route both READMEs through goal-based
   documentation, and clarify that Cortex synchronization is explicit rather than automatic.
