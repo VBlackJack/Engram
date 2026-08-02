@@ -983,9 +983,9 @@ def _ladder(
     monkeypatch.setattr(
         autostart_module,
         "database_ownership",
-        lambda _config: answers.pop(0)
-        if answers
-        else DatabaseOwnership(locked=False, role=None, pid=None),
+        lambda _config: (
+            answers.pop(0) if answers else DatabaseOwnership(locked=False, role=None, pid=None)
+        ),
     )
     monkeypatch.setattr(autostart_module, "LOCK_POLL_INTERVAL_SECONDS", 0.0)
     for name in (
