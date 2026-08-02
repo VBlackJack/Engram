@@ -160,6 +160,18 @@ def autostart_arguments(
     )
 
 
+@pytest.fixture(autouse=True)
+def logon_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Name the logon account, so no test here reads the one of the host it runs on.
+
+    Windows always sets USERNAME, so every task definition built below quietly
+    resolved its account from the ambient session and passed. A host that does not
+    set it fails instead, which is what the account check exists to do.
+    """
+    monkeypatch.setenv(autostart_module.USER_DOMAIN_KEY, "NYX")
+    monkeypatch.setenv(autostart_module.USER_NAME_KEY, "User")
+
+
 @pytest.fixture
 def windows_runtime(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """Pretend to run on Windows from an interpreter that ships a windowed build."""
