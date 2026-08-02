@@ -33,6 +33,7 @@ import sys
 import tempfile
 import time
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING
 from xml.etree import ElementTree as ET
@@ -42,6 +43,7 @@ from .process_lock import (
     DatabaseLockError,
     DatabaseLockRole,
     DatabaseProcessLock,
+    database_lock_path,
 )
 
 if TYPE_CHECKING:  # pragma: no cover - imported for typing only
@@ -76,6 +78,14 @@ USER_NAME_KEY = "USERNAME"
 SCHEDULER_DUMP_ENCODING = "utf-8"
 LOCK_RELEASE_TIMEOUT_SECONDS = 30.0
 LOCK_POLL_INTERVAL_SECONDS = 0.25
+# The stop request is a sibling of the ownership lock, in the directory that
+# holds the database. Asking a daemon to stop then costs exactly the right to
+# write beside its database, which is already the right to corrupt it.
+STOP_REQUEST_SUFFIX = ".stop"
+GRACEFUL_STOP_TIMEOUT_SECONDS = 10.0
+TASK_END_TIMEOUT_SECONDS = 10.0
+FORCED_STOP_TIMEOUT_SECONDS = 5.0
+TERMINATE_COMMAND = "taskkill"
 
 
 class AutostartError(RuntimeError):
@@ -126,6 +136,14 @@ class TaskConflict:
         return self.database is not None
 
 
+class StopMethod(StrEnum):
+    """How far the escalation had to go before the database was released."""
+
+    SENTINEL = "sentinel"
+    TASK_END = "task_end"
+    FORCED = "forced"
+
+
 @dataclass(frozen=True, slots=True)
 class DisabledTask:
     """One task this command took out of the way, reversibly."""
@@ -133,6 +151,40 @@ class DisabledTask:
     task_name: str
     ended: bool
     stopped_pid: int | None
+    stop_method: StopMethod | None
+
+
+def stop_request_path(database_path: Path) -> Path:
+    """Derive the stop request beside the ownership lock of one database."""
+    return database_lock_path(database_path).with_suffix(STOP_REQUEST_SUFFIX)
+
+
+def request_stop(database_path: Path) -> Path:
+    """Ask whichever daemon owns this database to close it and exit."""
+    path = stop_request_path(database_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.touch()
+    return path
+
+
+def stop_requested(database_path: Path) -> bool:
+    """Return whether a stop has been requested for this database."""
+    return stop_request_path(database_path).is_file()
+
+
+def clear_stop_request(database_path: Path) -> bool:
+    """Remove one stop request and report whether there was one to remove.
+
+    Callers must already own the database. Clearing a request without the lock
+    would let a process that is about to fail on the lock cancel a stop meant
+    for the daemon that holds it.
+    """
+    path = stop_request_path(database_path)
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return False
+    return True
 
 
 @dataclass(frozen=True, slots=True)
@@ -329,6 +381,20 @@ def _parse_task_dump(document: str) -> tuple[ScheduledAction, ...]:
     return tuple(actions)
 
 
+def registered_command(plan: AutostartPlan) -> Path | None:
+    """Return the executable the scheduler holds for this task, if it holds one.
+
+    The plan is recomputed from the running interpreter, so it can never be
+    missing. What can go missing is the interpreter written into the task at
+    install time, which is a different path and the one that runs at logon.
+    """
+    require_supported_platform()
+    for action in registered_actions():
+        if action.task_name.casefold() == plan.task_name.casefold():
+            return canonical_path(action.command)
+    return None
+
+
 def conflicting_tasks(plan: AutostartPlan, *, database: Path) -> tuple[TaskConflict, ...]:
     """Return every enabled task that reaches, or may reach, this database.
 
@@ -474,44 +540,104 @@ def _disable_conflicts(
             action=f"disable the competing task {conflict.task_name}",
         )
         ownership = database_ownership(config)
-        # /End refuses a task that is not running, which is an answer rather
-        # than a failure: nothing had to be stopped.
-        ended = (
-            _run_scheduler(("/End", "/TN", conflict.task_name)).returncode == SCHEDULER_SUCCESS
-            if ownership.locked
-            else False
-        )
+        method = _stop_owner(conflict.task_name, config=config, ownership=ownership, logger=logger)
         logger.info(
-            "Disabled competing task %s (ended=%s, database owner pid=%s)",
+            "Disabled competing task %s (stop=%s, database owner pid=%s)",
             conflict.task_name,
-            ended,
+            "none" if method is None else method.value,
             ownership.pid,
         )
         disabled.append(
             DisabledTask(
                 task_name=conflict.task_name,
-                ended=ended,
+                ended=method is not None,
                 stopped_pid=ownership.pid if ownership.daemon_running else None,
+                stop_method=method,
             )
         )
     _wait_for_release(config, logger=logger)
     return tuple(disabled)
 
 
+def _stop_owner(
+    task_name: str,
+    *,
+    config: AppConfig,
+    ownership: DatabaseOwnership,
+    logger: logging.Logger,
+) -> StopMethod | None:
+    """Escalate from asking to ending to terminating, verifying each rung.
+
+    Ending a task only terminates the process the scheduler started. When that
+    process is a wrapper script, the daemon it launched survives, keeps the lock
+    and keeps serving, while the scheduler reports the task stopped. Every rung
+    is therefore checked against the ownership lock rather than believed.
+    """
+    if not ownership.locked:
+        return None
+    try:
+        request_stop(config.database.path)
+        logger.info("Stop requested for %s through the sentinel", task_name)
+        if _released_within(config, GRACEFUL_STOP_TIMEOUT_SECONDS):
+            return StopMethod.SENTINEL
+        ended = _run_scheduler(("/End", "/TN", task_name)).returncode == SCHEDULER_SUCCESS
+        if ended and _released_within(config, TASK_END_TIMEOUT_SECONDS):
+            return StopMethod.TASK_END
+        surviving = database_ownership(config)
+        if not surviving.locked:
+            return StopMethod.TASK_END
+        if surviving.pid is not None:
+            logger.warning(
+                "Task %s reported stopped while pid %d still owns the database; "
+                "terminating the surviving tree",
+                task_name,
+                surviving.pid,
+            )
+            _terminate_tree(surviving.pid)
+            if _released_within(config, FORCED_STOP_TIMEOUT_SECONDS):
+                return StopMethod.FORCED
+    finally:
+        # Never leave a request behind. The next daemon clears one it finds, but
+        # a stale sentinel is exactly the failure this command exists to remove.
+        clear_stop_request(config.database.path)
+    return None
+
+
+def _terminate_tree(pid: int) -> None:
+    """Terminate one process and its descendants, as a last resort."""
+    executable = shutil.which(TERMINATE_COMMAND)
+    if executable is None:
+        raise AutostartError(
+            f"The {TERMINATE_COMMAND} command is not available on PATH, so the surviving "
+            f"process {pid} cannot be stopped. Stop it manually, then rerun."
+        )
+    subprocess.run(  # noqa: S603 - resolved executable, list argv, no shell
+        [executable, "/PID", str(pid), "/T", "/F"],
+        capture_output=True,
+        check=False,
+    )
+
+
+def _released_within(config: AppConfig, budget_seconds: float) -> bool:
+    """Poll the ownership lock for one budget and report whether it came free."""
+    deadline = time.monotonic() + budget_seconds
+    while True:
+        if not database_ownership(config).locked:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(LOCK_POLL_INTERVAL_SECONDS)
+
+
 def _wait_for_release(config: AppConfig, *, logger: logging.Logger) -> None:
     """Wait for the ownership lock itself, never for a fixed delay."""
-    deadline = time.monotonic() + LOCK_RELEASE_TIMEOUT_SECONDS
-    while True:
-        ownership = database_ownership(config)
-        if not ownership.locked:
-            logger.info("Database released by the competing task")
-            return
-        if time.monotonic() >= deadline:
-            raise AutostartError(
-                f"The database is still held by {_describe_owner(ownership)} after "
-                f"{LOCK_RELEASE_TIMEOUT_SECONDS:.0f} seconds. Stop that process, then rerun."
-            )
-        time.sleep(LOCK_POLL_INTERVAL_SECONDS)
+    if _released_within(config, LOCK_RELEASE_TIMEOUT_SECONDS):
+        logger.info("Database released by the competing task")
+        return
+    raise AutostartError(
+        f"The database is still held by {_describe_owner(database_ownership(config))} after "
+        f"{LOCK_RELEASE_TIMEOUT_SECONDS:.0f} seconds. Stop that process, then rerun."
+    )
 
 
 def is_installed(plan: AutostartPlan) -> bool:

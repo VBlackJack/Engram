@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import _thread
 import argparse
 import errno
 import json
@@ -13,6 +14,7 @@ import os
 import socket
 import sqlite3
 import sys
+import threading
 from collections.abc import Mapping
 from datetime import date, datetime
 from pathlib import Path
@@ -25,11 +27,14 @@ from .autostart import (
     DisabledTask,
     TaskConflict,
     build_plan,
+    clear_stop_request,
     conflicting_tasks,
     database_ownership,
     install,
     is_installed,
+    registered_command,
     resolve_conflicts,
+    stop_requested,
     uninstall,
 )
 from .config import (
@@ -86,6 +91,8 @@ EXIT_INTERRUPTED = 130
 DEBUG_ENVIRONMENT_KEY = "ENGRAM_DEBUG"
 DEBUG_TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
 WINDOWS_ADDRESS_IN_USE = getattr(errno, "WSAEADDRINUSE", 10048)
+STOP_WATCH_INTERVAL_SECONDS = 0.5
+STOP_WATCH_JOIN_TIMEOUT_SECONDS = 5.0
 
 
 class ServerBindError(OSError):
@@ -449,6 +456,52 @@ def _dispatch(  # noqa: C901, PLR0912
         parser.error(f"Unsupported command: {arguments.command}")
 
 
+class _StopWatcher:
+    """Turn a stop request beside the database into a clean unwind of `serve`.
+
+    A windowed daemon owns no console, so no console control event can reach it.
+    Raising the interrupt in the main thread is what lets `serve` leave its
+    context managers normally: the store closes its connection, and SQLite
+    removes the write-ahead log and its shared index because the last connection
+    went away. That removal is the observable proof the shutdown was clean.
+    """
+
+    def __init__(self, database_path: Path, *, logger: logging.Logger) -> None:
+        """Watch one database for a stop request without owning it."""
+        self._database_path = database_path
+        self._logger = logger
+        self._finished = threading.Event()
+        self._requested = threading.Event()
+        self._thread = threading.Thread(
+            target=self._watch,
+            name="engram-stop-watcher",
+            daemon=True,
+        )
+
+    @property
+    def requested(self) -> bool:
+        """Return whether this watcher is the reason the server is unwinding."""
+        return self._requested.is_set()
+
+    def start(self) -> None:
+        """Begin watching."""
+        self._thread.start()
+
+    def stop(self) -> None:
+        """Stop watching and wait for the thread to leave."""
+        self._finished.set()
+        self._thread.join(timeout=STOP_WATCH_JOIN_TIMEOUT_SECONDS)
+
+    def _watch(self) -> None:
+        while not self._finished.wait(STOP_WATCH_INTERVAL_SECONDS):
+            if not stop_requested(self._database_path):
+                continue
+            self._requested.set()
+            self._logger.info("Stop requested; unwinding the Engram MCP server")
+            _thread.interrupt_main()
+            return
+
+
 def _serve(*, config: AppConfig, logger: logging.Logger) -> None:
     _ensure_server_bind_available(config.server.host, config.server.port)
     with (
@@ -459,23 +512,50 @@ def _serve(*, config: AppConfig, logger: logging.Logger) -> None:
         ) as process_lock,
         EngramStore(config, process_lock=process_lock) as store,
     ):
-        server = create_mcp_server(config, store)
-        logger.info(
-            "Starting Engram MCP server on http://%s:%d%s",
-            config.server.host,
-            config.server.port,
-            config.server.path,
-        )
+        # Only once this process owns the database. A second serve started by
+        # mistake fails on the lock, and clearing beforehand would have it
+        # cancel a stop request meant for the daemon that actually holds it.
+        if clear_stop_request(config.database.path):
+            logger.info("Cleared a stop request left behind by an earlier run")
+        watcher = _StopWatcher(config.database.path, logger=logger)
+        watcher.start()
         try:
-            server.run(transport="streamable-http")
-        except SystemExit as exc:
-            if exc.code in {None, 0}:
-                return
-            raise ServerBindError(
-                f"Engram server could not start on {config.server.host}:{config.server.port}; "
-                "verify server.host and choose an available server.port"
-            ) from exc
-        logger.info("Engram MCP server stopped")
+            _run_server(config=config, store=store, logger=logger, watcher=watcher)
+        finally:
+            watcher.stop()
+            clear_stop_request(config.database.path)
+
+
+def _run_server(
+    *,
+    config: AppConfig,
+    store: EngramStore,
+    logger: logging.Logger,
+    watcher: _StopWatcher,
+) -> None:
+    """Run the transport until it stops, is asked to stop, or fails to bind."""
+    server = create_mcp_server(config, store)
+    logger.info(
+        "Starting Engram MCP server on http://%s:%d%s",
+        config.server.host,
+        config.server.port,
+        config.server.path,
+    )
+    try:
+        server.run(transport="streamable-http")
+    except KeyboardInterrupt:
+        if not watcher.requested:
+            raise
+        logger.info("Engram MCP server stopped on request")
+        return
+    except SystemExit as exc:
+        if exc.code in {None, 0}:
+            return
+        raise ServerBindError(
+            f"Engram server could not start on {config.server.host}:{config.server.port}; "
+            "verify server.host and choose an available server.port"
+        ) from exc
+    logger.info("Engram MCP server stopped")
 
 
 def _ensure_server_bind_available(host: str, port: int) -> None:
@@ -591,6 +671,10 @@ def _setup_autostart(
         _install_autostart(plan, config=config, logger=logger, arguments=arguments)
         return
     ownership = database_ownership(config)
+    # The interpreter that will actually run at the next logon is the one written
+    # into the task, not the one this process would compute now. Reporting the
+    # latter would answer "present" for an installation that can no longer start.
+    registered = registered_command(plan)
     _write_json(
         _plan_payload(plan)
         | {
@@ -599,6 +683,8 @@ def _setup_autostart(
                 _conflict_payload(conflict)
                 for conflict in conflicting_tasks(plan, database=config.database.path)
             ],
+            "interpreter_present": (registered or plan.command).is_file(),
+            "registered_command": None if registered is None else str(registered),
             "daemon_running": ownership.daemon_running,
             "database_locked": ownership.locked,
             "database_owner_pid": ownership.pid,
@@ -650,7 +736,12 @@ def _conflict_payload(conflict: TaskConflict) -> dict[str, object]:
 
 def _disabled_payload(task: DisabledTask) -> dict[str, object]:
     """Describe one task this command took out of the way."""
-    return {"ended": task.ended, "stopped_pid": task.stopped_pid, "task_name": task.task_name}
+    return {
+        "ended": task.ended,
+        "stop_method": None if task.stop_method is None else task.stop_method.value,
+        "stopped_pid": task.stopped_pid,
+        "task_name": task.task_name,
+    }
 
 
 def _plan_payload(plan: AutostartPlan) -> dict[str, object]:

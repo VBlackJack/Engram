@@ -23,6 +23,27 @@ project uses date-derived CalVer releases in the form `YYYY.MMDD.NN`.
 - Add a `--config` option that names the configuration file explicitly. A scheduled task inherits
   no environment variable, so the file a normal invocation would discover has to be written into
   the task rather than assumed.
+- Add a way to ask the daemon to stop. A windowless process can receive no console control event,
+  so every stop so far was a termination, and a terminated daemon never closes its last SQLite
+  connection: the write-ahead log and its shared index survived every restart. The request is an
+  empty file beside the ownership lock, which makes the right to stop Engram exactly the right to
+  write in its database directory — already the right to corrupt it — and exposes nothing on the
+  unauthenticated loopback port. The daemon now exits on its own with code 0, and the disappearance
+  of `-wal` and `-shm` is the observable proof the shutdown was clean.
+- Clear a stop request only after taking the ownership lock, never before. A second `serve` started
+  by mistake fails on that lock; had it cleared first, it would have cancelled a stop meant for the
+  daemon that owns the database, leaving an operator who asked for a shutdown watching nothing
+  happen. A request left behind by an earlier run is cleared at startup, so a stale file cannot
+  stop the next daemon either.
+- Escalate `--replace` from asking to ending to terminating, and verify each rung against the
+  ownership lock. Ending a task only terminates the process the scheduler started: in production
+  that was a wrapper script, and the daemon it had launched survived, kept the lock and kept
+  serving while the scheduler reported the task stopped. The payload now names which rung released
+  the database.
+- Report `interpreter_present` and `registered_command` in `--status`, read back from the task the
+  scheduler holds rather than recomputed from the running interpreter. The recomputed one always
+  exists; the one written into the task at install time is the one that can be deleted, and its
+  absence is why a task can be registered, enabled, and unable to start.
 - Refuse to install the logon task while another registered task would open the same database, and
   add `--replace` to take that installation over. The test is the database each task resolves to,
   never the name of a task: a literal name would be hardcoding, and would miss any installation

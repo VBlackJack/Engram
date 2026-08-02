@@ -74,7 +74,7 @@ Ce que la commande fait, et ce qu'elle ne fait pas :
 | Action | Effet | Code de sortie |
 |---|---|---|
 | `--install` | Enregistre ou met a jour **une seule** tache pour ce `engram.toml`, puis demarre le daemon si la base est libre. Rejouer la commande converge, sans doublon. | `0` |
-| `--status` | N'ecrit rien. Repond dans le JSON, jamais par le code de sortie. | `0` dans tous les cas |
+| `--status` | N'ecrit rien. Repond dans le JSON, jamais par le code de sortie. Le champ `interpreter_present` dit si l'interpreteur **enregistre dans la tache** existe toujours : `installed: true` avec `interpreter_present: false` decrit une tache qui ne demarrera plus. | `0` dans tous les cas |
 | `--uninstall` | Supprime la tache. Sur une tache deja absente, `removed` vaut `false`. | `0` |
 
 ### Reprendre une installation anterieure
@@ -133,6 +133,28 @@ Points a connaitre :
 - pour cibler un fichier de configuration precis, ajoutez `--config <chemin>` avant la
   sous-commande. La tache enregistre ce chemin en clair, elle n'herite d'aucune variable
   d'environnement.
+
+### Arreter le daemon proprement
+
+Un daemon sans console ne peut recevoir ni `Ctrl+C` ni `Ctrl+Break`. Pour lui demander de
+s'arreter, deposez un fichier vide `<base>.stop` a cote de la base - le meme repertoire que le
+verrou :
+
+```powershell
+New-Item -ItemType File -Path "local\runtime\engram.db.stop" -Force
+```
+
+**Resultat attendu :** le processus sort seul en code `0`, et **`engram.db-wal` comme
+`engram.db-shm` disparaissent**. C'est la preuve observable d'une fermeture propre : SQLite ne
+supprime ces deux fichiers qu'a la fermeture de la derniere connexion. Le daemon efface lui-meme la
+sentinelle en partant.
+
+Le droit d'arreter Engram est donc exactement le droit d'ecrire dans le repertoire de sa base, qui
+est deja le droit de la corrompre. Aucun port n'expose cette capacite.
+
+Une sentinelle oubliee n'empeche pas le demarrage suivant : le daemon efface celle qu'il trouve
+**apres** avoir pris le verrou. Un second `serve` lance par erreur echoue sur le verrou sans
+toucher a une demande d'arret destinee au daemon en place.
 
 Pour un diagnostic au premier plan, `engram serve` reste disponible et se comporte comme avant :
 il occupe le terminal et s'arrete a sa fermeture. Arretez d'abord le daemon, car un seul processus

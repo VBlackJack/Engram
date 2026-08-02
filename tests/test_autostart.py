@@ -5,12 +5,14 @@
 
 from __future__ import annotations
 
+import _thread
 import argparse
 import json
 import logging
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 from xml.etree import ElementTree as ET
@@ -19,23 +21,29 @@ import pytest
 
 import engram.__main__ as module_entry_point
 import engram.autostart as autostart_module
+import engram.cli as cli_module
 from engram.autostart import (
     TASK_NAMESPACE,
     AutostartConflictError,
     AutostartError,
     AutostartUnsupportedError,
     DatabaseOwnership,
+    StopMethod,
     TaskConflict,
     build_plan,
     canonical_path,
+    clear_stop_request,
     conflicting_tasks,
     database_ownership,
     install,
     is_installed,
     registered_actions,
+    request_stop,
     require_supported_platform,
     resolve_conflicts,
     same_path,
+    stop_request_path,
+    stop_requested,
     task_name,
     uninstall,
     windowed_interpreter,
@@ -49,7 +57,12 @@ from engram.cli import (
     main,
 )
 from engram.config import DEFAULT_CONFIG_PATH, ENV_PREFIX, load_config
-from engram.process_lock import DatabaseLockRole, DatabaseProcessLock
+from engram.process_lock import (
+    DatabaseLockError,
+    DatabaseLockRole,
+    DatabaseProcessLock,
+    database_lock_path,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -962,19 +975,44 @@ def test_replace_disables_the_competing_task_without_deleting_it(
     assert "/Delete" not in scheduler.verbs()
 
 
-def test_replace_stops_the_running_daemon_and_waits_for_the_lock_itself(
+def _ladder(
+    monkeypatch: pytest.MonkeyPatch,
+    answers: list[DatabaseOwnership],
+) -> None:
+    """Answer every ownership probe from a script, with no waiting."""
+    monkeypatch.setattr(
+        autostart_module,
+        "database_ownership",
+        lambda _config: answers.pop(0)
+        if answers
+        else DatabaseOwnership(locked=False, role=None, pid=None),
+    )
+    monkeypatch.setattr(autostart_module, "LOCK_POLL_INTERVAL_SECONDS", 0.0)
+    for name in (
+        "GRACEFUL_STOP_TIMEOUT_SECONDS",
+        "TASK_END_TIMEOUT_SECONDS",
+        "FORCED_STOP_TIMEOUT_SECONDS",
+        "LOCK_RELEASE_TIMEOUT_SECONDS",
+    ):
+        monkeypatch.setattr(autostart_module, name, 0.0)
+
+
+def test_replace_asks_before_it_ends_or_terminates_anything(
     app_config: AppConfig,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """A daemon that honours the sentinel must never be ended or terminated."""
     scheduler = RecordingScheduler(present=True)
     monkeypatch.setattr(autostart_module, "_run_scheduler", scheduler)
-    answers = [
-        DatabaseOwnership(locked=True, role=DatabaseLockRole.DAEMON, pid=1234),
-        DatabaseOwnership(locked=True, role=DatabaseLockRole.DAEMON, pid=1234),
-        DatabaseOwnership(locked=False, role=None, pid=None),
-    ]
-    monkeypatch.setattr(autostart_module, "database_ownership", lambda _config: answers.pop(0))
-    monkeypatch.setattr(autostart_module, "LOCK_POLL_INTERVAL_SECONDS", 0.0)
+    terminated: list[int] = []
+    monkeypatch.setattr(autostart_module, "_terminate_tree", terminated.append)
+    _ladder(
+        monkeypatch,
+        [
+            DatabaseOwnership(locked=True, role=DatabaseLockRole.DAEMON, pid=1234),
+            DatabaseOwnership(locked=False, role=None, pid=None),
+        ],
+    )
 
     disabled = resolve_conflicts(
         (_conflict(database=app_config.database.path),),
@@ -984,24 +1022,77 @@ def test_replace_stops_the_running_daemon_and_waits_for_the_lock_itself(
         logger=LOGGER,
     )
 
+    assert disabled[0].stop_method is StopMethod.SENTINEL
     assert disabled[0].stopped_pid == 1234
     assert disabled[0].ended
-    assert scheduler.named("/End") == ["Engram Local Daemon"]
-    assert answers == []
+    assert "/End" not in scheduler.verbs()
+    assert terminated == []
+    assert not stop_requested(app_config.database.path)
 
 
-def test_replace_gives_up_when_the_lock_is_never_released(
+def test_replace_ends_the_task_when_the_daemon_ignores_the_sentinel(
     app_config: AppConfig,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    scheduler = RecordingScheduler(present=True)
+    monkeypatch.setattr(autostart_module, "_run_scheduler", scheduler)
+    terminated: list[int] = []
+    monkeypatch.setattr(autostart_module, "_terminate_tree", terminated.append)
+    held = DatabaseOwnership(locked=True, role=DatabaseLockRole.DAEMON, pid=1234)
+    _ladder(monkeypatch, [held, held, DatabaseOwnership(locked=False, role=None, pid=None)])
+
+    disabled = resolve_conflicts(
+        (_conflict(database=app_config.database.path),),
+        config=app_config,
+        replace=True,
+        force=False,
+        logger=LOGGER,
+    )
+
+    assert disabled[0].stop_method is StopMethod.TASK_END
+    assert scheduler.named("/End") == ["Engram Local Daemon"]
+    assert terminated == []
+
+
+def test_replace_terminates_the_tree_the_scheduler_left_behind(
+    app_config: AppConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The production failure: the task ends, its descendants keep the lock."""
     monkeypatch.setattr(autostart_module, "_run_scheduler", RecordingScheduler(present=True))
+    terminated: list[int] = []
+    monkeypatch.setattr(autostart_module, "_terminate_tree", terminated.append)
+    held = DatabaseOwnership(locked=True, role=DatabaseLockRole.DAEMON, pid=82820)
+    _ladder(
+        monkeypatch,
+        [held, held, held, held, DatabaseOwnership(locked=False, role=None, pid=None)],
+    )
+
+    disabled = resolve_conflicts(
+        (_conflict(database=app_config.database.path),),
+        config=app_config,
+        replace=True,
+        force=False,
+        logger=LOGGER,
+    )
+
+    assert disabled[0].stop_method is StopMethod.FORCED
+    assert terminated == [82820]
+
+
+def test_replace_leaves_no_stop_request_behind_when_it_gives_up(
+    app_config: AppConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A sentinel surviving a failed takeover would kill the next daemon at logon."""
+    monkeypatch.setattr(autostart_module, "_run_scheduler", RecordingScheduler(present=True))
+    monkeypatch.setattr(autostart_module, "_terminate_tree", lambda _pid: None)
+    _ladder(monkeypatch, [])
     monkeypatch.setattr(
         autostart_module,
         "database_ownership",
         lambda _config: DatabaseOwnership(locked=True, role=DatabaseLockRole.DAEMON, pid=99),
     )
-    monkeypatch.setattr(autostart_module, "LOCK_POLL_INTERVAL_SECONDS", 0.0)
-    monkeypatch.setattr(autostart_module, "LOCK_RELEASE_TIMEOUT_SECONDS", 0.0)
 
     with pytest.raises(AutostartError) as failure:
         resolve_conflicts(
@@ -1013,6 +1104,7 @@ def test_replace_gives_up_when_the_lock_is_never_released(
         )
 
     assert "99" in str(failure.value)
+    assert not stop_requested(app_config.database.path)
 
 
 def test_install_refuses_while_a_competing_task_is_enabled(
@@ -1073,7 +1165,12 @@ def test_install_replace_reports_the_task_it_disabled(
 
     payload = json.loads(capsys.readouterr().out)
     assert payload["disabled"] == [
-        {"ended": False, "stopped_pid": None, "task_name": "Engram Local Daemon"}
+        {
+            "ended": False,
+            "stop_method": None,
+            "stopped_pid": None,
+            "task_name": "Engram Local Daemon",
+        }
     ]
     assert payload["created"] is True
     assert scheduler.named("/Change") == ["Engram Local Daemon"]
@@ -1114,3 +1211,166 @@ def test_status_lists_the_competing_tasks(
     assert payload["conflicts"][0]["resolved"] is True
     # The contract L5 established must not move underneath its consumers.
     assert {"installed", "daemon_running", "database_owner_pid"} <= set(payload)
+
+
+# --- Stop request and graceful shutdown ---------------------------------------
+
+
+def test_stop_request_is_a_sibling_of_the_ownership_lock(tmp_path: Path) -> None:
+    database = tmp_path / "engram.db"
+
+    assert stop_request_path(database) == database_lock_path(database).with_suffix(".stop")
+    assert stop_request_path(database).parent == database_lock_path(database).parent
+
+
+def test_stop_request_round_trip(tmp_path: Path) -> None:
+    database = tmp_path / "engram.db"
+
+    assert not stop_requested(database)
+    request_stop(database)
+    assert stop_requested(database)
+    assert clear_stop_request(database)
+    assert not stop_requested(database)
+    assert not clear_stop_request(database)
+
+
+def test_serve_clears_a_stop_request_once_it_owns_the_database(
+    app_config: AppConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Rule A: a sentinel surviving an earlier run must not stop the next daemon."""
+    monkeypatch.setattr(cli_module, "_ensure_server_bind_available", lambda _host, _port: None)
+    monkeypatch.setattr(cli_module, "_run_server", lambda **_keywords: None)
+    request_stop(app_config.database.path)
+
+    cli_module._serve(config=app_config, logger=LOGGER)  # noqa: SLF001
+
+    assert not stop_requested(app_config.database.path)
+
+
+def test_serve_leaves_a_stop_request_it_does_not_own(
+    app_config: AppConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Rule B: clearing before the lock would cancel a stop meant for the owner."""
+    monkeypatch.setattr(cli_module, "_ensure_server_bind_available", lambda _host, _port: None)
+    monkeypatch.setattr(cli_module, "_run_server", lambda **_keywords: None)
+    request_stop(app_config.database.path)
+
+    with (
+        DatabaseProcessLock(
+            app_config.database.path,
+            role=DatabaseLockRole.OFFLINE_WRITER,
+            command="migrate",
+        ),
+        pytest.raises(DatabaseLockError),
+    ):
+        cli_module._serve(config=app_config, logger=LOGGER)  # noqa: SLF001
+
+    assert stop_requested(app_config.database.path)
+    clear_stop_request(app_config.database.path)
+
+
+def test_stop_watcher_interrupts_the_main_thread_when_asked(
+    app_config: AppConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    interrupts: list[bool] = []
+    monkeypatch.setattr(_thread, "interrupt_main", lambda: interrupts.append(True))
+    monkeypatch.setattr(cli_module, "STOP_WATCH_INTERVAL_SECONDS", 0.01)
+    watcher = cli_module._StopWatcher(app_config.database.path, logger=LOGGER)  # noqa: SLF001
+    watcher.start()
+    try:
+        request_stop(app_config.database.path)
+        deadline = time.monotonic() + 5.0
+        while not watcher.requested and time.monotonic() < deadline:
+            time.sleep(0.01)
+    finally:
+        watcher.stop()
+        clear_stop_request(app_config.database.path)
+
+    assert watcher.requested
+    assert interrupts == [True]
+
+
+def test_stop_watcher_leaves_an_unasked_server_alone(
+    app_config: AppConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    interrupts: list[bool] = []
+    monkeypatch.setattr(_thread, "interrupt_main", lambda: interrupts.append(True))
+    monkeypatch.setattr(cli_module, "STOP_WATCH_INTERVAL_SECONDS", 0.01)
+    watcher = cli_module._StopWatcher(app_config.database.path, logger=LOGGER)  # noqa: SLF001
+    watcher.start()
+    time.sleep(0.1)
+    watcher.stop()
+
+    assert not watcher.requested
+    assert interrupts == []
+
+
+# --- interpreter_present -------------------------------------------------------
+
+
+def test_status_reports_a_registered_interpreter_that_no_longer_exists(
+    runtime_config: AppConfig,
+    windows_runtime: Path,
+    config_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A task whose interpreter was deleted still exists, and can no longer start."""
+    del windows_runtime
+    plan = build_plan(config_file)
+    vanished = config_file.parent / "removed" / "pythonw.exe"
+    monkeypatch.setattr(
+        autostart_module,
+        "_run_scheduler",
+        RecordingScheduler(
+            present=True,
+            dump=task_dump(scheduled_task(plan.task_name, command=str(vanished))),
+        ),
+    )
+
+    _setup_autostart(
+        config=runtime_config,
+        config_path=config_file,
+        logger=LOGGER,
+        arguments=autostart_arguments(),
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["installed"] is True
+    assert payload["interpreter_present"] is False
+    assert payload["registered_command"] == str(vanished)
+
+
+def test_status_reports_a_registered_interpreter_that_is_there(
+    runtime_config: AppConfig,
+    windows_runtime: Path,
+    config_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    plan = build_plan(config_file)
+    monkeypatch.setattr(
+        autostart_module,
+        "_run_scheduler",
+        RecordingScheduler(
+            present=True,
+            dump=task_dump(
+                scheduled_task(plan.task_name, command=str(windows_runtime / "pythonw.exe"))
+            ),
+        ),
+    )
+
+    _setup_autostart(
+        config=runtime_config,
+        config_path=config_file,
+        logger=LOGGER,
+        arguments=autostart_arguments(),
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["installed"] is True
+    assert payload["interpreter_present"] is True

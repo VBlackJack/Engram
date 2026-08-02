@@ -73,7 +73,7 @@ What the command does, and what it does not:
 | Action | Effect | Exit code |
 |---|---|---|
 | `--install` | Registers or updates **one** task for this `engram.toml`, then starts the daemon when the database is free. Repeating the command converges instead of adding a second task. | `0` |
-| `--status` | Writes nothing. The answer is in the JSON, never in the exit code. | `0` in every case |
+| `--status` | Writes nothing. The answer is in the JSON, never in the exit code. The `interpreter_present` field says whether the interpreter **recorded in the task** still exists: `installed: true` with `interpreter_present: false` describes a task that will no longer start. | `0` in every case |
 | `--uninstall` | Removes the task. On an already absent task, `removed` is `false`. | `0` |
 
 ### Taking over an earlier installation
@@ -129,6 +129,27 @@ Worth knowing:
   operating system, supervise `engram serve` with the local service manager;
 - to target one specific configuration file, add `--config <path>` before the subcommand. The task
   records that path literally; it inherits no environment variable.
+
+### Stopping the daemon cleanly
+
+A daemon with no console can receive neither `Ctrl+C` nor `Ctrl+Break`. To ask it to stop, drop an
+empty `<database>.stop` file beside the database — the same directory as the lock:
+
+```powershell
+New-Item -ItemType File -Path "local\runtime\engram.db.stop" -Force
+```
+
+**Expected result:** the process exits on its own with code `0`, and **both `engram.db-wal` and
+`engram.db-shm` disappear**. That is the observable proof of a clean shutdown: SQLite only removes
+those two files when the last connection closes. The daemon clears the stop request itself on the
+way out.
+
+The right to stop Engram is therefore exactly the right to write in its database directory, which
+is already the right to corrupt it. No port exposes that capability.
+
+A forgotten stop request does not prevent the next start: the daemon clears the one it finds
+**after** taking the lock. A second `serve` started by mistake fails on the lock without touching a
+stop request meant for the daemon that owns it.
 
 For foreground diagnostics, `engram serve` is still available and behaves as before: it holds the
 terminal and stops when it closes. Stop the daemon first, because only one Engram process may write
