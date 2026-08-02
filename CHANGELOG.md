@@ -16,9 +16,13 @@ project uses date-derived CalVer releases in the form `YYYY.MMDD.NN`.
   an absent task succeeds, and a host without a logon scheduler is refused explicitly instead of
   reporting a success it did not achieve.
 - Add a module entry point, so an interpreter that cannot run a console launcher can still start
-  Engram, and a `--config` option that names the configuration file explicitly. A scheduled task
-  inherits no environment variable, so the file a normal invocation would discover has to be
-  written into the task rather than assumed.
+  Engram. It binds the standard streams a windowed interpreter leaves unset, because the transport
+  stack asks standard output whether it is a terminal while configuring its own logging: without
+  this, the daemon announced its endpoint and then died on the next statement, which is a worse
+  failure than the window it replaces.
+- Add a `--config` option that names the configuration file explicitly. A scheduled task inherits
+  no environment variable, so the file a normal invocation would discover has to be written into
+  the task rather than assumed.
 - Add task-oriented French and English quick-start, operator, and
   Engram-Datacron-Cortex guides, with short ADHD-friendly paths and expected results.
 - Add contract tests binding every published input constraint to the enforcement the server

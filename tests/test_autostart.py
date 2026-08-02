@@ -103,6 +103,43 @@ def test_module_entry_point_delegates_to_the_console_entry_point() -> None:
     assert module_entry_point.main is main
 
 
+def test_absent_standard_streams_are_bound_before_the_transport_reads_them(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A windowed interpreter starts with no streams, and uvicorn asks stdout for a tty."""
+    for name in module_entry_point.NULL_STREAM_MODES:
+        monkeypatch.setattr(sys, name, None)
+
+    bound = module_entry_point.bind_absent_standard_streams()
+
+    try:
+        assert set(bound) == set(module_entry_point.NULL_STREAM_MODES)
+        # The question uvicorn asks while configuring its logging, which raised
+        # AttributeError on the None a windowed interpreter leaves behind.
+        assert isinstance(sys.stdout.isatty(), bool)
+        assert sys.stdout.fileno() >= 0
+        sys.stdout.write("discarded")
+    finally:
+        for name in bound:
+            getattr(sys, name).close()
+
+
+def test_present_standard_streams_are_left_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A console interpreter must keep the streams it was given."""
+    monkeypatch.setattr(sys, "stdin", None)
+    original = sys.stdout
+
+    bound = module_entry_point.bind_absent_standard_streams()
+
+    try:
+        assert bound == ("stdin",)
+        assert sys.stdout is original
+    finally:
+        sys.stdin.close()
+
+
 def test_module_entry_point_starts_without_the_console_script() -> None:
     """The package must be runnable by an interpreter that cannot run a launcher."""
     completed = subprocess.run(
