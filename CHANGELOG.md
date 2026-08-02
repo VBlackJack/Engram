@@ -9,6 +9,16 @@ project uses date-derived CalVer releases in the form `YYYY.MMDD.NN`.
 
 ### Added
 
+- Add `engram setup autostart`, which registers the daemon as a Windows logon task run by the
+  windowed interpreter beside the running one. The absence of a console window is a property of
+  that interpreter rather than of a flag asking a console to hide itself, so it can be proven from
+  outside the process. Installing twice converges on one task instead of adding a second, removing
+  an absent task succeeds, and a host without a logon scheduler is refused explicitly instead of
+  reporting a success it did not achieve.
+- Add a module entry point, so an interpreter that cannot run a console launcher can still start
+  Engram, and a `--config` option that names the configuration file explicitly. A scheduled task
+  inherits no environment variable, so the file a normal invocation would discover has to be
+  written into the task rather than assumed.
 - Add task-oriented French and English quick-start, operator, and
   Engram-Datacron-Cortex guides, with short ADHD-friendly paths and expected results.
 - Add contract tests binding every published input constraint to the enforcement the server

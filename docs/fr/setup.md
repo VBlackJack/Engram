@@ -50,15 +50,50 @@ Avec une nouvelle installation, les valeurs sures de `engram.example.toml` suffi
 > sauvegardez puis suivez
 > [Migrer une base existante](operator-guide.md#migrer-une-base-existante).
 
-Pour une nouvelle base uniquement, lancez :
+Pour une nouvelle base uniquement, installez le demarrage automatique :
 
 ```powershell
-uv run --python 3.14.6 engram serve
+uv run --python 3.14.6 engram setup autostart --install
 ```
 
-**Resultat attendu :** le processus reste actif sans erreur. Gardez ce terminal ouvert.
+**Resultat attendu :** la commande sort en 0 et affiche un JSON dont `started` vaut `true`. Engram
+tourne des maintenant et redemarrera a chaque ouverture de session. **Aucun terminal ne doit rester
+ouvert :** la tache lance l'interpreteur sans console, donc il n'y a pas de fenetre a fermer par
+inadvertance.
 
-Un seul processus Engram doit ecrire cette base. Testez avec un client MCP, pas avec un navigateur.
+Verifiez :
+
+```powershell
+uv run --python 3.14.6 engram setup autostart --status
+```
+
+**Resultat attendu :** `installed` vaut `true` et `daemon_running` vaut `true`.
+
+Ce que la commande fait, et ce qu'elle ne fait pas :
+
+| Action | Effet | Code de sortie |
+|---|---|---|
+| `--install` | Enregistre ou met a jour **une seule** tache pour ce `engram.toml`, puis demarre le daemon si la base est libre. Rejouer la commande converge, sans doublon. | `0` |
+| `--status` | N'ecrit rien. Repond dans le JSON, jamais par le code de sortie. | `0` dans tous les cas |
+| `--uninstall` | Supprime la tache. Sur une tache deja absente, `removed` vaut `false`. | `0` |
+
+Points a connaitre :
+
+- la tache est nommee d'apres le chemin de votre `engram.toml`. Deux installations distinctes ont
+  deux taches distinctes, et aucune ne remplace l'autre en silence ;
+- `--install` ne demarre pas un second daemon si la base est deja detenue. Il l'ecrit dans
+  `start_skipped_reason` au lieu de faire semblant d'avoir reussi ;
+- hors Windows, la commande echoue explicitement en code `2` et ne fait rien. Sur un autre systeme,
+  supervisez `engram serve` avec le gestionnaire de services local ;
+- pour cibler un fichier de configuration precis, ajoutez `--config <chemin>` avant la
+  sous-commande. La tache enregistre ce chemin en clair, elle n'herite d'aucune variable
+  d'environnement.
+
+Pour un diagnostic au premier plan, `engram serve` reste disponible et se comporte comme avant :
+il occupe le terminal et s'arrete a sa fermeture. Arretez d'abord le daemon, car un seul processus
+Engram peut ecrire cette base.
+
+Testez avec un client MCP, pas avec un navigateur.
 
 ## 3. Choisir un seul client
 

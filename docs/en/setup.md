@@ -50,15 +50,48 @@ For a new installation, the safe values in `engram.example.toml` are enough:
 > up and follow
 > [Migrate an existing database](operator-guide.md#migrate-an-existing-database).
 
-For a new database only, start:
+For a new database only, install the logon autostart:
 
 ```powershell
-uv run --python 3.14.6 engram serve
+uv run --python 3.14.6 engram setup autostart --install
 ```
 
-**Expected result:** the process stays active without errors. Keep this terminal open.
+**Expected result:** the command exits 0 and prints JSON whose `started` field is `true`. Engram is
+running now and will start again at every logon. **No terminal has to stay open:** the task runs the
+windowed interpreter, so there is no window left to close by accident.
 
-Only one Engram process may write this database. Test with an MCP client, not a browser.
+Verify:
+
+```powershell
+uv run --python 3.14.6 engram setup autostart --status
+```
+
+**Expected result:** `installed` is `true` and `daemon_running` is `true`.
+
+What the command does, and what it does not:
+
+| Action | Effect | Exit code |
+|---|---|---|
+| `--install` | Registers or updates **one** task for this `engram.toml`, then starts the daemon when the database is free. Repeating the command converges instead of adding a second task. | `0` |
+| `--status` | Writes nothing. The answer is in the JSON, never in the exit code. | `0` in every case |
+| `--uninstall` | Removes the task. On an already absent task, `removed` is `false`. | `0` |
+
+Worth knowing:
+
+- the task is named after the path of your `engram.toml`. Two separate installations own two
+  separate tasks, and neither replaces the other silently;
+- `--install` does not start a second daemon when the database is already held. It says so in
+  `start_skipped_reason` rather than reporting a success it did not achieve;
+- off Windows the command fails explicitly with exit code `2` and changes nothing. On another
+  operating system, supervise `engram serve` with the local service manager;
+- to target one specific configuration file, add `--config <path>` before the subcommand. The task
+  records that path literally; it inherits no environment variable.
+
+For foreground diagnostics, `engram serve` is still available and behaves as before: it holds the
+terminal and stops when it closes. Stop the daemon first, because only one Engram process may write
+this database.
+
+Test with an MCP client, not a browser.
 
 ## 3. Choose one client
 

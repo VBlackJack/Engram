@@ -13,11 +13,29 @@ import os
 import socket
 import sqlite3
 import sys
+from collections.abc import Mapping
 from datetime import date, datetime
 from pathlib import Path
 
 from . import __version__
-from .config import AppConfig, ConfigError, load_config, load_preflight_config
+from .autostart import (
+    AutostartError,
+    AutostartPlan,
+    AutostartUnsupportedError,
+    build_plan,
+    database_ownership,
+    install,
+    is_installed,
+    uninstall,
+)
+from .config import (
+    DEFAULT_CONFIG_PATH,
+    ENV_PREFIX,
+    AppConfig,
+    ConfigError,
+    load_config,
+    load_preflight_config,
+)
 from .consolidation.gateway import DatacronGatewayError
 from .consolidation.mcp_gateway import McpDatacronGateway
 from .consolidation.models import ApplyStatus, ConsolidationPlan
@@ -85,14 +103,23 @@ def main() -> None:
     debug = bool(arguments.debug) or _environment_debug_enabled()
     logger: logging.Logger | None = None
     try:
-        config = load_preflight_config() if arguments.command == "preflight" else load_config()
+        config_path = _resolve_config_path(arguments.config)
+        # An explicit path is forwarded; otherwise the loader applies its own
+        # default resolution, which stays the single definition of that default.
+        selected = () if arguments.config is None else (config_path,)
+        config = (
+            load_preflight_config(*selected)
+            if arguments.command == "preflight"
+            else load_config(*selected)
+        )
         logger = FileLogger(config.logging).configure()
-        _dispatch(parser, arguments, config=config, logger=logger)
+        _dispatch(parser, arguments, config=config, config_path=config_path, logger=logger)
     except KeyboardInterrupt:
         if logger is not None:
             logger.info("Engram interrupted by operator")
         parser.exit(status=EXIT_INTERRUPTED, message="engram: interrupted\n")
     except (
+        AutostartError,
         ConfigError,
         DatabaseError,
         DatabaseLockError,
@@ -124,6 +151,14 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=f"Show tracebacks for known failures (or set {DEBUG_ENVIRONMENT_KEY}=1)",
     )
+    parser.add_argument(
+        "--config",
+        type=Path,
+        help=(
+            "Configuration file to load "
+            f"(default: {ENV_PREFIX}CONFIG, then {DEFAULT_CONFIG_PATH} in the working directory)"
+        ),
+    )
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("serve", help="Run the streamable HTTP MCP server")
     commands.add_parser("migrate", help="Migrate and validate storage offline")
@@ -135,7 +170,55 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_trusted_command_parsers(commands)
     _add_evaluation_parser(commands)
     _add_consolidation_parser(commands)
+    _add_setup_parser(commands)
     return parser
+
+
+def _add_setup_parser(
+    commands: argparse._SubParsersAction[argparse.ArgumentParser],
+) -> None:
+    """Add the local startup integration arguments."""
+    setup = commands.add_parser("setup", help="Install or inspect local startup integration")
+    targets = setup.add_subparsers(dest="setup_target", required=True)
+    autostart = targets.add_parser(
+        "autostart",
+        help="Manage the logon task that starts the daemon without a console window",
+    )
+    action = autostart.add_mutually_exclusive_group(required=True)
+    action.add_argument(
+        "--install",
+        action="store_true",
+        help="Register or update the logon task, and start it when the database is free",
+    )
+    action.add_argument(
+        "--uninstall",
+        action="store_true",
+        help="Remove the logon task",
+    )
+    action.add_argument(
+        "--status",
+        action="store_true",
+        help="Report the registered task and the current database owner",
+    )
+
+
+def _resolve_config_path(
+    explicit: Path | None,
+    environ: Mapping[str, str] | None = None,
+) -> Path:
+    """Resolve the configuration file once, so every consumer names the same one.
+
+    The logon task cannot inherit an environment variable, so the path that a
+    normal invocation would discover has to be resolved here and written into
+    the task explicitly.
+    """
+    environment = os.environ if environ is None else environ
+    selected = (
+        explicit
+        if explicit is not None
+        else Path(environment.get(f"{ENV_PREFIX}CONFIG", str(DEFAULT_CONFIG_PATH)))
+    )
+    return selected.expanduser().resolve()
 
 
 def _add_trusted_command_parsers(
@@ -271,6 +354,7 @@ def _dispatch(  # noqa: C901
     arguments: argparse.Namespace,
     *,
     config: AppConfig,
+    config_path: Path,
     logger: logging.Logger,
 ) -> None:
     """Execute one parsed command."""
@@ -337,6 +421,14 @@ def _dispatch(  # noqa: C901
             apply_path=arguments.apply,
             check_freshness=bool(arguments.check_freshness),
             output_path=arguments.out,
+        )
+    elif arguments.command == "setup":
+        _setup_autostart(
+            config=config,
+            config_path=config_path,
+            logger=logger,
+            install_requested=bool(arguments.install),
+            uninstall_requested=bool(arguments.uninstall),
         )
     else:
         parser.error(f"Unsupported command: {arguments.command}")
@@ -467,13 +559,64 @@ def _preflight(*, config: AppConfig, logger: logging.Logger) -> None:
     )
 
 
+def _setup_autostart(
+    *,
+    config: AppConfig,
+    config_path: Path,
+    logger: logging.Logger,
+    install_requested: bool,
+    uninstall_requested: bool,
+) -> None:
+    """Register, remove, or report the logon task for this configuration."""
+    plan = build_plan(config_path)
+    if uninstall_requested:
+        removed = uninstall(plan, logger=logger)
+        _write_json({"action": "uninstall", "removed": removed, "task_name": plan.task_name})
+        return
+    if install_requested:
+        outcome = install(plan, ownership=database_ownership(config), logger=logger)
+        _write_json(
+            _plan_payload(plan)
+            | {
+                "action": "install",
+                "created": outcome.created,
+                "start_skipped_reason": outcome.start_skipped_reason,
+                "started": outcome.started,
+            }
+        )
+        return
+    ownership = database_ownership(config)
+    _write_json(
+        _plan_payload(plan)
+        | {
+            "action": "status",
+            "daemon_running": ownership.daemon_running,
+            "database_locked": ownership.locked,
+            "database_owner_pid": ownership.pid,
+            "database_owner_role": None if ownership.role is None else ownership.role.value,
+            "installed": is_installed(plan),
+        }
+    )
+
+
+def _plan_payload(plan: AutostartPlan) -> dict[str, object]:
+    """Describe the process the logon task runs, for every autostart action."""
+    return {
+        "arguments": plan.argument_line,
+        "command": str(plan.command),
+        "config": str(plan.config_path),
+        "task_name": plan.task_name,
+        "working_directory": str(plan.working_directory),
+    }
+
+
 def _environment_debug_enabled() -> bool:
     value = os.environ.get(DEBUG_ENVIRONMENT_KEY, "")
     return value.strip().casefold() in DEBUG_TRUE_VALUES
 
 
 def _error_exit_code(error: BaseException) -> int:
-    if isinstance(error, ConfigError | StoreValidationError):
+    if isinstance(error, AutostartUnsupportedError | ConfigError | StoreValidationError):
         return EXIT_USAGE_OR_CONFIG
     if isinstance(error, DatacronGatewayError | VectorRebuildError):
         return EXIT_EXTERNAL_DEPENDENCY
