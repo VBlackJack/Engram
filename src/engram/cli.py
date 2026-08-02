@@ -22,10 +22,14 @@ from .autostart import (
     AutostartError,
     AutostartPlan,
     AutostartUnsupportedError,
+    DisabledTask,
+    TaskConflict,
     build_plan,
+    conflicting_tasks,
     database_ownership,
     install,
     is_installed,
+    resolve_conflicts,
     uninstall,
 )
 from .config import (
@@ -200,6 +204,16 @@ def _add_setup_parser(
         action="store_true",
         help="Report the registered task and the current database owner",
     )
+    autostart.add_argument(
+        "--replace",
+        action="store_true",
+        help="With --install: disable, without deleting, every task competing for this database",
+    )
+    autostart.add_argument(
+        "--force",
+        action="store_true",
+        help="With --install: install even though a competing task was found or left undetermined",
+    )
 
 
 def _resolve_config_path(
@@ -349,7 +363,7 @@ def _add_consolidation_parser(
     )
 
 
-def _dispatch(  # noqa: C901
+def _dispatch(  # noqa: C901, PLR0912
     parser: argparse.ArgumentParser,
     arguments: argparse.Namespace,
     *,
@@ -423,12 +437,13 @@ def _dispatch(  # noqa: C901
             output_path=arguments.out,
         )
     elif arguments.command == "setup":
+        if (arguments.replace or arguments.force) and not arguments.install:
+            parser.error("--replace and --force apply to --install only")
         _setup_autostart(
             config=config,
             config_path=config_path,
             logger=logger,
-            install_requested=bool(arguments.install),
-            uninstall_requested=bool(arguments.uninstall),
+            arguments=arguments,
         )
     else:
         parser.error(f"Unsupported command: {arguments.command}")
@@ -564,32 +579,26 @@ def _setup_autostart(
     config: AppConfig,
     config_path: Path,
     logger: logging.Logger,
-    install_requested: bool,
-    uninstall_requested: bool,
+    arguments: argparse.Namespace,
 ) -> None:
     """Register, remove, or report the logon task for this configuration."""
     plan = build_plan(config_path)
-    if uninstall_requested:
+    if arguments.uninstall:
         removed = uninstall(plan, logger=logger)
         _write_json({"action": "uninstall", "removed": removed, "task_name": plan.task_name})
         return
-    if install_requested:
-        outcome = install(plan, ownership=database_ownership(config), logger=logger)
-        _write_json(
-            _plan_payload(plan)
-            | {
-                "action": "install",
-                "created": outcome.created,
-                "start_skipped_reason": outcome.start_skipped_reason,
-                "started": outcome.started,
-            }
-        )
+    if arguments.install:
+        _install_autostart(plan, config=config, logger=logger, arguments=arguments)
         return
     ownership = database_ownership(config)
     _write_json(
         _plan_payload(plan)
         | {
             "action": "status",
+            "conflicts": [
+                _conflict_payload(conflict)
+                for conflict in conflicting_tasks(plan, database=config.database.path)
+            ],
             "daemon_running": ownership.daemon_running,
             "database_locked": ownership.locked,
             "database_owner_pid": ownership.pid,
@@ -597,6 +606,51 @@ def _setup_autostart(
             "installed": is_installed(plan),
         }
     )
+
+
+def _install_autostart(
+    plan: AutostartPlan,
+    *,
+    config: AppConfig,
+    logger: logging.Logger,
+    arguments: argparse.Namespace,
+) -> None:
+    """Clear the way if asked, then register the logon task."""
+    conflicts = conflicting_tasks(plan, database=config.database.path)
+    disabled = resolve_conflicts(
+        conflicts,
+        config=config,
+        replace=bool(arguments.replace),
+        force=bool(arguments.force),
+        logger=logger,
+    )
+    outcome = install(plan, ownership=database_ownership(config), logger=logger)
+    _write_json(
+        _plan_payload(plan)
+        | {
+            "action": "install",
+            "created": outcome.created,
+            "disabled": [_disabled_payload(task) for task in disabled],
+            "start_skipped_reason": outcome.start_skipped_reason,
+            "started": outcome.started,
+        }
+    )
+
+
+def _conflict_payload(conflict: TaskConflict) -> dict[str, object]:
+    """Describe one competing task, including one that could not be resolved."""
+    return {
+        "database": None if conflict.database is None else str(conflict.database),
+        "enabled": conflict.enabled,
+        "reason": conflict.reason,
+        "resolved": conflict.resolved,
+        "task_name": conflict.task_name,
+    }
+
+
+def _disabled_payload(task: DisabledTask) -> dict[str, object]:
+    """Describe one task this command took out of the way."""
+    return {"ended": task.ended, "stopped_pid": task.stopped_pid, "task_name": task.task_name}
 
 
 def _plan_payload(plan: AutostartPlan) -> dict[str, object]:

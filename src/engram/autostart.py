@@ -24,16 +24,20 @@ replacing the first.
 from __future__ import annotations
 
 import hashlib
+import itertools
 import os
+import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 from xml.etree import ElementTree as ET
 
+from .config import DEFAULT_CONFIG_PATH, ConfigError, load_config
 from .process_lock import (
     DatabaseLockError,
     DatabaseLockRole,
@@ -66,6 +70,12 @@ SCHEDULER_SUCCESS = 0
 WINDOWS_PLATFORM = "win32"
 USER_DOMAIN_KEY = "USERDOMAIN"
 USER_NAME_KEY = "USERNAME"
+# Measured on the scheduler shipped with this host: one <Tasks> root, no XML
+# declaration, every task preceded by a comment holding its full path, encoded
+# as UTF-8 rather than in the console code page.
+SCHEDULER_DUMP_ENCODING = "utf-8"
+LOCK_RELEASE_TIMEOUT_SECONDS = 30.0
+LOCK_POLL_INTERVAL_SECONDS = 0.25
 
 
 class AutostartError(RuntimeError):
@@ -74,6 +84,55 @@ class AutostartError(RuntimeError):
 
 class AutostartUnsupportedError(AutostartError):
     """Raised when the running operating system has no logon task scheduler."""
+
+
+class AutostartConflictError(AutostartError):
+    """Raised when another registered task would open the same database."""
+
+
+@dataclass(frozen=True, slots=True)
+class ScheduledAction:
+    """One registered task and the process it starts, as the scheduler stores it."""
+
+    task_name: str
+    enabled: bool
+    command: str
+    arguments: str
+    working_directory: str
+
+    def tokens(self) -> tuple[str, ...]:
+        """Return the command and its arguments as separate, unquoted values."""
+        try:
+            split = shlex.split(self.arguments, posix=False)
+        except ValueError:
+            # An argument line the scheduler accepted but no quoting rule
+            # explains. Whatever it starts cannot be resolved from it.
+            split = self.arguments.split()
+        return tuple(value.strip('"') for value in (self.command, *split) if value.strip('"'))
+
+
+@dataclass(frozen=True, slots=True)
+class TaskConflict:
+    """One registered task that reaches, or may reach, the same database."""
+
+    task_name: str
+    enabled: bool
+    database: Path | None
+    reason: str
+
+    @property
+    def resolved(self) -> bool:
+        """Return whether the database this task opens could be determined."""
+        return self.database is not None
+
+
+@dataclass(frozen=True, slots=True)
+class DisabledTask:
+    """One task this command took out of the way, reversibly."""
+
+    task_name: str
+    ended: bool
+    stopped_pid: int | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -200,6 +259,259 @@ def database_ownership(config: AppConfig) -> DatabaseOwnership:
         )
     probe.release()
     return DatabaseOwnership(locked=False, role=None, pid=None)
+
+
+def canonical_path(value: str) -> Path | None:
+    """Return one comparable form of a path the scheduler stored as free text.
+
+    Windows reaches the same file through different spellings: a different case,
+    a home shortcut, a junction, an 8.3 short name. Resolution collapses all of
+    them for a path that exists, which is the only case that matters here: a
+    task pointing at a file that is not there cannot be holding its lock.
+    """
+    cleaned = value.strip().strip('"').strip()
+    if not cleaned:
+        return None
+    try:
+        return Path(cleaned).expanduser().resolve()
+    except (OSError, ValueError, RuntimeError):
+        return None
+
+
+def same_path(left: Path, right: Path) -> bool:
+    """Compare two canonical paths the way the file system does."""
+    return str(left).casefold() == str(right).casefold()
+
+
+def registered_actions() -> tuple[ScheduledAction, ...]:
+    """Return every registered task and the process it starts."""
+    require_supported_platform()
+    completed = _run_scheduler(("/Query", "/XML", "ONE"))
+    _require_scheduler_success(completed, action="list the registered tasks")
+    return _parse_task_dump(completed.stdout.decode(SCHEDULER_DUMP_ENCODING, errors="replace"))
+
+
+def _parse_task_dump(document: str) -> tuple[ScheduledAction, ...]:
+    """Read the scheduler's own dump of every task it holds.
+
+    The dump names each task in a comment rather than in an element, and not
+    every task carries a registration URI, so the comments are read as data
+    instead of being discarded by the parser.
+    """
+    # The document is this host's own scheduler describing its own tasks, over a
+    # pipe, not input from anywhere else. Reaching a hardened parser would mean
+    # a new dependency, which this lot is not allowed to add.
+    parser = ET.XMLParser(target=ET.TreeBuilder(insert_comments=True))  # noqa: S314
+    parser.feed(document)
+    root = parser.close()
+    actions: list[ScheduledAction] = []
+    pending_name: str | None = None
+    for child in root:
+        if not isinstance(child.tag, str):
+            pending_name = "" if child.text is None else child.text.strip().lstrip("\\")
+            continue
+        execution = child.find("./{*}Actions/{*}Exec")
+        command = None if execution is None else execution.findtext("./{*}Command")
+        if execution is None or command is None or not pending_name:
+            pending_name = None
+            continue
+        enabled = child.findtext("./{*}Settings/{*}Enabled")
+        actions.append(
+            ScheduledAction(
+                task_name=pending_name,
+                enabled=enabled is None or enabled.strip().casefold() != "false",
+                command=command,
+                arguments=execution.findtext("./{*}Arguments") or "",
+                working_directory=execution.findtext("./{*}WorkingDirectory") or "",
+            )
+        )
+        pending_name = None
+    return tuple(actions)
+
+
+def conflicting_tasks(plan: AutostartPlan, *, database: Path) -> tuple[TaskConflict, ...]:
+    """Return every enabled task that reaches, or may reach, this database.
+
+    The test is the database, never the name of a task. A literal name would be
+    the hardcoding this project refuses everywhere else, and it would miss any
+    installation that chose a different one. What creates the collision is the
+    exclusive lock over one SQLite file, so that file is what is compared.
+    """
+    target = database.expanduser().resolve()
+    scope = plan.config_path.parent
+    conflicts: list[TaskConflict] = []
+    for action in registered_actions():
+        if action.task_name.casefold() == plan.task_name.casefold() or not action.enabled:
+            continue
+        opened = _action_database(action)
+        if opened is not None:
+            if same_path(opened, target):
+                conflicts.append(
+                    TaskConflict(
+                        task_name=action.task_name,
+                        enabled=action.enabled,
+                        database=opened,
+                        reason="starts Engram on the same database",
+                    )
+                )
+            continue
+        if _action_reaches_into(action, scope):
+            conflicts.append(
+                TaskConflict(
+                    task_name=action.task_name,
+                    enabled=action.enabled,
+                    database=None,
+                    reason=(
+                        f"runs {action.command} against a file inside {scope}, and does not "
+                        "name the configuration it loads, so the database it opens is "
+                        "undetermined"
+                    ),
+                )
+            )
+    return tuple(conflicts)
+
+
+def _action_database(action: ScheduledAction) -> Path | None:
+    """Return the database this task opens, or None when it cannot be read from it."""
+    tokens = action.tokens()
+    if not _starts_this_package(tokens):
+        return None
+    configured = _configured_path(tokens) or _default_config_path(action)
+    if configured is None or not configured.is_file():
+        return None
+    try:
+        return load_config(configured).database.path.expanduser().resolve()
+    except (ConfigError, OSError):
+        return None
+
+
+def _starts_this_package(tokens: tuple[str, ...]) -> bool:
+    """Return whether these arguments start this distribution, not something else."""
+    if not tokens:
+        return False
+    if Path(tokens[0]).stem.casefold() == PACKAGE_NAME:
+        return True
+    return any(
+        left == MODULE_OPTION and right.casefold() == PACKAGE_NAME
+        for left, right in itertools.pairwise(tokens)
+    )
+
+
+def _configured_path(tokens: tuple[str, ...]) -> Path | None:
+    """Return the configuration named on the command line, when one is."""
+    for index, token in enumerate(tokens):
+        if token == CONFIG_OPTION and index + 1 < len(tokens):
+            return canonical_path(tokens[index + 1])
+        if token.startswith(f"{CONFIG_OPTION}="):
+            return canonical_path(token.split("=", 1)[1])
+    return None
+
+
+def _default_config_path(action: ScheduledAction) -> Path | None:
+    """Return the configuration a command with no explicit path would discover."""
+    directory = canonical_path(action.working_directory)
+    if directory is None:
+        return None
+    return directory / DEFAULT_CONFIG_PATH.name
+
+
+def _action_reaches_into(action: ScheduledAction, directory: Path) -> bool:
+    """Return whether this task names any file inside the configuration's directory."""
+    for token in action.tokens():
+        candidate = canonical_path(token)
+        if candidate is None:
+            continue
+        if same_path(candidate, directory) or any(
+            same_path(parent, directory) for parent in candidate.parents
+        ):
+            return True
+    return False
+
+
+def resolve_conflicts(
+    conflicts: tuple[TaskConflict, ...],
+    *,
+    config: AppConfig,
+    replace: bool,
+    force: bool,
+    logger: logging.Logger,
+) -> tuple[DisabledTask, ...]:
+    """Refuse, bypass, or clear the tasks that would fight for this database.
+
+    An undetermined answer is not an absence of conflict. Installing over one
+    would produce a task that looks registered and never serves, which is the
+    exact failure this command exists to remove.
+    """
+    if not conflicts:
+        return ()
+    if replace:
+        return _disable_conflicts(conflicts, config=config, logger=logger)
+    if force:
+        logger.warning(
+            "Installing over %d unresolved or conflicting task(s) because --force was given: %s",
+            len(conflicts),
+            ", ".join(conflict.task_name for conflict in conflicts),
+        )
+        return ()
+    raise AutostartConflictError(
+        "Another registered task would open this database: "
+        + "; ".join(f"'{conflict.task_name}' {conflict.reason}" for conflict in conflicts)
+        + ". Rerun with --replace to disable it, or with --force to install anyway."
+    )
+
+
+def _disable_conflicts(
+    conflicts: tuple[TaskConflict, ...],
+    *,
+    config: AppConfig,
+    logger: logging.Logger,
+) -> tuple[DisabledTask, ...]:
+    """Take the competing tasks out of the way without destroying them."""
+    disabled: list[DisabledTask] = []
+    for conflict in conflicts:
+        _require_scheduler_success(
+            _run_scheduler(("/Change", "/TN", conflict.task_name, "/DISABLE")),
+            action=f"disable the competing task {conflict.task_name}",
+        )
+        ownership = database_ownership(config)
+        # /End refuses a task that is not running, which is an answer rather
+        # than a failure: nothing had to be stopped.
+        ended = (
+            _run_scheduler(("/End", "/TN", conflict.task_name)).returncode == SCHEDULER_SUCCESS
+            if ownership.locked
+            else False
+        )
+        logger.info(
+            "Disabled competing task %s (ended=%s, database owner pid=%s)",
+            conflict.task_name,
+            ended,
+            ownership.pid,
+        )
+        disabled.append(
+            DisabledTask(
+                task_name=conflict.task_name,
+                ended=ended,
+                stopped_pid=ownership.pid if ownership.daemon_running else None,
+            )
+        )
+    _wait_for_release(config, logger=logger)
+    return tuple(disabled)
+
+
+def _wait_for_release(config: AppConfig, *, logger: logging.Logger) -> None:
+    """Wait for the ownership lock itself, never for a fixed delay."""
+    deadline = time.monotonic() + LOCK_RELEASE_TIMEOUT_SECONDS
+    while True:
+        ownership = database_ownership(config)
+        if not ownership.locked:
+            logger.info("Database released by the competing task")
+            return
+        if time.monotonic() >= deadline:
+            raise AutostartError(
+                f"The database is still held by {_describe_owner(ownership)} after "
+                f"{LOCK_RELEASE_TIMEOUT_SECONDS:.0f} seconds. Stop that process, then rerun."
+            )
+        time.sleep(LOCK_POLL_INTERVAL_SECONDS)
 
 
 def is_installed(plan: AutostartPlan) -> bool:

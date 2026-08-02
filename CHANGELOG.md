@@ -23,6 +23,15 @@ project uses date-derived CalVer releases in the form `YYYY.MMDD.NN`.
 - Add a `--config` option that names the configuration file explicitly. A scheduled task inherits
   no environment variable, so the file a normal invocation would discover has to be written into
   the task rather than assumed.
+- Refuse to install the logon task while another registered task would open the same database, and
+  add `--replace` to take that installation over. The test is the database each task resolves to,
+  never the name of a task: a literal name would be hardcoding, and would miss any installation
+  that chose a different one. A task launched through a wrapper script does not announce its
+  configuration; that answer is reported as undetermined and still refuses, because installing over
+  an unknown produces a task that looks registered and never serves. `--replace` disables the
+  competing task rather than deleting it, stops the daemon it started, and waits for the ownership
+  lock itself rather than for a fixed delay. `--force` remains for an operator who knows better.
+  `--status` now also lists the competing tasks; the fields it already published are unchanged.
 - Add task-oriented French and English quick-start, operator, and
   Engram-Datacron-Cortex guides, with short ADHD-friendly paths and expected results.
 - Add contract tests binding every published input constraint to the enforcement the server

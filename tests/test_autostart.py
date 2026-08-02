@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import logging
 import shutil
@@ -20,14 +21,21 @@ import engram.__main__ as module_entry_point
 import engram.autostart as autostart_module
 from engram.autostart import (
     TASK_NAMESPACE,
+    AutostartConflictError,
     AutostartError,
     AutostartUnsupportedError,
     DatabaseOwnership,
+    TaskConflict,
     build_plan,
+    canonical_path,
+    conflicting_tasks,
     database_ownership,
     install,
     is_installed,
+    registered_actions,
     require_supported_platform,
+    resolve_conflicts,
+    same_path,
     task_name,
     uninstall,
     windowed_interpreter,
@@ -40,7 +48,7 @@ from engram.cli import (
     _setup_autostart,
     main,
 )
-from engram.config import DEFAULT_CONFIG_PATH, ENV_PREFIX
+from engram.config import DEFAULT_CONFIG_PATH, ENV_PREFIX, load_config
 from engram.process_lock import DatabaseLockRole, DatabaseProcessLock
 
 if TYPE_CHECKING:
@@ -52,19 +60,60 @@ EXAMPLE_CONFIG = Path(__file__).resolve().parent.parent / "engram.example.toml"
 LOGGER = logging.getLogger("engram-autostart-test")
 
 
+EMPTY_TASK_DUMP = "<Tasks></Tasks>"
+
+
+def task_dump(*tasks: str) -> str:
+    """Build a dump shaped like the one the scheduler produces for every task."""
+    return f"<Tasks>{''.join(tasks)}</Tasks>"
+
+
+def scheduled_task(
+    name: str,
+    *,
+    command: str,
+    arguments: str = "",
+    working_directory: str | None = None,
+    enabled: bool = True,
+) -> str:
+    """Render one task the way the scheduler dumps it, named by a comment."""
+    directory = (
+        ""
+        if working_directory is None
+        else f"<WorkingDirectory>{working_directory}</WorkingDirectory>"
+    )
+    return (
+        f"<!-- \\{name} -->"
+        f'<Task version="1.3" xmlns="{TASK_NAMESPACE}">'
+        f"<Settings><Enabled>{'true' if enabled else 'false'}</Enabled></Settings>"
+        f'<Actions Context="Author"><Exec>'
+        f"<Command>{command}</Command><Arguments>{arguments}</Arguments>{directory}"
+        f"</Exec></Actions></Task>"
+    )
+
+
 class RecordingScheduler:
     """Answer scheduler invocations from a script and record every argv."""
 
-    def __init__(self, *, present: bool, failures: Mapping[str, int] | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        present: bool,
+        failures: Mapping[str, int] | None = None,
+        dump: str = EMPTY_TASK_DUMP,
+    ) -> None:
         """Start from a known registration state and optional per-verb failures."""
         self.present = present
         self.failures = dict(failures or {})
+        self.dump = dump
         self.calls: list[tuple[str, ...]] = []
 
     def __call__(self, arguments: tuple[str, ...]) -> subprocess.CompletedProcess[bytes]:
         """Record one invocation and answer as the scheduler would."""
         self.calls.append(arguments)
         verb = arguments[0]
+        if verb == "/Query" and "/TN" not in arguments:
+            return subprocess.CompletedProcess([verb], 0, self.dump.encode("utf-8"), b"")
         code = (0 if self.present else 1) if verb == "/Query" else self.failures.get(verb, 0)
         if code == 0 and verb == "/Create":
             self.present = True
@@ -75,6 +124,27 @@ class RecordingScheduler:
     def verbs(self) -> list[str]:
         """Return the verb of every recorded invocation, in order."""
         return [call[0] for call in self.calls]
+
+    def named(self, verb: str) -> list[str]:
+        """Return the task names this verb was invoked on, in order."""
+        return [call[2] for call in self.calls if call[0] == verb and len(call) > 2]
+
+
+def autostart_arguments(
+    *,
+    install: bool = False,
+    uninstall: bool = False,
+    replace: bool = False,
+    force: bool = False,
+) -> argparse.Namespace:
+    """Build the parsed arguments the setup dispatch reads."""
+    return argparse.Namespace(
+        install=install,
+        uninstall=uninstall,
+        status=not (install or uninstall),
+        replace=replace,
+        force=force,
+    )
 
 
 @pytest.fixture
@@ -96,6 +166,12 @@ def config_file(tmp_path: Path) -> Path:
     path.parent.mkdir(parents=True)
     path.write_text(EXAMPLE_CONFIG.read_text(encoding="utf-8"), encoding="utf-8")
     return path
+
+
+@pytest.fixture
+def runtime_config(config_file: Path) -> AppConfig:
+    """Return the very configuration the competing tasks in these tests also load."""
+    return load_config(config_file)
 
 
 def test_module_entry_point_delegates_to_the_console_entry_point() -> None:
@@ -525,8 +601,7 @@ def test_status_reports_an_absent_task_and_the_current_owner(
         config=app_config,
         config_path=config_file,
         logger=LOGGER,
-        install_requested=False,
-        uninstall_requested=False,
+        arguments=autostart_arguments(),
     )
 
     payload = json.loads(capsys.readouterr().out)
@@ -557,8 +632,7 @@ def test_status_reports_the_registered_task_and_a_running_daemon(
             config=app_config,
             config_path=config_file,
             logger=LOGGER,
-            install_requested=False,
-            uninstall_requested=False,
+            arguments=autostart_arguments(),
         )
 
     payload = json.loads(capsys.readouterr().out)
@@ -582,8 +656,7 @@ def test_install_action_reports_what_it_registered(
         config=app_config,
         config_path=config_file,
         logger=LOGGER,
-        install_requested=True,
-        uninstall_requested=False,
+        arguments=autostart_arguments(install=True),
     )
 
     payload = json.loads(capsys.readouterr().out)
@@ -608,8 +681,7 @@ def test_uninstall_action_reports_an_already_absent_task(
         config=app_config,
         config_path=config_file,
         logger=LOGGER,
-        install_requested=False,
-        uninstall_requested=True,
+        arguments=autostart_arguments(uninstall=True),
     )
 
     payload = json.loads(capsys.readouterr().out)
@@ -627,3 +699,418 @@ def test_setup_requires_one_explicit_action(
         main()
 
     assert exit_info.value.code == EXIT_USAGE_OR_CONFIG
+
+
+def test_replace_and_force_apply_to_install_only(
+    monkeypatch: pytest.MonkeyPatch,
+    config_file: Path,
+) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["engram", "--config", str(config_file), "setup", "autostart", "--status", "--replace"],
+    )
+
+    with pytest.raises(SystemExit) as exit_info:
+        main()
+
+    assert exit_info.value.code == EXIT_USAGE_OR_CONFIG
+
+
+# --- Competing scheduled tasks -------------------------------------------------
+
+
+def competing_engram_task(
+    name: str,
+    interpreter: Path,
+    config: Path,
+    *,
+    enabled: bool = True,
+) -> str:
+    """Render a task that starts this package with an explicit configuration."""
+    return scheduled_task(
+        name,
+        command=str(interpreter),
+        arguments=f'-m engram --config "{config}" serve',
+        enabled=enabled,
+    )
+
+
+def test_task_dump_names_every_task_from_the_comment_that_precedes_it(
+    windows_runtime: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        autostart_module,
+        "_run_scheduler",
+        RecordingScheduler(
+            present=False,
+            dump=task_dump(
+                scheduled_task("Some Vendor\\Updater", command="C:\\vendor\\update.exe"),
+                scheduled_task("Disabled Thing", command="C:\\vendor\\other.exe", enabled=False),
+                # A task whose action is not an executable, which the scheduler
+                # also dumps and which names no process to compare.
+                f'<!-- \\Handler -->\n<Task version="1.3" xmlns="{TASK_NAMESPACE}">'
+                "<Actions><ComHandler /></Actions></Task>",
+            ),
+        ),
+    )
+    del windows_runtime
+
+    actions = registered_actions()
+
+    assert [action.task_name for action in actions] == ["Some Vendor\\Updater", "Disabled Thing"]
+    assert [action.enabled for action in actions] == [True, False]
+
+
+def test_canonical_path_collapses_the_spellings_windows_treats_as_one(tmp_path: Path) -> None:
+    present = tmp_path / "engram.db"
+    present.write_bytes(b"")
+
+    assert canonical_path(f'  "{present}" ') == present.resolve()
+    assert same_path(canonical_path(str(present).upper()) or present, present.resolve())
+    assert canonical_path("   ") is None
+
+
+def test_conflicting_tasks_finds_a_task_that_opens_the_same_database(
+    windows_runtime: Path,
+    config_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    interpreter = windows_runtime / "pythonw.exe"
+    monkeypatch.setattr(
+        autostart_module,
+        "_run_scheduler",
+        RecordingScheduler(
+            present=False,
+            dump=task_dump(competing_engram_task("Engram Local Daemon", interpreter, config_file)),
+        ),
+    )
+    database = (config_file.parent / "engram.db").resolve()
+
+    conflicts = conflicting_tasks(build_plan(config_file), database=database)
+
+    assert [conflict.task_name for conflict in conflicts] == ["Engram Local Daemon"]
+    assert conflicts[0].resolved
+    assert conflicts[0].database == database
+
+
+def test_conflicting_tasks_ignores_a_task_serving_another_database(
+    windows_runtime: Path,
+    config_file: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    elsewhere = tmp_path / "elsewhere" / DEFAULT_CONFIG_PATH.name
+    elsewhere.parent.mkdir(parents=True)
+    elsewhere.write_text(EXAMPLE_CONFIG.read_text(encoding="utf-8"), encoding="utf-8")
+    monkeypatch.setattr(
+        autostart_module,
+        "_run_scheduler",
+        RecordingScheduler(
+            present=False,
+            dump=task_dump(
+                competing_engram_task("Other Engram", windows_runtime / "pythonw.exe", elsewhere)
+            ),
+        ),
+    )
+
+    conflicts = conflicting_tasks(
+        build_plan(config_file),
+        database=(config_file.parent / "engram.db").resolve(),
+    )
+
+    assert conflicts == ()
+
+
+def test_conflicting_tasks_refuses_to_clear_a_task_it_cannot_resolve(
+    windows_runtime: Path,
+    config_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A wrapper script hides the configuration, and a hidden answer is not 'no conflict'."""
+    del windows_runtime
+    script = config_file.parent / "start-engram.ps1"
+    script.write_text("", encoding="utf-8")
+    monkeypatch.setattr(
+        autostart_module,
+        "_run_scheduler",
+        RecordingScheduler(
+            present=False,
+            dump=task_dump(
+                scheduled_task(
+                    "Engram Local Daemon",
+                    command="C:\\Program Files\\PowerShell\\7\\pwsh.exe",
+                    arguments=f'-NoProfile -WindowStyle Hidden -File "{script}"',
+                )
+            ),
+        ),
+    )
+
+    conflicts = conflicting_tasks(
+        build_plan(config_file),
+        database=(config_file.parent / "engram.db").resolve(),
+    )
+
+    assert [conflict.task_name for conflict in conflicts] == ["Engram Local Daemon"]
+    assert not conflicts[0].resolved
+    assert conflicts[0].database is None
+    assert "undetermined" in conflicts[0].reason
+
+
+def test_conflicting_tasks_ignores_a_disabled_task_and_its_own(
+    windows_runtime: Path,
+    config_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    interpreter = windows_runtime / "pythonw.exe"
+    plan = build_plan(config_file)
+    monkeypatch.setattr(
+        autostart_module,
+        "_run_scheduler",
+        RecordingScheduler(
+            present=True,
+            dump=task_dump(
+                competing_engram_task("Retired Daemon", interpreter, config_file, enabled=False),
+                competing_engram_task(plan.task_name, interpreter, config_file),
+            ),
+        ),
+    )
+
+    conflicts = conflicting_tasks(plan, database=(config_file.parent / "engram.db").resolve())
+
+    assert conflicts == ()
+
+
+def _conflict(name: str = "Engram Local Daemon", *, database: Path | None = None) -> TaskConflict:
+    return TaskConflict(
+        task_name=name,
+        enabled=True,
+        database=database,
+        reason="starts Engram on the same database" if database else "undetermined",
+    )
+
+
+def test_resolve_conflicts_refuses_and_names_the_competing_task(
+    app_config: AppConfig,
+) -> None:
+    with pytest.raises(AutostartConflictError) as failure:
+        resolve_conflicts(
+            (_conflict(database=app_config.database.path),),
+            config=app_config,
+            replace=False,
+            force=False,
+            logger=LOGGER,
+        )
+
+    assert "Engram Local Daemon" in str(failure.value)
+    assert "--replace" in str(failure.value)
+
+
+def test_resolve_conflicts_refuses_an_undetermined_task_rather_than_assuming_it_is_free(
+    app_config: AppConfig,
+) -> None:
+    with pytest.raises(AutostartConflictError) as failure:
+        resolve_conflicts(
+            (_conflict(),),
+            config=app_config,
+            replace=False,
+            force=False,
+            logger=LOGGER,
+        )
+
+    assert "undetermined" in str(failure.value)
+
+
+def test_force_installs_over_a_conflict_without_disabling_anything(
+    app_config: AppConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scheduler = RecordingScheduler(present=False)
+    monkeypatch.setattr(autostart_module, "_run_scheduler", scheduler)
+
+    disabled = resolve_conflicts(
+        (_conflict(),),
+        config=app_config,
+        replace=False,
+        force=True,
+        logger=LOGGER,
+    )
+
+    assert disabled == ()
+    assert "/Change" not in scheduler.verbs()
+
+
+def test_replace_disables_the_competing_task_without_deleting_it(
+    app_config: AppConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scheduler = RecordingScheduler(present=True)
+    monkeypatch.setattr(autostart_module, "_run_scheduler", scheduler)
+
+    disabled = resolve_conflicts(
+        (_conflict(database=app_config.database.path),),
+        config=app_config,
+        replace=True,
+        force=False,
+        logger=LOGGER,
+    )
+
+    assert [task.task_name for task in disabled] == ["Engram Local Daemon"]
+    assert scheduler.named("/Change") == ["Engram Local Daemon"]
+    assert "/DISABLE" in scheduler.calls[0]
+    assert "/Delete" not in scheduler.verbs()
+
+
+def test_replace_stops_the_running_daemon_and_waits_for_the_lock_itself(
+    app_config: AppConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scheduler = RecordingScheduler(present=True)
+    monkeypatch.setattr(autostart_module, "_run_scheduler", scheduler)
+    answers = [
+        DatabaseOwnership(locked=True, role=DatabaseLockRole.DAEMON, pid=1234),
+        DatabaseOwnership(locked=True, role=DatabaseLockRole.DAEMON, pid=1234),
+        DatabaseOwnership(locked=False, role=None, pid=None),
+    ]
+    monkeypatch.setattr(autostart_module, "database_ownership", lambda _config: answers.pop(0))
+    monkeypatch.setattr(autostart_module, "LOCK_POLL_INTERVAL_SECONDS", 0.0)
+
+    disabled = resolve_conflicts(
+        (_conflict(database=app_config.database.path),),
+        config=app_config,
+        replace=True,
+        force=False,
+        logger=LOGGER,
+    )
+
+    assert disabled[0].stopped_pid == 1234
+    assert disabled[0].ended
+    assert scheduler.named("/End") == ["Engram Local Daemon"]
+    assert answers == []
+
+
+def test_replace_gives_up_when_the_lock_is_never_released(
+    app_config: AppConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(autostart_module, "_run_scheduler", RecordingScheduler(present=True))
+    monkeypatch.setattr(
+        autostart_module,
+        "database_ownership",
+        lambda _config: DatabaseOwnership(locked=True, role=DatabaseLockRole.DAEMON, pid=99),
+    )
+    monkeypatch.setattr(autostart_module, "LOCK_POLL_INTERVAL_SECONDS", 0.0)
+    monkeypatch.setattr(autostart_module, "LOCK_RELEASE_TIMEOUT_SECONDS", 0.0)
+
+    with pytest.raises(AutostartError) as failure:
+        resolve_conflicts(
+            (_conflict(database=app_config.database.path),),
+            config=app_config,
+            replace=True,
+            force=False,
+            logger=LOGGER,
+        )
+
+    assert "99" in str(failure.value)
+
+
+def test_install_refuses_while_a_competing_task_is_enabled(
+    runtime_config: AppConfig,
+    windows_runtime: Path,
+    config_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        autostart_module,
+        "_run_scheduler",
+        RecordingScheduler(
+            present=False,
+            dump=task_dump(
+                competing_engram_task(
+                    "Engram Local Daemon",
+                    windows_runtime / "pythonw.exe",
+                    config_file,
+                )
+            ),
+        ),
+    )
+
+    with pytest.raises(AutostartConflictError):
+        _setup_autostart(
+            config=runtime_config,
+            config_path=config_file,
+            logger=LOGGER,
+            arguments=autostart_arguments(install=True),
+        )
+
+
+def test_install_replace_reports_the_task_it_disabled(
+    runtime_config: AppConfig,
+    windows_runtime: Path,
+    config_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    scheduler = RecordingScheduler(
+        present=False,
+        dump=task_dump(
+            competing_engram_task(
+                "Engram Local Daemon",
+                windows_runtime / "pythonw.exe",
+                config_file,
+            )
+        ),
+    )
+    monkeypatch.setattr(autostart_module, "_run_scheduler", scheduler)
+
+    _setup_autostart(
+        config=runtime_config,
+        config_path=config_file,
+        logger=LOGGER,
+        arguments=autostart_arguments(install=True, replace=True),
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["disabled"] == [
+        {"ended": False, "stopped_pid": None, "task_name": "Engram Local Daemon"}
+    ]
+    assert payload["created"] is True
+    assert scheduler.named("/Change") == ["Engram Local Daemon"]
+    assert "/Delete" not in scheduler.verbs()
+
+
+def test_status_lists_the_competing_tasks(
+    runtime_config: AppConfig,
+    windows_runtime: Path,
+    config_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(
+        autostart_module,
+        "_run_scheduler",
+        RecordingScheduler(
+            present=True,
+            dump=task_dump(
+                competing_engram_task(
+                    "Engram Local Daemon",
+                    windows_runtime / "pythonw.exe",
+                    config_file,
+                )
+            ),
+        ),
+    )
+
+    _setup_autostart(
+        config=runtime_config,
+        config_path=config_file,
+        logger=LOGGER,
+        arguments=autostart_arguments(),
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert [conflict["task_name"] for conflict in payload["conflicts"]] == ["Engram Local Daemon"]
+    assert payload["conflicts"][0]["resolved"] is True
+    # The contract L5 established must not move underneath its consumers.
+    assert {"installed", "daemon_running", "database_owner_pid"} <= set(payload)

@@ -76,6 +76,49 @@ What the command does, and what it does not:
 | `--status` | Writes nothing. The answer is in the JSON, never in the exit code. | `0` in every case |
 | `--uninstall` | Removes the task. On an already absent task, `removed` is `false`. | `0` |
 
+### Taking over an earlier installation
+
+If Engram was already started at logon by something else — a scheduled task created by hand, a
+launch script — `--install` **refuses** and names the task it found:
+
+```powershell
+uv run --python 3.14.6 engram setup autostart --install
+```
+
+**Expected result:** a non-zero exit code and a message of the form
+`Another registered task would open this database: 'Engram Local Daemon' ...`.
+
+Detection compares **the database being targeted**, not the name of the task. A task that goes
+through a wrapper script does not announce its configuration: in that case the command does not
+conclude that there is no conflict, it reports the uncertainty and refuses anyway. An unknown
+answer is not a negative one.
+
+To take the installation over:
+
+```powershell
+uv run --python 3.14.6 engram setup autostart --install --replace
+```
+
+**Expected result:** exit 0, and JSON whose `disabled` field names the task that was taken over.
+
+```powershell
+uv run --python 3.14.6 engram setup autostart --status
+```
+
+**Expected result:** `installed` is `true`, `daemon_running` is `true`, and `conflicts` is empty.
+
+> **The task taken over is disabled, not deleted.** Its definition stays intact in the scheduler.
+> To go back: `Enable-ScheduledTask -TaskName "<name reported in disabled>"`, then disable
+> Engram's own. Deleting it for good stays your gesture, never the command's.
+
+`--replace` stops the daemon belonging to the task it takes over and **waits for the database lock
+to be released**, not for a fixed delay. Replaying `--install --replace` on an already converged
+system exits 0 and changes nothing.
+
+As a last resort, `--force` installs despite a conflict or an unresolved answer. Use it only when
+you know the other task will not open this database: with two daemons on one database, the second
+is the one that dies on the lock.
+
 Worth knowing:
 
 - the task is named after the path of your `engram.toml`. Two separate installations own two

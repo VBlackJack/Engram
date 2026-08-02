@@ -77,6 +77,51 @@ Ce que la commande fait, et ce qu'elle ne fait pas :
 | `--status` | N'ecrit rien. Repond dans le JSON, jamais par le code de sortie. | `0` dans tous les cas |
 | `--uninstall` | Supprime la tache. Sur une tache deja absente, `removed` vaut `false`. | `0` |
 
+### Reprendre une installation anterieure
+
+Si Engram etait deja lance au demarrage par un autre mecanisme - une tache planifiee posee a la
+main, un script de lancement - `--install` **refuse** et nomme la tache concernee :
+
+```powershell
+uv run --python 3.14.6 engram setup autostart --install
+```
+
+**Resultat attendu :** code de sortie non nul, et un message de la forme
+`Another registered task would open this database: 'Engram Local Daemon' ...`.
+
+La detection compare **la base de donnees visee**, pas le nom de la tache. Une tache qui passe par
+un script intermediaire n'annonce pas sa configuration : dans ce cas la commande ne conclut pas a
+l'absence de conflit, elle signale l'indetermination et refuse quand meme. Une reponse inconnue
+n'est pas une reponse negative.
+
+Pour reprendre l'installation :
+
+```powershell
+uv run --python 3.14.6 engram setup autostart --install --replace
+```
+
+**Resultat attendu :** code 0, et un JSON dont `disabled` nomme la tache reprise.
+
+```powershell
+uv run --python 3.14.6 engram setup autostart --status
+```
+
+**Resultat attendu :** `installed` vaut `true`, `daemon_running` vaut `true`, et `conflicts` est
+vide.
+
+> **La tache reprise est desactivee, pas supprimee.** Sa definition reste intacte dans le
+> planificateur. Pour revenir en arriere :
+> `Enable-ScheduledTask -TaskName "<nom rapporte dans disabled>"`, puis desactivez celle
+> d'Engram. La suppression definitive reste votre geste, jamais celui de la commande.
+
+`--replace` arrete proprement le daemon issu de la tache reprise et **attend la liberation du
+verrou de la base**, pas un delai fixe. Rejouer `--install --replace` sur un systeme deja converge
+sort en 0 sans rien changer.
+
+En dernier recours, `--force` installe malgre un conflit ou une indetermination. A n'utiliser que
+si vous savez que l'autre tache n'ouvrira pas cette base : deux daemons sur la meme base, c'est le
+second qui meurt sur le verrou.
+
 Points a connaitre :
 
 - la tache est nommee d'apres le chemin de votre `engram.toml`. Deux installations distinctes ont
