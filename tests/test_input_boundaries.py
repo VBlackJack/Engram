@@ -65,6 +65,12 @@ class _RecordingApp:
         await send({"type": "http.response.body", "body": b""})
 
 
+MCP_OPENING_HEADERS: tuple[tuple[bytes, bytes], ...] = (
+    (b"accept", b"application/json, text/event-stream"),
+    (b"content-type", b"application/json"),
+)
+
+
 async def _invoke_body_middleware(
     *,
     max_body_bytes: int,
@@ -96,7 +102,7 @@ async def _invoke_body_middleware(
         "raw_path": b"/mcp",
         "query_string": b"",
         "root_path": "",
-        "headers": list(headers),
+        "headers": [*MCP_OPENING_HEADERS, *headers],
         "client": ("127.0.0.1", 50000),
         "server": ("127.0.0.1", 8377),
         "state": {},
@@ -206,8 +212,8 @@ async def test_body_limit_accepts_and_replays_exact_boundary_once() -> None:
         max_body_bytes=8,
         headers=((b"content-length", b"8"),),
         messages=(
-            {"type": "http.request", "body": b"123", "more_body": True},
-            {"type": "http.request", "body": b"45678", "more_body": False},
+            {"type": "http.request", "body": b'{"a', "more_body": True},
+            {"type": "http.request", "body": b'b":1}', "more_body": False},
         ),
     )
 
@@ -215,7 +221,7 @@ async def test_body_limit_accepts_and_replays_exact_boundary_once() -> None:
     assert receive_calls == 2
     assert downstream.received_message == {
         "type": "http.request",
-        "body": b"12345678",
+        "body": b'{"ab":1}',
         "more_body": False,
     }
     assert sent[0]["status"] == 204

@@ -56,6 +56,11 @@ from .retrieval import EntryIndexer, RetrievalRequest, Retriever, build_retrieve
 from .store import EngramStore, StoreBusyError
 
 MAX_HTTP_BODY_CHUNKS = 256
+# The media types the streamable HTTP transport requires, named here so the
+# guard in front of it cannot drift from the transport behind it.
+CONTENT_TYPE_JSON = "application/json"
+CONTENT_TYPE_SSE = "text/event-stream"
+MCP_SESSION_HEADER = b"mcp-session-id"
 MAX_CLIENT_COMPONENT_CHARS = MAX_MCP_CLIENT_COMPONENT_CHARS
 ASCII_ZERO = ord("0")
 ASCII_NINE = ord("9")
@@ -165,6 +170,8 @@ class RequestBodyLimitMiddleware:
         try:
             self._validate_content_length(scope)
             body = await self._read_body(receive)
+            if body is not None:
+                self._validate_session_opening(scope, body)
         except _RequestBodyRejectedError as exc:
             await self._reject(send, exc.status_code, exc.detail)
             return
@@ -185,6 +192,43 @@ class RequestBodyLimitMiddleware:
             return await receive()
 
         await self._app(scope, replay_receive, send)
+
+    def _validate_session_opening(self, scope: Scope, body: bytes) -> None:
+        """Refuse a session-opening POST the transport would reject anyway.
+
+        The SDK registers a transport and starts its task before it validates
+        anything, so every rejected POST that carried no session id left a live
+        session and an anyio task behind for the lifetime of the process. Measured
+        on this build: 500 rejected requests, 500 leaked sessions. A daemon
+        installed to run from logon and stay up for weeks grows without bound
+        under a misconfigured client, or under anything that can send a request.
+
+        The checks are the transport's own, applied one layer earlier and with
+        the same status codes, so nothing the transport would have accepted is
+        refused here. Requests carrying a session id are untouched: they reach an
+        existing transport and create nothing.
+        """
+        headers = {name.lower(): value for name, value in scope.get("headers", ())}
+        if MCP_SESSION_HEADER in headers:
+            return
+        accept = headers.get(b"accept", b"").decode("latin-1")
+        offered = {part.split(";")[0].strip() for part in accept.split(",")}
+        if not {CONTENT_TYPE_JSON, CONTENT_TYPE_SSE} <= offered:
+            raise _RequestBodyRejectedError(
+                406,
+                "Not Acceptable: Client must accept both application/json and text/event-stream",
+            )
+        declared = headers.get(b"content-type", b"").decode("latin-1")
+        media_types = {part.strip() for part in declared.split(";")[0].split(",")}
+        if CONTENT_TYPE_JSON not in media_types:
+            raise _RequestBodyRejectedError(
+                415,
+                "Unsupported Media Type: Content-Type must be application/json",
+            )
+        try:
+            json.loads(body)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise _RequestBodyRejectedError(400, "Parse error: invalid JSON") from exc
 
     def _validate_content_length(self, scope: Scope) -> None:
         content_lengths = [

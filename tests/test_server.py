@@ -20,6 +20,7 @@ import httpx
 import pytest
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
+from mcp.server.fastmcp import FastMCP
 from mcp.types import CallToolResult, Implementation, TextContent
 from starlette.applications import Starlette
 
@@ -751,3 +752,111 @@ async def test_daemon_lifespan_cancels_ttl_task_on_shutdown(
             await started.wait()
 
         assert stopped.is_set()
+
+
+def _sessions(server: FastMCP[object]) -> int:
+    """Count the transports the SDK is holding open."""
+    return len(server.session_manager._server_instances)  # noqa: SLF001
+
+
+REJECTED_OPENINGS = {
+    "content type is not json": (
+        {"content-type": "text/plain", "accept": "application/json, text/event-stream"},
+        b"x",
+        415,
+    ),
+    "accept header absent": ({"content-type": "application/json"}, b"{}", 406),
+    "accept omits the event stream": (
+        {"content-type": "application/json", "accept": "application/json"},
+        b"{}",
+        406,
+    ),
+    "body is not json": (
+        {"content-type": "application/json", "accept": "application/json, text/event-stream"},
+        b"{ not json",
+        400,
+    ),
+}
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("shape", sorted(REJECTED_OPENINGS))
+async def test_a_rejected_session_opening_creates_no_session(
+    shape: str,
+    app_config: AppConfig,
+    store: EngramStore,
+) -> None:
+    """The SDK registers a transport before it validates, so a refusal used to leak one.
+
+    Measured before the guard existed: every rejected POST left a live session and
+    an anyio task for the lifetime of the process, so a daemon meant to run for
+    weeks grew without bound under anything that could send a request.
+    """
+    headers, body, expected_status = REJECTED_OPENINGS[shape]
+    server = create_mcp_server(app_config, store)
+    app = server.streamable_http_app()
+    transport = httpx.ASGITransport(app=app)
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1:8377") as client,
+    ):
+        before = _sessions(server)
+        response = await client.post("/mcp", headers=headers, content=body)
+
+        assert response.status_code == expected_status
+        assert _sessions(server) == before
+
+
+@pytest.mark.anyio
+async def test_a_flood_of_rejected_openings_leaves_the_session_table_bounded(
+    app_config: AppConfig,
+    store: EngramStore,
+) -> None:
+    """One session per rejected request is unbounded growth; zero is the contract."""
+    server = create_mcp_server(app_config, store)
+    app = server.streamable_http_app()
+    transport = httpx.ASGITransport(app=app)
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1:8377") as client,
+    ):
+        before = _sessions(server)
+        for _ in range(200):
+            await client.post("/mcp", headers={"content-type": "text/plain"}, content=b"x")
+
+        assert _sessions(server) == before
+
+
+@pytest.mark.anyio
+async def test_the_guard_leaves_a_real_session_working_end_to_end(
+    app_config: AppConfig,
+    store: EngramStore,
+) -> None:
+    """The guard sits in front of the transport, so the transport must be untouched."""
+    server = create_mcp_server(app_config, store)
+    app = server.streamable_http_app()
+    async with (
+        app.router.lifespan_context(app),
+        _client(app) as session,
+    ):
+        listed = await session.list_tools()
+        assert sorted(tool.name for tool in listed.tools) == ["recall", "remember"]
+
+        written = await session.call_tool(
+            "remember",
+            {
+                "statement": "The guard must not break a legitimate session.",
+                "kind": "fact",
+                "scope": "project/engram",
+                "subject_keys": ["engram:guard"],
+            },
+        )
+        assert _structured(written)["outcome"] == "created"
+
+        recalled = await session.call_tool(
+            "recall",
+            {"query": "guard legitimate session", "scope": "project/engram"},
+        )
+        capsule = _structured(recalled)
+        assert len(capsule["own_pending"]) == 1
+        assert _sessions(server) == 1
