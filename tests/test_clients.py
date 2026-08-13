@@ -224,14 +224,14 @@ def test_a_codex_table_without_a_url_is_refused_rather_than_duplicated(
     """TOML forbids the same table twice; appending one produced a file Codex cannot read."""
     plan = plan_client(ClientKind.CODEX, app_config, home=workspace)
     plan.config_path.parent.mkdir(parents=True, exist_ok=True)
-    plan.config_path.write_text("[mcp_servers.engram]\nenabled = true\n", encoding="utf-8")
+    plan.config_path.write_bytes(b"[mcp_servers.engram]\nenabled = true\n")
 
     with pytest.raises(ClientConfigError, match="already declares"):
         connect(plan_client(ClientKind.CODEX, app_config, home=workspace), force=False)
 
-    text = plan.config_path.read_text(encoding="utf-8")
-    assert text.count("[mcp_servers.engram]") == 1
-    assert tomllib.loads(text)
+    raw = plan.config_path.read_bytes()
+    assert raw == b"[mcp_servers.engram]\nenabled = true\n"
+    assert tomllib.loads(raw.decode("utf-8"))
 
 
 def test_a_codex_file_that_is_not_valid_toml_is_never_appended_to(
@@ -241,12 +241,12 @@ def test_a_codex_file_that_is_not_valid_toml_is_never_appended_to(
     """A document that does not parse is not an absent table."""
     plan = plan_client(ClientKind.CODEX, app_config, home=workspace)
     plan.config_path.parent.mkdir(parents=True, exist_ok=True)
-    plan.config_path.write_text("[mcp_servers.engram\nbroken\n", encoding="utf-8")
+    plan.config_path.write_bytes(b"[mcp_servers.engram\nbroken\n")
 
     with pytest.raises(ClientConfigError, match="not valid TOML"):
         plan_client(ClientKind.CODEX, app_config, home=workspace)
 
-    assert plan.config_path.read_text(encoding="utf-8") == "[mcp_servers.engram\nbroken\n"
+    assert plan.config_path.read_bytes() == b"[mcp_servers.engram\nbroken\n"
 
 
 def test_a_codex_table_naming_another_endpoint_is_refused_even_with_force(
@@ -256,15 +256,16 @@ def test_a_codex_table_naming_another_endpoint_is_refused_even_with_force(
     """Rewriting a table textually would lose the comments and ordering around it."""
     plan = plan_client(ClientKind.CODEX, app_config, home=workspace)
     plan.config_path.parent.mkdir(parents=True, exist_ok=True)
-    plan.config_path.write_text(
-        '# kept\n[mcp_servers.engram]\nurl = "http://127.0.0.1:9999/mcp"\n',
-        encoding="utf-8",
+    plan.config_path.write_bytes(
+        b'# kept\n[mcp_servers.engram]\nurl = "http://127.0.0.1:9999/mcp"\n'
     )
 
     with pytest.raises(ClientConfigError, match="already declares"):
         connect(plan_client(ClientKind.CODEX, app_config, home=workspace), force=True)
 
-    assert "# kept" in plan.config_path.read_text(encoding="utf-8")
+    assert plan.config_path.read_bytes() == (
+        b'# kept\n[mcp_servers.engram]\nurl = "http://127.0.0.1:9999/mcp"\n'
+    )
 
 
 @pytest.mark.parametrize(
@@ -293,13 +294,13 @@ def test_a_structurally_invalid_codex_entry_is_refused_not_read_as_absent(
     del label
     plan = plan_client(ClientKind.CODEX, app_config, home=workspace)
     plan.config_path.parent.mkdir(parents=True, exist_ok=True)
-    plan.config_path.write_text(content, encoding="utf-8")
+    plan.config_path.write_bytes(content.encode("utf-8"))
 
     with pytest.raises(ClientConfigError):
         connect(plan_client(ClientKind.CODEX, app_config, home=workspace), force=False)
 
-    assert plan.config_path.read_text(encoding="utf-8") == content
-    assert tomllib.loads(plan.config_path.read_text(encoding="utf-8")) is not None
+    assert plan.config_path.read_bytes() == content.encode("utf-8")
+    assert tomllib.loads(content) is not None
 
 
 def test_a_codex_write_that_would_not_parse_puts_the_file_back(
@@ -315,13 +316,13 @@ def test_a_codex_write_that_would_not_parse_puts_the_file_back(
     original = '# irreplaceable\nmodel = "gpt-5"\n'
     plan = plan_client(ClientKind.CODEX, app_config, home=workspace)
     plan.config_path.parent.mkdir(parents=True, exist_ok=True)
-    plan.config_path.write_text(original, encoding="utf-8")
+    plan.config_path.write_bytes(original.encode("utf-8"))
     monkeypatch.setattr(clients_module, "_render_codex_block", lambda _url: "[unterminated\n")
 
     with pytest.raises(ClientConfigError, match="cannot carry"):
         connect(plan_client(ClientKind.CODEX, app_config, home=workspace), force=False)
 
-    assert plan.config_path.read_text(encoding="utf-8") == original
+    assert plan.config_path.read_bytes() == original.encode("utf-8")
 
 
 def test_a_codex_write_that_would_not_parse_creates_no_file(
@@ -337,3 +338,91 @@ def test_a_codex_write_that_would_not_parse_creates_no_file(
         connect(plan_client(ClientKind.CODEX, app_config, home=workspace), force=False)
 
     assert not plan.config_path.exists()
+
+
+REFUSED_CODEX_SHAPES = {
+    "mcp_servers is a scalar": b'mcp_servers = "legacy"',
+    "mcp_servers.engram is a scalar": b'[mcp_servers]\nengram = "legacy"',
+    "mcp_servers is an inline table": b'mcp_servers = { datacron = { url = "http://x/mcp" } }',
+    "the engram table carries no url": b"[mcp_servers.engram]\nenabled = true",
+    "the engram table names another endpoint": b'[mcp_servers.engram]\nurl = "http://other/mcp"',
+    "the document is not valid TOML": b"[mcp_servers.engram\nbroken",
+}
+
+
+def _with_endings(body: bytes, family: str) -> bytes:
+    if family == "CRLF":
+        return body.replace(b"\n", b"\r\n") + b"\r\n"
+    if family == "mixed":
+        return body.replace(b"\n", b"\r\n", 1) + b"\n"
+    return body + b"\n"
+
+
+@pytest.mark.parametrize("shape", sorted(REFUSED_CODEX_SHAPES))
+@pytest.mark.parametrize("family", ["LF", "CRLF", "mixed"])
+def test_a_refused_codex_write_leaves_the_file_identical_byte_for_byte(
+    shape: str,
+    family: str,
+    app_config: AppConfig,
+    workspace: Path,
+) -> None:
+    """Refusing is only fail-closed if the destination was never touched.
+
+    The first attempt wrote the destination and undid it afterwards, through a
+    text write that rewrites every line ending on Windows: a refusal announcing
+    the file was unchanged had turned it from LF to CRLF. Comparing with
+    read_text could not see that, because reading normalises it back.
+    """
+    raw = _with_endings(REFUSED_CODEX_SHAPES[shape], family)
+    plan = plan_client(ClientKind.CODEX, app_config, home=workspace)
+    plan.config_path.parent.mkdir(parents=True, exist_ok=True)
+    plan.config_path.write_bytes(raw)
+
+    with pytest.raises(ClientConfigError):
+        connect(plan_client(ClientKind.CODEX, app_config, home=workspace), force=False)
+
+    assert plan.config_path.read_bytes() == raw
+    assert list(plan.config_path.parent.iterdir()) == [plan.config_path]
+
+
+@pytest.mark.parametrize("family", ["LF", "CRLF"])
+def test_an_accepted_codex_write_keeps_the_existing_bytes_and_their_newlines(
+    family: str,
+    app_config: AppConfig,
+    workspace: Path,
+) -> None:
+    """A user's line endings are theirs; appending must not rewrite the file."""
+    raw = _with_endings(b'# kept\n[mcp_servers.datacron]\nurl = "http://x/mcp"', family)
+    plan = plan_client(ClientKind.CODEX, app_config, home=workspace)
+    plan.config_path.parent.mkdir(parents=True, exist_ok=True)
+    plan.config_path.write_bytes(raw)
+
+    connect(plan_client(ClientKind.CODEX, app_config, home=workspace), force=False)
+
+    written = plan.config_path.read_bytes()
+    newline = b"\r\n" if family == "CRLF" else b"\n"
+    assert written.startswith(raw)
+    assert tomllib.loads(written.decode("utf-8"))["mcp_servers"]["engram"]["url"] == endpoint_url(
+        app_config
+    )
+    assert written.removeprefix(raw).count(newline) == written.removeprefix(raw).count(b"\n")
+    assert list(plan.config_path.parent.iterdir()) == [plan.config_path]
+
+
+@pytest.mark.parametrize("family", ["LF", "CRLF"])
+def test_the_protocol_append_keeps_the_instructions_file_bytes(
+    family: str,
+    app_config: AppConfig,
+    workspace: Path,
+) -> None:
+    """Rewriting the whole instructions file normalised its line endings too."""
+    raw = _with_endings(b"# My project\n\nExisting guidance.", family)
+    plan = plan_client(ClientKind.CLAUDE, app_config, home=workspace)
+    plan.instructions_path.write_bytes(raw)
+
+    assert install_protocol(plan) is True
+    assert install_protocol(plan) is False
+
+    written = plan.instructions_path.read_bytes()
+    assert written.startswith(raw)
+    assert written.count(b"Engram session protocol") == 1

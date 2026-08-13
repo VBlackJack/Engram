@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 import tomllib
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -110,19 +111,13 @@ def connect(plan: ClientPlan, *, force: bool) -> bool:
 
 def install_protocol(plan: ClientPlan) -> bool:
     """Append the session protocol to the client's instructions, once."""
-    protocol = client_protocol_text()
-    existing = (
-        plan.instructions_path.read_text(encoding="utf-8")
-        if plan.instructions_path.is_file()
-        else ""
-    )
-    if protocol.strip() in existing:
+    protocol = client_protocol_text().strip()
+    existing = plan.instructions_path.read_bytes() if plan.instructions_path.is_file() else b""
+    if protocol.encode("utf-8") in existing.replace(b"\r\n", b"\n"):
         return False
-    separator = "" if not existing or existing.endswith("\n\n") else "\n"
-    plan.instructions_path.parent.mkdir(parents=True, exist_ok=True)
-    plan.instructions_path.write_text(
-        f"{existing}{separator}\n{protocol.strip()}\n",
-        encoding="utf-8",
+    _replace_atomically(
+        plan.instructions_path,
+        existing + _line_separated_appendix(existing, f"{protocol}\n"),
     )
     return True
 
@@ -182,8 +177,10 @@ def _write_json_client(plan: ClientPlan, *, force: bool) -> None:
         )
     servers[SERVER_KEY] = json.loads(plan.block)["mcpServers"][SERVER_KEY]
     document["mcpServers"] = servers
-    plan.config_path.parent.mkdir(parents=True, exist_ok=True)
-    plan.config_path.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
+    _replace_atomically(
+        plan.config_path,
+        (json.dumps(document, indent=2) + "\n").encode("utf-8"),
+    )
 
 
 def _codex_declares(path: Path, url: str) -> bool:
@@ -207,8 +204,8 @@ def _codex_entry(path: Path) -> Mapping[str, object] | None:
     if not path.is_file():
         return None
     try:
-        document = tomllib.loads(path.read_text(encoding="utf-8"))
-    except OSError as exc:
+        document = tomllib.loads(path.read_bytes().decode("utf-8"))
+    except (OSError, UnicodeDecodeError) as exc:
         raise ClientConfigError(f"{path} cannot be read: {exc}") from exc
     except tomllib.TOMLDecodeError as exc:
         raise ClientConfigError(
@@ -249,8 +246,9 @@ def _write_codex(plan: ClientPlan, *, force: bool) -> None:
     header cannot extend: a string, an inline table, a dotted key. Each of those
     parses into exactly what a well-formed table parses into, so no inspection
     separates them, and every missed shape reported success over a file Codex can
-    no longer read. The result is therefore parsed rather than predicted, and a
-    file that does not load is restored byte for byte.
+    no longer read. The candidate bytes are therefore assembled and parsed
+    without the destination being touched at all, and only a document that loads
+    is moved into place.
     """
     del force
     if _codex_entry(plan.config_path) is not None:
@@ -261,24 +259,70 @@ def _write_codex(plan: ClientPlan, *, force: bool) -> None:
             "document this project does not own loses comments and ordering. Edit the url in "
             "place, or run with --print and merge the block yourself."
         )
-    original = plan.config_path.read_text(encoding="utf-8") if plan.config_path.is_file() else None
-    existing = original or ""
-    separator = "" if not existing or existing.endswith("\n\n") else "\n"
-    updated = f"{existing}{separator}{plan.block}"
-    plan.config_path.parent.mkdir(parents=True, exist_ok=True)
-    plan.config_path.write_text(updated, encoding="utf-8")
+    existing = plan.config_path.read_bytes() if plan.config_path.is_file() else b""
+    candidate = existing + _line_separated_appendix(existing, plan.block)
     try:
-        tomllib.loads(updated)
-    except tomllib.TOMLDecodeError as exc:
-        if original is None:
-            plan.config_path.unlink()
-        else:
-            plan.config_path.write_text(original, encoding="utf-8")
+        tomllib.loads(candidate.decode("utf-8"))
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
         raise ClientConfigError(
             f"{plan.config_path} cannot carry a [mcp_servers.{SERVER_KEY}] table: {exc}. "
-            "The file is unchanged. Repair the conflicting entry, or run with --print and "
+            "The file is untouched. Repair the conflicting entry, or run with --print and "
             "merge the block yourself."
         ) from exc
+    _replace_atomically(plan.config_path, candidate)
+
+
+def _line_separated_appendix(existing: bytes, block: str) -> bytes:
+    """Return the bytes to append, separated from what is there and matching its newlines.
+
+    Nothing already in the file is rewritten: a user's line endings are theirs,
+    and normalising them is a change to a document this project does not own.
+    """
+    newline = b"\r\n" if b"\r\n" in existing else b"\n"
+    encoded = newline.join(block.encode("utf-8").split(b"\n"))
+    if not existing or existing.endswith((b"\n\n", b"\r\n\r\n")):
+        return encoded
+    if existing.endswith((b"\n", b"\r")):
+        return newline + encoded
+    return newline + newline + encoded
+
+
+def _require_written(temporary: Path, path: Path, data: bytes) -> None:
+    """Compare what reached the disk with what was checked, not with what was meant."""
+    if temporary.read_bytes() != data:
+        raise ClientConfigError(
+            f"{path} was not written: the bytes on disk differ from the ones checked"
+        )
+
+
+def _replace_atomically(path: Path, data: bytes) -> None:
+    """Put bytes at a path without the destination ever holding a partial state.
+
+    The destination is never opened for writing. The candidate is written beside
+    it, read back so that what landed on disk is what was checked rather than
+    what was intended, and moved into place by a single rename. An interrupted
+    run therefore leaves either the previous file or a stray temporary one, never
+    a half-written configuration a client cannot parse.
+
+    The earlier attempt wrote the destination first and undid it afterwards,
+    which is not the same thing. It validated a variable rather than a file, and
+    the undo went through a text write that rewrote every line ending on Windows:
+    a refusal that announced the file was unchanged had turned it from LF to
+    CRLF. Bytes are read and written as bytes here for that reason.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".part")
+    temporary = Path(name)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        _require_written(temporary, path, data)
+        temporary.replace(path)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
 
 
 def default_home() -> Path:
