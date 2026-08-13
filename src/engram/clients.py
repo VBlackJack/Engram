@@ -195,13 +195,14 @@ def _codex_declares(path: Path, url: str) -> bool:
 def _codex_entry(path: Path) -> Mapping[str, object] | None:
     """Return the table Codex already declares for Engram, or None when it has none.
 
-    Reading only the url conflated three different states: no table, a table
-    naming another endpoint, and a table that exists without a url. The last one
-    read as "nothing is configured", so a second table of the same name was
-    appended -- which TOML forbids -- and the command reported success over a
-    file Codex can no longer parse. A document that does not parse is likewise
-    not an absent table: appending to it would confirm a configuration nobody
-    can load.
+    Absent and structurally invalid are answered separately, because collapsing
+    them is what produced the defect twice. Reading only the url made a table
+    without one read as "nothing configured"; testing the container with
+    isinstance made `mcp_servers = "legacy"` and `mcp_servers.engram = "legacy"`
+    read the same way. Each time, a second table of the same name was appended --
+    which TOML forbids -- and the command reported success over a file Codex can
+    no longer parse. A key that is missing returns None; a value of the wrong
+    shape, and a document that does not parse at all, raise.
     """
     if not path.is_file():
         return None
@@ -214,21 +215,42 @@ def _codex_entry(path: Path) -> Mapping[str, object] | None:
             f"{path} is not valid TOML: {exc}. Repair it before connecting a client; "
             "appending to it would leave Codex unable to start."
         ) from exc
-    servers = document.get("mcp_servers")
-    if not isinstance(servers, dict):
+    if "mcp_servers" not in document:
         return None
-    entry = servers.get(SERVER_KEY)
-    return entry if isinstance(entry, Mapping) else None
+    servers = document["mcp_servers"]
+    if not isinstance(servers, Mapping):
+        raise ClientConfigError(
+            f"{path} declares mcp_servers as a {type(servers).__name__} rather than a table, "
+            f"so no [mcp_servers.{SERVER_KEY}] table can be added beside it. "
+            "Repair that entry, or run with --print and merge the block yourself."
+        )
+    if SERVER_KEY not in servers:
+        return None
+    entry = servers[SERVER_KEY]
+    if not isinstance(entry, Mapping):
+        raise ClientConfigError(
+            f"{path} declares mcp_servers.{SERVER_KEY} as a {type(entry).__name__} rather than a "
+            "table. Appending the block would leave a file Codex cannot parse. "
+            "Repair that entry, or run with --print and merge the block yourself."
+        )
+    return entry
 
 
 def _write_codex(plan: ClientPlan, *, force: bool) -> None:
-    """Append the table, because a TOML document has no safe in-place editor here.
+    """Append the table, then prove the file still parses, or put it back untouched.
 
-    Appending a uniquely named table is always valid TOML whatever precedes it,
-    so the rest of the file is never reparsed or rewritten. Replacing one that
-    already exists is refused rather than attempted: a textual substitution
-    inside a document this project does not own is how comments and ordering get
-    silently destroyed.
+    Replacing a table that already exists is refused rather than attempted: a
+    textual substitution inside a document this project does not own is how
+    comments and ordering get silently destroyed.
+
+    Appending is not unconditionally safe either, and reasoning about when it is
+    safe is what produced two defects in a row. "A uniquely named table is always
+    valid" is false whenever something already occupies that name in a form a
+    header cannot extend: a string, an inline table, a dotted key. Each of those
+    parses into exactly what a well-formed table parses into, so no inspection
+    separates them, and every missed shape reported success over a file Codex can
+    no longer read. The result is therefore parsed rather than predicted, and a
+    file that does not load is restored byte for byte.
     """
     del force
     if _codex_entry(plan.config_path) is not None:
@@ -239,10 +261,24 @@ def _write_codex(plan: ClientPlan, *, force: bool) -> None:
             "document this project does not own loses comments and ordering. Edit the url in "
             "place, or run with --print and merge the block yourself."
         )
-    existing = plan.config_path.read_text(encoding="utf-8") if plan.config_path.is_file() else ""
+    original = plan.config_path.read_text(encoding="utf-8") if plan.config_path.is_file() else None
+    existing = original or ""
     separator = "" if not existing or existing.endswith("\n\n") else "\n"
+    updated = f"{existing}{separator}{plan.block}"
     plan.config_path.parent.mkdir(parents=True, exist_ok=True)
-    plan.config_path.write_text(f"{existing}{separator}{plan.block}", encoding="utf-8")
+    plan.config_path.write_text(updated, encoding="utf-8")
+    try:
+        tomllib.loads(updated)
+    except tomllib.TOMLDecodeError as exc:
+        if original is None:
+            plan.config_path.unlink()
+        else:
+            plan.config_path.write_text(original, encoding="utf-8")
+        raise ClientConfigError(
+            f"{plan.config_path} cannot carry a [mcp_servers.{SERVER_KEY}] table: {exc}. "
+            "The file is unchanged. Repair the conflicting entry, or run with --print and "
+            "merge the block yourself."
+        ) from exc
 
 
 def default_home() -> Path:

@@ -13,6 +13,7 @@ from urllib.parse import urlparse
 
 import pytest
 
+import engram.clients as clients_module
 from engram.clients import (
     ClientConfigError,
     ClientKind,
@@ -264,3 +265,75 @@ def test_a_codex_table_naming_another_endpoint_is_refused_even_with_force(
         connect(plan_client(ClientKind.CODEX, app_config, home=workspace), force=True)
 
     assert "# kept" in plan.config_path.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    ("label", "content"),
+    [
+        ("mcp_servers is a string", 'mcp_servers = "legacy"\n'),
+        ("mcp_servers.engram is a string", '[mcp_servers]\nengram = "legacy"\n'),
+        (
+            "mcp_servers is an inline table",
+            'mcp_servers = { datacron = { url = "http://x/mcp" } }\n',
+        ),
+    ],
+)
+def test_a_structurally_invalid_codex_entry_is_refused_not_read_as_absent(
+    label: str,
+    content: str,
+    app_config: AppConfig,
+    workspace: Path,
+) -> None:
+    """Each of these is valid TOML that no [mcp_servers.engram] header can extend.
+
+    They parse into the same shapes a well-formed configuration parses into, so
+    treating a failed lookup as "nothing is configured" appended a second table
+    and reported success over a file Codex can no longer read.
+    """
+    del label
+    plan = plan_client(ClientKind.CODEX, app_config, home=workspace)
+    plan.config_path.parent.mkdir(parents=True, exist_ok=True)
+    plan.config_path.write_text(content, encoding="utf-8")
+
+    with pytest.raises(ClientConfigError):
+        connect(plan_client(ClientKind.CODEX, app_config, home=workspace), force=False)
+
+    assert plan.config_path.read_text(encoding="utf-8") == content
+    assert tomllib.loads(plan.config_path.read_text(encoding="utf-8")) is not None
+
+
+def test_a_codex_write_that_would_not_parse_puts_the_file_back(
+    app_config: AppConfig,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reasoning about when appending is safe is what produced the defect twice.
+
+    The result is parsed instead of predicted, so a shape nobody enumerated
+    still leaves the file exactly as it was rather than half-written.
+    """
+    original = '# irreplaceable\nmodel = "gpt-5"\n'
+    plan = plan_client(ClientKind.CODEX, app_config, home=workspace)
+    plan.config_path.parent.mkdir(parents=True, exist_ok=True)
+    plan.config_path.write_text(original, encoding="utf-8")
+    monkeypatch.setattr(clients_module, "_render_codex_block", lambda _url: "[unterminated\n")
+
+    with pytest.raises(ClientConfigError, match="cannot carry"):
+        connect(plan_client(ClientKind.CODEX, app_config, home=workspace), force=False)
+
+    assert plan.config_path.read_text(encoding="utf-8") == original
+
+
+def test_a_codex_write_that_would_not_parse_creates_no_file(
+    app_config: AppConfig,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A rollback must not leave behind a file the user never had."""
+    plan = plan_client(ClientKind.CODEX, app_config, home=workspace)
+    monkeypatch.setattr(clients_module, "_render_codex_block", lambda _url: "[unterminated\n")
+
+    with pytest.raises(ClientConfigError, match="cannot carry"):
+        connect(plan_client(ClientKind.CODEX, app_config, home=workspace), force=False)
+
+    assert not plan.config_path.exists()
