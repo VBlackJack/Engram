@@ -220,6 +220,127 @@ def test_requested_conflict_survives_lower_priority_context_under_budget() -> No
     _assert_source_invariant(capsule)
 
 
+def test_requesting_conflicts_never_costs_context_without_delivering_them() -> None:
+    """A family too large to fit must not be paid for with the content it displaces.
+
+    Conflict groups are removed whole and evicted last, so a family that cannot
+    fit made the builder empty every other section to make room and then drop
+    the family as well: asking for conflicts returned strictly less than not
+    asking for them.
+    """
+    standalone = _entry(
+        "standalone",
+        EntryKind.FACT,
+        "The deployment runbook lives beside the release notes.",
+        claim_key="runbook/location",
+    )
+    family = tuple(
+        _entry(
+            f"version-{index}",
+            EntryKind.FACT,
+            f"Retention is {index * 30} days. " + ("padding " * 120),
+            claim_key="retention/days",
+            canonical_key=f"retention-{index}",
+        )
+        for index in range(4)
+    )
+    retrieval = RetrievalResult(matches=(standalone, *family), next_actions=(), own_pending=())
+    builder = CapsuleBuilder(CapsuleConfig())
+
+    hidden, _ = builder.build(retrieval, scope=None, include_conflicts=False, token_budget=4800)
+    requested, _ = builder.build(retrieval, scope=None, include_conflicts=True, token_budget=4800)
+
+    assert hidden.sources == ["standalone"]
+    assert requested.conflicts == []
+    assert requested.sources == ["standalone"]
+    assert requested.notes.recall_complete is False
+    assert CAPSULE_BUDGET_OVERFLOW_NOTICE in requested.notes.warnings
+    _assert_source_invariant(requested)
+
+
+def test_conflict_families_that_fit_are_kept_smallest_last() -> None:
+    """A family refused for its size must not refuse a later one that does fit."""
+    large = tuple(
+        _entry(
+            f"large-{index}",
+            EntryKind.FACT,
+            f"Retention is {index * 30} days. " + ("padding " * 120),
+            claim_key="retention/days",
+            canonical_key=f"retention-{index}",
+        )
+        for index in range(4)
+    )
+    small = tuple(
+        _entry(
+            f"small-{index}",
+            EntryKind.FACT,
+            f"The owner is team {index}.",
+            claim_key="owner/team",
+            canonical_key=f"owner-{index}",
+        )
+        for index in range(2)
+    )
+    capsule, text = CapsuleBuilder(CapsuleConfig()).build(
+        RetrievalResult(matches=(*large, *small), next_actions=(), own_pending=()),
+        scope=None,
+        include_conflicts=True,
+        token_budget=4800,
+    )
+
+    assert [conflict.claim_key for conflict in capsule.conflicts] == ["owner/team"]
+    assert capsule.notes.recall_complete is False
+    assert CAPSULE_BUDGET_OVERFLOW_NOTICE in capsule.notes.warnings
+    assert estimate_capsule_bytes(capsule, text) <= 4800
+    _assert_source_invariant(capsule)
+
+
+def test_conflict_request_is_never_a_net_loss_across_family_sizes() -> None:
+    """Sweep the shapes where the eviction order used to spend content for nothing."""
+    builder = CapsuleBuilder(CapsuleConfig())
+    for family_size in (2, 4, 8):
+        for width in (60, 400, 1200):
+            standalone = _entry(
+                "standalone",
+                EntryKind.FACT,
+                "The deployment runbook lives beside the release notes.",
+                claim_key="runbook/location",
+            )
+            family = tuple(
+                _entry(
+                    f"version-{index}",
+                    EntryKind.FACT,
+                    f"Retention is {index * 30} days. " + ("word " * (width // 5)),
+                    claim_key="retention/days",
+                    canonical_key=f"retention-{index}",
+                )
+                for index in range(family_size)
+            )
+            retrieval = RetrievalResult(
+                matches=(standalone, *family),
+                next_actions=(),
+                own_pending=(),
+            )
+            for budget in (1200, 4800, 6000):
+                hidden, _ = builder.build(
+                    retrieval,
+                    scope=None,
+                    include_conflicts=False,
+                    token_budget=budget,
+                )
+                requested, _ = builder.build(
+                    retrieval,
+                    scope=None,
+                    include_conflicts=True,
+                    token_budget=budget,
+                )
+
+                assert requested.conflicts or set(requested.sources) >= set(hidden.sources), (
+                    f"family={family_size} width={width} budget={budget}: "
+                    f"asking for conflicts lost {set(hidden.sources) - set(requested.sources)} "
+                    "and delivered no conflict family"
+                )
+
+
 def test_budget_below_mandatory_envelope_fails_closed() -> None:
     builder = CapsuleBuilder(CapsuleConfig())
 
