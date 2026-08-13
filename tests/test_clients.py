@@ -567,3 +567,51 @@ def test_a_target_repointed_at_another_file_with_the_same_bytes_is_refused(
     assert victim.read_bytes() == shared, "the victim received the write"
     assert plan.instructions_path.read_bytes() == shared
     assert plan.instructions_path.samefile(victim)
+
+
+@pytest.mark.parametrize("kind", list(ClientKind))
+def test_a_stale_plan_never_reports_already_correct_over_a_changed_endpoint(
+    kind: ClientKind,
+    app_config: AppConfig,
+    workspace: Path,
+) -> None:
+    """A plan describes the file when it was made; acting on that is a false no-op.
+
+    Connecting, then having somebody point the entry elsewhere, then replaying
+    the old plan reported "Already correct" and wrote nothing, leaving the client
+    aimed at an endpoint that is not this Engram.
+    """
+    connect(plan_client(kind, app_config, home=workspace), force=False)
+    stale = plan_client(kind, app_config, home=workspace)
+    assert stale.already_correct is True
+
+    text = stale.config_path.read_text(encoding="utf-8")
+    stale.config_path.write_bytes(
+        text.replace(endpoint_url(app_config), "http://127.0.0.1:9999/elsewhere").encode("utf-8")
+    )
+
+    if kind is ClientKind.CODEX:
+        # Codex tables are never rewritten in place, so the honest answer is a
+        # refusal that names the conflict rather than a silent no-op.
+        with pytest.raises(ClientConfigError, match="already declares"):
+            connect(stale, force=False)
+    else:
+        assert connect(stale, force=True) is True
+        assert endpoint_url(app_config) in stale.config_path.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("kind", list(ClientKind))
+def test_a_stale_plan_never_reports_already_correct_over_an_unreadable_file(
+    kind: ClientKind,
+    app_config: AppConfig,
+    workspace: Path,
+) -> None:
+    """A file that stopped parsing must produce a refusal, not a reported success."""
+    connect(plan_client(kind, app_config, home=workspace), force=False)
+    stale = plan_client(kind, app_config, home=workspace)
+    assert stale.already_correct is True
+
+    stale.config_path.write_bytes(b"{ this is neither valid JSON nor valid TOML")
+
+    with pytest.raises(ClientConfigError):
+        connect(stale, force=True)

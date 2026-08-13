@@ -21,7 +21,7 @@ import os
 import stat
 import tomllib
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from pathlib import Path
 from typing import IO, TYPE_CHECKING, Any
@@ -64,11 +64,18 @@ class _Snapshot:
 
 @dataclass(frozen=True, slots=True)
 class ClientPlan:
-    """What connecting one client would write, and where."""
+    """What connecting one client would write, and where.
+
+    `already_correct` describes the file as it was when the plan was made, which
+    is what `--print` reports. It is deliberately not what `connect` acts on: a
+    plan is a description, not a promise about a file somebody else can still
+    edit.
+    """
 
     kind: ClientKind
     config_path: Path
     instructions_path: Path
+    endpoint: str
     block: str
     already_correct: bool
 
@@ -86,36 +93,55 @@ def plan_client(kind: ClientKind, config: AppConfig, *, home: Path | None = None
         # Project scope: a file beside the work, which is also the form the
         # vendor documents for sharing a server with a repository.
         path = Path.cwd() / ".mcp.json"
-        return ClientPlan(
+        plan = ClientPlan(
             kind=kind,
             config_path=path,
             instructions_path=Path.cwd() / "CLAUDE.md",
+            endpoint=url,
             block=_render_json_block({"type": "http", "url": url}),
-            already_correct=_json_entry(path, ("mcpServers", SERVER_KEY))
-            == {"type": "http", "url": url},
+            already_correct=False,
         )
-    if kind is ClientKind.GEMINI:
+    elif kind is ClientKind.GEMINI:
         path = root / ".gemini" / "settings.json"
-        return ClientPlan(
+        plan = ClientPlan(
             kind=kind,
             config_path=path,
             instructions_path=Path.cwd() / "GEMINI.md",
+            endpoint=url,
             block=_render_json_block({"httpUrl": url}),
-            already_correct=_json_entry(path, ("mcpServers", SERVER_KEY)) == {"httpUrl": url},
+            already_correct=False,
         )
-    path = root / ".codex" / "config.toml"
-    return ClientPlan(
-        kind=kind,
-        config_path=path,
-        instructions_path=Path.cwd() / "AGENTS.md",
-        block=_render_codex_block(url),
-        already_correct=_codex_declares(path, url),
-    )
+    else:
+        path = root / ".codex" / "config.toml"
+        plan = ClientPlan(
+            kind=kind,
+            config_path=path,
+            instructions_path=Path.cwd() / "AGENTS.md",
+            endpoint=url,
+            block=_render_codex_block(url),
+            already_correct=False,
+        )
+    return replace(plan, already_correct=_declares_endpoint(plan))
+
+
+def _declares_endpoint(plan: ClientPlan) -> bool:
+    """Read the vendor file now and report whether it already names this endpoint.
+
+    Called again by `connect`, never inherited from the plan. A plan describes
+    the file at the moment it was made, and acting on that description reported
+    "already correct" over an endpoint somebody had since changed, or over a file
+    that had since stopped parsing -- a no-op announced as a success, which is
+    the one outcome this command must never produce.
+    """
+    if plan.kind is ClientKind.CODEX:
+        return _codex_declares(plan.config_path, plan.endpoint)
+    expected: object = json.loads(plan.block)["mcpServers"][SERVER_KEY]
+    return _json_entry(plan.config_path, ("mcpServers", SERVER_KEY)) == expected
 
 
 def connect(plan: ClientPlan, *, force: bool) -> bool:
     """Write the endpoint into the vendor configuration, and report whether it changed."""
-    if plan.already_correct:
+    if _declares_endpoint(plan):
         return False
     if plan.kind is ClientKind.CODEX:
         _write_codex(plan, force=force)
