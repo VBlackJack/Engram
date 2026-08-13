@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import tempfile
 import tomllib
 from collections.abc import Mapping
@@ -309,20 +310,57 @@ def _replace_atomically(path: Path, data: bytes) -> None:
     the undo went through a text write that rewrote every line ending on Windows:
     a refusal that announced the file was unchanged had turned it from LF to
     CRLF. Bytes are read and written as bytes here for that reason.
+
+    A symlink names a file rather than being one. Renaming onto the link would
+    replace the link itself with a regular file, detaching a configuration a
+    dotfiles repository owns from the source it is kept in, while reporting
+    success. The target is resolved and written instead, so the link survives
+    and the canonical file receives the change.
     """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".part")
+    destination = path.resolve() if path.is_symlink() else path
+    mode = _destination_mode(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, name = tempfile.mkstemp(
+        dir=destination.parent,
+        prefix=f".{destination.name}.",
+        suffix=".part",
+    )
     temporary = Path(name)
     try:
         with os.fdopen(descriptor, "wb") as stream:
             stream.write(data)
             stream.flush()
             os.fsync(stream.fileno())
-        _require_written(temporary, path, data)
-        temporary.replace(path)
+        _require_written(temporary, destination, data)
+        if mode is not None:
+            temporary.chmod(mode)
+        temporary.replace(destination)
     except BaseException:
         temporary.unlink(missing_ok=True)
         raise
+
+
+def _destination_mode(path: Path) -> int | None:
+    """Return the permission bits the replacement has to carry, or None off POSIX.
+
+    A temporary file is created private, which is right while it is a temporary
+    file and wrong the moment it becomes the destination: renaming it over a
+    configuration that was readable by the group left that configuration at 0600,
+    so a file a dotfiles repository or a shared machine relied on stopped being
+    readable, silently. An existing file keeps the bits it had; a new one gets
+    what any other tool would have created under this umask, rather than the
+    stricter mode that is an artefact of how it was written.
+
+    Windows has no POSIX mode -- chmod there only toggles a read-only flag -- so
+    nothing is imposed on it.
+    """
+    if os.name == "nt":
+        return None
+    if path.exists():
+        return stat.S_IMODE(path.stat().st_mode)
+    umask = os.umask(0)
+    os.umask(umask)
+    return 0o666 & ~umask
 
 
 def default_home() -> Path:
