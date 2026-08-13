@@ -82,6 +82,9 @@ LOCK_POLL_INTERVAL_SECONDS = 0.25
 # holds the database. Asking a daemon to stop then costs exactly the right to
 # write beside its database, which is already the right to corrupt it.
 STOP_REQUEST_SUFFIX = ".stop"
+# A refusal has to stay readable on a terminal. The complete list goes to the
+# log, where it can be as long as the machine's task inventory requires.
+REPORTED_CONFLICT_LIMIT = 5
 GRACEFUL_STOP_TIMEOUT_SECONDS = 10.0
 TASK_END_TIMEOUT_SECONDS = 10.0
 FORCED_STOP_TIMEOUT_SECONDS = 5.0
@@ -313,19 +316,32 @@ def database_ownership(config: AppConfig) -> DatabaseOwnership:
     return DatabaseOwnership(locked=False, role=None, pid=None)
 
 
-def canonical_path(value: str) -> Path | None:
+def canonical_path(value: str, *, base: Path | None = None) -> Path | None:
     """Return one comparable form of a path the scheduler stored as free text.
 
     Windows reaches the same file through different spellings: a different case,
-    a home shortcut, a junction, an 8.3 short name. Resolution collapses all of
-    them for a path that exists, which is the only case that matters here: a
-    task pointing at a file that is not there cannot be holding its lock.
+    a home shortcut, a junction, an 8.3 short name, an environment variable left
+    unexpanded. Resolution collapses all of them for a path that exists, which is
+    the only case that matters here: a task pointing at a file that is not there
+    cannot be holding its lock.
+
+    A token the scheduler stored relative belongs to the working directory of its
+    own task, never to wherever Engram happens to be invoked from. Resolving it
+    against the current directory places unrelated tasks inside the configuration
+    directory and reports them as conflicts, which is how every maintenance task
+    on the machine came to look like a competing Engram. Such a token is refused
+    unless the caller supplies the base it is relative to.
     """
-    cleaned = value.strip().strip('"').strip()
+    cleaned = os.path.expandvars(value.strip().strip('"').strip())
     if not cleaned:
         return None
     try:
-        return Path(cleaned).expanduser().resolve()
+        candidate = Path(cleaned).expanduser()
+        if not candidate.is_absolute():
+            if base is None or not base.is_absolute():
+                return None
+            candidate = base / candidate
+        return candidate.resolve()
     except (OSError, ValueError, RuntimeError):
         return None
 
@@ -442,7 +458,7 @@ def _action_database(action: ScheduledAction) -> Path | None:
     tokens = action.tokens()
     if not _starts_this_package(tokens):
         return None
-    configured = _configured_path(tokens) or _default_config_path(action)
+    configured = _configured_path(tokens, _action_directory(action)) or _default_config_path(action)
     if configured is None or not configured.is_file():
         return None
     try:
@@ -463,19 +479,24 @@ def _starts_this_package(tokens: tuple[str, ...]) -> bool:
     )
 
 
-def _configured_path(tokens: tuple[str, ...]) -> Path | None:
+def _action_directory(action: ScheduledAction) -> Path | None:
+    """Return the directory this task starts in, when the scheduler records one."""
+    return canonical_path(action.working_directory)
+
+
+def _configured_path(tokens: tuple[str, ...], base: Path | None) -> Path | None:
     """Return the configuration named on the command line, when one is."""
     for index, token in enumerate(tokens):
         if token == CONFIG_OPTION and index + 1 < len(tokens):
-            return canonical_path(tokens[index + 1])
+            return canonical_path(tokens[index + 1], base=base)
         if token.startswith(f"{CONFIG_OPTION}="):
-            return canonical_path(token.split("=", 1)[1])
+            return canonical_path(token.split("=", 1)[1], base=base)
     return None
 
 
 def _default_config_path(action: ScheduledAction) -> Path | None:
     """Return the configuration a command with no explicit path would discover."""
-    directory = canonical_path(action.working_directory)
+    directory = _action_directory(action)
     if directory is None:
         return None
     return directory / DEFAULT_CONFIG_PATH.name
@@ -483,8 +504,9 @@ def _default_config_path(action: ScheduledAction) -> Path | None:
 
 def _action_reaches_into(action: ScheduledAction, directory: Path) -> bool:
     """Return whether this task names any file inside the configuration's directory."""
+    base = _action_directory(action)
     for token in action.tokens():
-        candidate = canonical_path(token)
+        candidate = canonical_path(token, base=base)
         if candidate is None:
             continue
         if same_path(candidate, directory) or any(
@@ -519,9 +541,17 @@ def resolve_conflicts(
             ", ".join(conflict.task_name for conflict in conflicts),
         )
         return ()
+    logger.warning(
+        "Refusing to install over %d conflicting task(s): %s",
+        len(conflicts),
+        "; ".join(f"'{conflict.task_name}' {conflict.reason}" for conflict in conflicts),
+    )
+    named = conflicts[:REPORTED_CONFLICT_LIMIT]
+    remainder = len(conflicts) - len(named)
     raise AutostartConflictError(
         "Another registered task would open this database: "
-        + "; ".join(f"'{conflict.task_name}' {conflict.reason}" for conflict in conflicts)
+        + "; ".join(f"'{conflict.task_name}' {conflict.reason}" for conflict in named)
+        + (f"; and {remainder} more, named in the log" if remainder else "")
         + ". Rerun with --replace to disable it, or with --force to install anyway."
     )
 

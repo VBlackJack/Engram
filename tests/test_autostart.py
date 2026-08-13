@@ -797,6 +797,68 @@ def test_canonical_path_collapses_the_spellings_windows_treats_as_one(tmp_path: 
     assert canonical_path("   ") is None
 
 
+def test_canonical_path_refuses_a_relative_token_rather_than_inventing_a_location(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A relative token belongs to its own task, never to the directory Engram runs in."""
+    monkeypatch.chdir(tmp_path)
+
+    assert canonical_path("BthUdTask.exe") is None
+    assert canonical_path("subdirectory\\vendor.exe") is None
+    assert canonical_path("BthUdTask.exe", base=Path("also-relative")) is None
+    assert canonical_path("vendor.exe", base=tmp_path) == (tmp_path / "vendor.exe").resolve()
+
+
+def test_canonical_path_expands_a_variable_the_scheduler_stored_unexpanded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unexpanded variable names a real location, not one under the current directory."""
+    monkeypatch.chdir(tmp_path)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.setenv("ENGRAM_TEST_ROOT", str(elsewhere))
+
+    resolved = canonical_path("$ENGRAM_TEST_ROOT/vendor.exe")
+
+    assert resolved == (elsewhere / "vendor.exe").resolve()
+
+
+def test_conflicting_tasks_ignores_maintenance_tasks_named_by_a_relative_command(
+    windows_runtime: Path,
+    config_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unrelated tasks must not become conflicts because Engram runs from that directory.
+
+    The documented installation makes the configuration directory the working
+    directory, so resolving a scheduler token against the current directory put
+    every maintenance task on the machine inside it.
+    """
+    monkeypatch.chdir(config_file.parent)
+    monkeypatch.setattr(
+        autostart_module,
+        "_run_scheduler",
+        RecordingScheduler(
+            present=False,
+            dump=task_dump(
+                scheduled_task("Vendor\\Bluetooth", command="BthUdTask.exe"),
+                scheduled_task("Vendor\\Updater", command="%windir%\\system32\\rundll32.exe"),
+                scheduled_task("Vendor\\Relative", command="maintenance.exe", arguments="/quiet"),
+            ),
+        ),
+    )
+    del windows_runtime
+
+    conflicts = conflicting_tasks(
+        build_plan(config_file),
+        database=(config_file.parent / "engram.db").resolve(),
+    )
+
+    assert conflicts == ()
+
+
 def test_conflicting_tasks_finds_a_task_that_opens_the_same_database(
     windows_runtime: Path,
     config_file: Path,
