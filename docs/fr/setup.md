@@ -251,6 +251,17 @@ Elle fusionne, elle n'écrase pas : les autres serveurs MCP, les clés sans rapp
 commentaires TOML de ces fichiers survivent. Rejouée alors que l'entrée est déjà correcte, elle
 n'écrit rien et le dit.
 
+> **L'écriture n'est délibérément pas atomique.** Engram écrit *à travers* votre fichier existant
+> au lieu de le remplacer : c'est ce qui préserve ses permissions, son propriétaire, sa liste de
+> contrôle d'accès, ses attributs étendus, ses flux alternatifs NTFS et tous les liens durs qui
+> pointent vers lui — un remplacement perdrait tout cela en silence. Le prix est qu'une coupure de
+> courant, ou un processus tué pendant l'écriture, peut laisser le fichier partiellement écrit. La
+> fenêtre est celle d'une petite écriture sur un fichier local, et l'exécution suivante refuse un
+> fichier qu'elle ne sait pas analyser au lieu de le compléter.
+>
+> Si vous ne pouvez pas accepter ce risque, utilisez `--print` et collez le bloc vous-même : rien
+> n'est écrit. Copiez d'abord le fichier s'il est précieux et hors gestion de versions.
+
 **Résultat attendu :** le fichier existe et contient votre endpoint. Redémarrez le client, puis
 passez à la [vérification](#4-verification-fonctionnelle).
 

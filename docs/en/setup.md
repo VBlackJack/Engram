@@ -240,6 +240,16 @@ stays correct without anyone noticing the difference:
 It merges, it does not clobber: other MCP servers, unrelated keys, and TOML comments in those files
 survive. Re-running it when the entry is already correct writes nothing and says so.
 
+> **The write is not atomic, deliberately.** Engram writes *through* your existing file rather than
+> replacing it, which is what keeps its permissions, its owner, its access control list, its
+> extended attributes, its NTFS alternate data streams and every hard link pointing at it — a
+> replacement would silently drop all of those. The price is that a machine that loses power, or a
+> process killed, during the write can leave the file partly written. The window is one small write
+> to a local file, and the next run refuses a file it cannot parse rather than appending to it.
+>
+> If you cannot accept even that, use `--print` and paste the block yourself: it writes nothing at
+> all. Copy the file first if it is precious and not under version control.
+
 **Expected result:** the file exists and contains your endpoint. Restart the client, then go to
 [verification](#4-functional-verification).
 
