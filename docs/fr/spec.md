@@ -1,150 +1,158 @@
-# Contrat de donnees
+# Contrat de données
 
-[Francais](spec.md) | [English](../en/spec.md)
+[Français](spec.md) | [English](../en/spec.md)
 
-> **Document de reference :** utile pour implementer ou auditer un client. Pour l'usage courant,
+> **Document de référence :** utile pour implémenter ou auditer un client. Pour l'usage courant,
 > lire le [guide utilisateur](user-guide.md).
 
-Ce document decrit le contrat persistant d'Engram. Les champs de confiance et de provenance sont
-des decisions du serveur, pas des affirmations libres du client.
+Ce document décrit le contrat persistant d'Engram. Les champs de confiance et de provenance sont
+des décisions du serveur, pas des affirmations libres du client.
 
 ## Kinds
 
-| Kind | Usage | TTL par defaut |
+| Kind | Usage | TTL par défaut |
 | --- | --- | --- |
-| `preference` | Preference durable explicite | Sans expiration |
-| `decision` | Decision prise et raison utile | Sans expiration |
-| `project_state` | Etat courant et prochaine action | 30 jours |
-| `fact` | Fait stable verifie | Sans expiration |
-| `episode` | Evenement de session utile a court terme | 7 jours |
+| `preference` | Préférence durable explicite | Sans expiration |
+| `decision` | Décision prise et raison utile | Sans expiration |
+| `project_state` | État courant et prochaine action | 30 jours |
+| `fact` | Fait stable vérifié | Sans expiration |
+| `episode` | Événement de session utile à court terme | 7 jours |
 
-Les TTL sont configurables dans `[ttl_days]`. La valeur `0` desactive l'expiration. Recall exclut
-immediatement les entrees a ou apres `expires_at`, puis le daemon passe periodiquement leur status
-a `expired`. La validite metier est inclusive : une entree ne peut etre rappelee ou consolidee que
+Les TTL sont configurables dans `[ttl_days]`. La valeur `0` désactive l'expiration. Recall exclut
+immédiatement les entrées à ou après `expires_at`, puis le démon passe périodiquement leur status
+à `expired`. La validité métier est inclusive : une entrée ne peut être rappelée ou consolidée que
 si la date UTC du store respecte `valid_from <= aujourd'hui <= valid_until` ; une borne
 absente reste ouverte.
 
-## Schema d'une entree
+## Schéma d'une entrée
 
-| Champ | Type | Regle |
+| Champ | Type | Règle |
 | --- | --- | --- |
 | `id` | string | ULID serveur canonique |
 | `kind` | enum | Un des cinq kinds |
-| `scope` | string | Espace logique normalise, `user` par defaut |
-| `statement` | string | Contenu borne par `max_statement_chars` |
-| `subject_keys` | liste de strings | Cles de recherche/sujet bornees et normalisees |
+| `scope` | string | Espace logique normalisé, `user` par défaut |
+| `statement` | string | Contenu borné par `max_statement_chars` |
+| `subject_keys` | liste de strings | Clés de recherche/sujet bornées et normalisées |
 | `status` | enum | `active`, `superseded`, `quarantined`, `expired` |
 | `promotion_state` | enum | `candidate`, `approved`, `rejected`, `promoted` |
 | `source_type` | enum | `human`, `tool_verified`, `model_inferred`, `session_summary` |
-| `writer_model` | string ou null | Identite MCP du client ecrivain |
+| `writer_model` | string ou null | Identité MCP du client écrivain |
 | `confidence` | enum | `high`, `medium`, `low` |
-| `observed_at` | datetime ou null | Moment observe fourni si connu |
+| `observed_at` | datetime ou null | Moment observé fourni si connu |
 | `recorded_at` | datetime | Horodatage serveur UTC |
-| `valid_from` | date ou null | Debut de validite metier |
-| `valid_until` | date ou null | Fin de validite metier |
-| `expires_at` | datetime ou null | Expiration calculee par kind |
-| `canonical_key` | string | Identite SHA-256 du kind, scope et statement normalises |
-| `idempotency_key` | string | Empreinte SHA-256 de la cle canonique et de l'ULID |
-| `claim_key` | string ou null | Famille semantique normalisee des affirmations fiables |
-| `supersedes` | liste d'identifiants | Versions remplacees |
-| `evidence` | liste `{type, ref}` | References opaques, jamais le payload source |
-| `stale` | booleen | Promotion Datacron dont la fraicheur a diverge |
+| `valid_from` | date ou null | Début de validité métier |
+| `valid_until` | date ou null | Fin de validité métier |
+| `expires_at` | datetime ou null | Expiration calculée par kind |
+| `canonical_key` | string | Identité SHA-256 du kind, scope et statement normalisés |
+| `idempotency_key` | string | Empreinte SHA-256 de la clé canonique et de l'ULID |
+| `claim_key` | string ou null | Famille sémantique normalisée des affirmations fiables |
+| `supersedes` | liste d'identifiants | Versions remplacées |
+| `evidence` | liste `{type, ref}` | Références opaques, jamais le payload source |
+| `stale` | booléen | Promotion Datacron dont la fraîcheur a divergé |
 | `datacron_ref` | string ou null | Chemin et section de la cible promue |
-| `datacron_hash` | string ou null | Hash relu apres ecriture |
-| `synced_at` | datetime ou null | Derniere synchronisation confirmee |
+| `datacron_hash` | string ou null | Hash relu après écriture |
+| `synced_at` | datetime ou null | Dernière synchronisation confirmée |
+
+Le champ `type` d'une evidence est fermé : seuls `tool_result`, `datacron_note`, `human_message` et
+`review` sont acceptés.
 
 ## Provenance et confiance
 
-Pour un contenu nouveau ou renouvele, `remember` cree une entree `model_inferred`, `quarantined`,
-`candidate`. Un retry exact du meme writer retourne cette generation ; des metadonnees
-materiellement differentes de ce writer sont conservees comme observation corroborante. Un contenu
-canonique identique deja actif et fiable est retourne sans creer de candidat. L'outcome explicite
-est `created`, `retry`, `corroborated`, `existing_trusted` ou `renewed`. L'identite du writer vient
-de l'initialisation MCP et non d'un argument. Une confiance `high` demandee a ce niveau est stockee
-`medium` et l'evenement de plafonnement est audite.
+Pour un contenu nouveau ou renouvelé, `remember` crée une entrée `model_inferred`, `quarantined`,
+`candidate`. Un retry exact du même writer retourne cette génération ; des métadonnées
+matériellement différentes de ce writer sont conservées comme observation corroborante. Un contenu
+canonique identique déjà actif et fiable est retourné sans créer de candidat. L'outcome explicite
+est `created`, `retry`, `corroborated`, `existing_trusted` ou `renewed`. L'identité du writer vient
+de l'initialisation MCP et non d'un argument. Une confiance `high` demandée à ce niveau est stockée
+`medium` et l'événement de plafonnement est audité.
 
-Chaque generation candidate possede au moins une ligne dans `entry_observations`. Les observations
-supplementaires conservent writer, confiance, dates, subject keys et preuves sans fusionner
-silencieusement des writers differents dans une meme affirmation de provenance.
+Chaque génération candidate possède au moins une ligne dans `entry_observations`. Les observations
+supplémentaires conservent writer, confiance, dates, subject keys et preuves sans fusionner
+silencieusement des writers différents dans une même affirmation de provenance.
 
-Seul le chemin CLI local atteste accepte `human` ou `tool_verified`. Une entree ne devient eligible
-a la consolidation que si elle est `active`, `approved`, non stale, dans sa fenetre de validite
-metier et attestee par une de ces deux provenances. Apply controle la fenetre avant une ecriture
-Datacron, puis le store la controle encore dans la transaction de promotion : une entree devenue
-invalide ne peut pas etre marquee `promoted`.
+Seul le chemin CLI local attesté accepte `human` ou `tool_verified`. Une entrée ne devient éligible
+à la consolidation que si elle est `active`, `approved`, non stale, dans sa fenêtre de validité
+métier et attestée par une de ces deux provenances. Apply contrôle la fenêtre avant une écriture
+Datacron, puis le store la contrôle encore dans la transaction de promotion : une entrée devenue
+invalide ne peut pas être marquée `promoted`.
 
 ## Cycle de vie
 
-1. Un appel `remember` cree, renouvelle, retrouve ou corrobore un candidat `quarantined`, ou
+1. Un appel `remember` crée, renouvelle, retrouve ou corrobore un candidat `quarantined`, ou
    retourne un contenu fiable actif canoniquement identique.
-2. Une attestation explicite produit une entree `active` et `approved`. Le contenu canonique
+2. Une attestation explicite produit une entrée `active` et `approved`. Le contenu canonique
    identique d'un candidat est promu sur place et conserve son identifiant.
 3. Une nouvelle version peut rendre les anciennes `superseded` sans effacer l'historique.
-4. Le TTL rend une entree `expired`; la purge physique est une operation distincte et auditee.
-5. Une consolidation revue passe l'etat a `promoted` seulement apres creation exactement relue ou
-   liaison `redundant` exactement reverifiee.
+4. Le TTL rend une entrée `expired` ; la purge physique est une opération distincte et auditée.
+5. Une consolidation revue passe l'état à `promoted` seulement après création exactement relue ou
+   liaison `redundant` exactement revérifiée.
 
-Les conflits fiables actifs sont regroupes uniquement par le tuple exact
-`(kind, scope, claim_key)`. Toutes les versions de cette famille sont retournees symetriquement
-dans `conflicts` ; aucune n'est placee arbitrairement dans `current`. Les `subject_keys` ameliorent
-la recherche par sujet, mais ne definissent jamais l'identite semantique d'un conflit. Les anciennes
-entrees fiables sans `claim_key` restent lisibles dans l'inventaire explicite des non classees,
-mais sont masquees de `current` jusqu'a leur classification par un operateur.
+Les conflits fiables actifs sont regroupés uniquement par le tuple exact
+`(kind, scope, claim_key)`. Toutes les versions de cette famille sont retournées symétriquement
+dans `conflicts` ; aucune n'est placée arbitrairement dans `current`. Les `subject_keys` améliorent
+la recherche par sujet, mais ne définissent jamais l'identité sémantique d'un conflit. Les anciennes
+entrées fiables sans `claim_key` restent lisibles dans l'inventaire explicite des non classées,
+mais sont masquées de `current` jusqu'à leur classification par un opérateur.
 
-## Propriete du processus
+## Propriété du processus
 
-Le daemon et chaque commande capable de modifier la base configuree prennent le meme verrou OS
-exclusif avant d'ouvrir le store. Une contention echoue immediatement avec le diagnostic de l'owner.
-Un fichier de coordination non verrouille ne constitue pas une propriete : des metadonnees de PID
-perimees ne peuvent donc pas bloquer la reprise. Le listing par statut utilise une base existante et
-migree en mode SQLite read-only ; il reste disponible pendant le fonctionnement du daemon.
+Le démon et chaque commande capable de modifier la base configurée prennent le même verrou OS
+exclusif avant d'ouvrir le store. Une contention échoue immédiatement avec le diagnostic de l'owner.
+Un fichier de coordination non verrouillé ne constitue pas une propriété : des métadonnées de PID
+périmées ne peuvent donc pas bloquer la reprise. Le listing par statut utilise une base existante et
+migrée en mode SQLite read-only ; il reste disponible pendant le fonctionnement du démon.
 
-Le contrat d'erreur CLI reserve le code `2` a l'usage/configuration, `3` aux ressources locales
-indisponibles, `4` aux dependances externes indisponibles (transport Datacron ou endpoint
-d'embeddings), `5` a la contention transitoire du store, `6` a un rapport apply contenant des
-propositions failed ou stale et `130` a une interruption operateur propagee a la CLI. Les erreurs
+L'arrêt propre du démon passe par la sentinelle `<base>.stop` déposée à côté de la base, que
+`engram stop` écrit et dont il attend l'effet en surveillant le verrou de propriété. Le démon efface
+la demande qu'il trouve après avoir pris ce verrou, de sorte qu'une sentinelle oubliée ne bloque
+jamais un démarrage ultérieur.
+
+Le contrat d'erreur CLI réserve le code `2` à l'usage/configuration, `3` aux ressources locales
+indisponibles, `4` aux dépendances externes indisponibles (transport Datacron ou endpoint
+d'embeddings), `5` à la contention transitoire du store, `6` à un rapport apply contenant des
+propositions failed ou stale et `130` à une interruption opérateur propagée à la CLI. Les erreurs
 connues omettent les tracebacks, sauf si le flag global `--debug` ou `ENGRAM_DEBUG=1` est actif. La
-disponibilite du port est verifiee avant l'ouverture de SQLite ou du verrou de processus.
+disponibilité du port est vérifiée avant l'ouverture de SQLite ou du verrou de processus.
 
 ## Idempotence
 
-`canonical_key` identifie le contenu normalise exact. `idempotency_key` identifie une generation
-stable en hachant cette cle canonique avec son ULID ; elle survit donc a l'attestation sur place.
-La detection d'un retry utilise l'identite canonique, le writer et l'observation conservee : un
+`canonical_key` identifie le contenu normalisé exact. `idempotency_key` identifie une génération
+stable en hachant cette clé canonique avec son ULID ; elle survit donc à l'attestation sur place.
+La détection d'un retry utilise l'identité canonique, le writer et l'observation conservée : un
 retry exact retourne `retry` et audite `idempotent_noop`, tandis qu'une nouvelle observation
 retourne `corroborated`.
 
-## Fraicheur Datacron
+## Fraîcheur Datacron
 
-Apres promotion, Engram conserve `datacron_ref`, `datacron_hash` et `synced_at`. Le controle de
-fraicheur relit la note. Si son hash differe, l'entree devient `stale` et est masquee de `current`
-jusqu'a revue. L'historique n'est pas supprime et Datacron n'est pas reecrit par ce controle.
+Après promotion, Engram conserve `datacron_ref`, `datacron_hash` et `synced_at`. Le contrôle de
+fraîcheur relit la note. Si son hash diffère, l'entrée devient `stale` et est masquée de `current`
+jusqu'à revue. L'historique n'est pas supprimé et Datacron n'est pas réécrit par ce contrôle.
 
-La recherche Datacron ne fournit pas de subject keys durables. Le gateway conserve donc ces cles
-vides au lieu de recopier celles du candidat. La recherche combine la requete AND complete et des
-variantes par terme. Le travail reste borne a trois requetes completes plus au plus huit variantes
+La recherche Datacron ne fournit pas de subject keys durables. Le gateway conserve donc ces clés
+vides au lieu de recopier celles du candidat. La recherche combine la requête AND complète et des
+variantes par terme. Le travail reste borné à trois requêtes complètes plus au plus huit variantes
 unitaires, et `neighbor_limit` reste compris entre 1 et 64. Tout hit sans chemin, illisible, vide ou
-sans selecteur de section unique fait echouer le plan ; il ne peut jamais provoquer une
-classification `new` suivie d'une creation.
+sans sélecteur de section unique fait échouer le plan ; il ne peut jamais provoquer une
+classification `new` suivie d'une création.
 `get_note(full)` valide le `rel_path`, retire uniquement l'enveloppe sandbox Datacron canonique et
-refuse tout contenu tronque. Le `content_hash` serveur, calcule sur le fichier, reste intact pour la
-fraicheur et la verification ; le contrat `freshness-contract-v1` est obligatoire.
-Une proposition `redundant` cible toujours le voisin dont le statement normalise correspond
-exactement au candidat. Une proposition `update` montre la cible classee et son diff dans le
-rapport, avec son niveau `H1` a `H6`, mais son action actuelle est `skip` : aucun patch de section
-n'est autorise sans ancrage d'identite durable independamment verifie.
+refuse tout contenu tronqué. Le `content_hash` serveur, calculé sur le fichier, reste intact pour la
+fraîcheur et la vérification ; le contrat `freshness-contract-v1` est obligatoire.
+Une proposition `redundant` cible toujours le voisin dont le statement normalisé correspond
+exactement au candidat. Une proposition `update` montre la cible classée et son diff dans le
+rapport, avec son niveau `H1` à `H6`, mais son action actuelle est `skip` : aucun patch de section
+n'est autorisé sans ancrage d'identité durable indépendamment vérifié.
 
-Le chemin d'une nouvelle note est deterministe, borne son slug ASCII a 64 caracteres et contient
+Le chemin d'une nouvelle note est déterministe, borne son slug ASCII à 64 caractères et contient
 toujours l'ID candidat. Avant chaque plan, Engram relit ce chemin canonique. Une note dont le
 contenu complet correspond exactement au
-rendu attendu devient `redundant`, y compris apres une reponse de creation perdue ; seules les fins
-de ligne et la presence du newline final sont normalisees. Toute autre note presente devient
-`update/skip`. Aucune variante de chemin ne peut creer un doublon.
+rendu attendu devient `redundant`, y compris après une réponse de création perdue ; seules les fins
+de ligne et la présence du newline final sont normalisées. Toute autre note présente devient
+`update/skip`. Aucune variante de chemin ne peut créer un doublon.
 La planification persiste un snapshot canonique et immuable des propositions sous un `plan_id`
-genere. L'artefact de revue ne
-peut modifier que la decision de chaque proposition. Apply refuse toute autre divergence ou
-decision encore `pending` sans consommer le plan. Une fois toutes les decisions approve/reject,
-apply consomme le plan avant les ecritures externes et interdit sa relecture. Une passe finale
-reconcilie le hash de note complete de chaque promotion sur un chemin potentiellement ecrit avant
-qu'elle puisse etre rappelee. Tout resultat apply `failed` ou `stale` produit le code de sortie 6
-apres ecriture du rapport.
+généré. L'artefact de revue ne
+peut modifier que la décision de chaque proposition. Apply refuse toute autre divergence ou
+décision encore `pending` sans consommer le plan. Une fois toutes les décisions approve/reject,
+apply consomme le plan avant les écritures externes et interdit sa relecture. Une passe finale
+réconcilie le hash de note complète de chaque promotion sur un chemin potentiellement écrit avant
+qu'elle puisse être rappelée. Tout résultat apply `failed` ou `stale` produit le code de sortie 6
+après écriture du rapport.

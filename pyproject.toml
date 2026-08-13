@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "engram-memory-broker"
-version = "2026.0730.02"
+version = "2026.813.1"
 description = "Local-first MCP memory broker with trust-aware recall and reviewed consolidation."
 readme = "README.en.md"
 requires-python = ">=3.13"
@@ -53,6 +53,12 @@ Changelog = "https://github.com/VBlackJack/Engram/blob/main/CHANGELOG.md"
 where = ["src", "."]
 include = ["engram", "engram.*", "evalsets"]
 namespaces = false
+
+# The starting configuration has to reach the wheel, not only the source
+# archive. Without this, an install that was not a checkout refused to start and
+# named a file the user could not obtain from anywhere.
+[tool.setuptools.package-data]
+"engram.resources" = ["*.toml", "*.txt"]
 
 [tool.ruff]
 target-version = "py313"

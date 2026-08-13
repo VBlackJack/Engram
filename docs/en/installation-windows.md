@@ -1,10 +1,14 @@
 # Windows and SQLite installation
 
-[Francais](../fr/installation-windows.md) | [English](installation-windows.md)
+[Français](../fr/installation-windows.md) | [English](installation-windows.md)
 
-> **Use this page only when** the SQLite check in the
-> [quick start](quick-start.md) reports a version below `3.51.3`.<br>
-> **Verified on:** 2026-08-01.
+> **Use this page only when** `engram doctor` reports a SQLite version below `3.51.3`, or when the
+> SQLite floor error names this page.<br>
+> **Verified on:** 2026-08-13.
+
+This page is Windows-specific. For a POSIX host, the interpreter advice below still applies, but
+the DLL replacement does not; see
+[Install as a service on macOS and Linux](installation-unix.md) for the rest of the setup.
 
 ## Why this is a hard requirement
 
@@ -36,17 +40,24 @@ version from the Python version, on any platform. Run the check.
 Every other path on this page repairs a runtime that would otherwise fail. Install the working one
 instead; it does not modify an existing runtime:
 
-```powershell
+```text
 uv python install 3.14.6
 uv sync --python 3.14.6
-uv run --python 3.14.6 python -c "import sys, sqlite3; print(sys.executable); print(sqlite3.sqlite_version)"
+uv run --python 3.14.6 engram doctor
 ```
 
-Installing `3.14.6` needs `uv` 0.12.1 or newer; earlier releases only know builds up to `3.14.3`.
+Installing `3.14.6` requires `uv` 0.12.1 or newer; earlier releases only know builds up to
+`3.14.3`.
 
-The command must display SQLite `3.51.3` or newer (the build tested for this release displays
-`3.53.1`). Use the same `--python 3.14.6` for `serve` and other commands. Contributors install
-`--extra dev` separately before running tests.
+The `sqlite` line must report `3.51.3` or newer (the build tested for this release reports
+`3.53.1`), and the `python` line names the interpreter it measured. Use the same `--python 3.14.6`
+for `serve` and other commands. Contributors install `--extra dev` separately before running tests.
+
+The equivalent one-liner, when you want the raw numbers without the rest of the diagnosis:
+
+```text
+uv run --python 3.14.6 python -c "import sys, sqlite3; print(sys.executable); print(sqlite3.sqlite_version)"
+```
 
 ### Ask for the patch, not the minor
 
@@ -55,9 +66,9 @@ build **its own release** knows about, so the build you get is decided by which 
 have rather than by what you asked for — and some of those builds, `3.14.4` among them, link a
 SQLite below the floor. Name `3.14.6`.
 
-If you deliberately use a different build, nothing here forbids it, but the third command above is
-the only evidence that it works. Run it. If it prints a version below `3.51.3`, that build cannot
-run Engram: install `3.14.6`, or repair the runtime you have with the DLL method below.
+If you deliberately use a different build, nothing here forbids it, but `engram doctor` is the only
+evidence that it works. Run it. If it reports a version below `3.51.3`, that build cannot run
+Engram: install `3.14.6`, or repair the runtime you have with the DLL method below.
 
 **`pip install` succeeding proves nothing here.** It succeeds on every distribution in the table
 above, including the four that cannot run Engram. The version check is the only signal.
@@ -73,7 +84,7 @@ are free to choose. Never replace a file while a Python process is running.
 
 1. Identify the interpreter and loaded version:
 
-   ```powershell
+   ```text
    python -c "import sys, sqlite3, _sqlite3; print(sys.executable); print(_sqlite3.__file__); print(sqlite3.sqlite_version)"
    ```
 
@@ -89,9 +100,11 @@ are free to choose. Never replace a file while a Python process is running.
    without administrator approval.
 6. Open a new terminal and verify:
 
-   ```powershell
+   ```text
    python -c "import sqlite3; print(sqlite3.sqlite_version); assert sqlite3.sqlite_version_info >= (3, 51, 3)"
    ```
+
+Or, equivalently, `engram doctor`, which also names the repair when the version is still too low.
 
 If Python no longer starts or still loads the old version, restore the backup and use the
 uv-managed runtime. Some builds link SQLite statically; a DLL cannot upgrade them, so the

@@ -157,6 +157,22 @@ class CapsuleBuilder:
                 "retry with include_conflicts=true"
             )
 
+        scope_used = _safe_scope_representation(scope)
+        notices = (
+            *retrieval.notices,
+            *((UNCLASSIFIED_CLAIM_OMITTED_NOTICE,) if unclassified_ids else ()),
+            *(
+                (CONFLICTS_HIDDEN_BY_REQUEST_NOTICE,)
+                if conflict_ids and not include_conflicts
+                else ()
+            ),
+        )
+        conflicts, unfittable = _conflicts_within_budget(
+            conflicts,
+            _empty_capsule(scope_used, reasons, notices),
+            token_budget,
+        )
+
         candidates: list[tuple[str, CapsuleItem | ConflictItem | PendingItem]] = []
         candidates.extend(("current", item) for item in current)
         candidates.extend(("next_action", item) for item in next_action)
@@ -164,47 +180,12 @@ class CapsuleBuilder:
         candidates.extend(("conflicts", item) for item in conflicts)
         candidates.extend(("own_pending", item) for item in own_pending)
 
-        capsule = _empty_capsule(
-            _safe_scope_representation(scope),
-            reasons,
-            (
-                *retrieval.notices,
-                *((UNCLASSIFIED_CLAIM_OMITTED_NOTICE,) if unclassified_ids else ()),
-                *(
-                    (CONFLICTS_HIDDEN_BY_REQUEST_NOTICE,)
-                    if conflict_ids and not include_conflicts
-                    else ()
-                ),
-            ),
-        )
+        capsule = _empty_capsule(scope_used, reasons, notices)
         for section, item in candidates:
             _append_item(capsule, section, item)
         _refresh_sources(capsule)
 
-        omitted = 0
-        if estimate_capsule_bytes(capsule) > token_budget:
-            _compact_notes(capsule)
-        while estimate_capsule_bytes(capsule) > token_budget:
-            removed = _remove_lowest_priority(capsule)
-            if removed == 0:
-                break
-            omitted += removed
-            _refresh_sources(capsule)
-            _set_budget_note(capsule, omitted)
-            _mark_incomplete(capsule, CAPSULE_BUDGET_OVERFLOW_NOTICE)
-
-        text = render_capsule_text(capsule)
-        serialized_bytes = estimate_capsule_bytes(capsule, text)
-        if serialized_bytes > token_budget:
-            _minimize_notes(capsule)
-            text = render_capsule_text(capsule)
-            serialized_bytes = estimate_capsule_bytes(capsule, text)
-        if serialized_bytes > token_budget:
-            raise ValueError(
-                "token_budget is too small for mandatory capsule metadata: "
-                f"requires {serialized_bytes} serialized bytes, received {token_budget}"
-            )
-        return capsule, text
+        return _fit_to_budget(capsule, token_budget, unfittable)
 
 
 def estimate_payload_bytes(payload: str) -> int:
@@ -288,6 +269,78 @@ def _find_conflicts(entries: Sequence[Entry]) -> tuple[list[ConflictItem], set[s
     ]
     conflict_ids = {entry.id for _, group in groups for entry in group}
     return conflict_items, conflict_ids
+
+
+def _fit_to_budget(
+    capsule: CapsuleResult,
+    token_budget: int,
+    omitted: int,
+) -> tuple[CapsuleResult, str]:
+    """Evict whole items by section priority until the serialized result fits.
+
+    The count carried in is what the caller already refused to include, so the
+    reported total covers everything the request lost rather than only what this
+    loop removed.
+    """
+    if omitted:
+        _set_budget_note(capsule, omitted)
+        _mark_incomplete(capsule, CAPSULE_BUDGET_OVERFLOW_NOTICE)
+    if estimate_capsule_bytes(capsule) > token_budget:
+        _compact_notes(capsule)
+    while estimate_capsule_bytes(capsule) > token_budget:
+        removed = _remove_lowest_priority(capsule)
+        if removed == 0:
+            break
+        omitted += removed
+        _refresh_sources(capsule)
+        _set_budget_note(capsule, omitted)
+        _mark_incomplete(capsule, CAPSULE_BUDGET_OVERFLOW_NOTICE)
+
+    text = render_capsule_text(capsule)
+    serialized_bytes = estimate_capsule_bytes(capsule, text)
+    if serialized_bytes > token_budget:
+        _minimize_notes(capsule)
+        text = render_capsule_text(capsule)
+        serialized_bytes = estimate_capsule_bytes(capsule, text)
+    if serialized_bytes > token_budget:
+        raise ValueError(
+            "token_budget is too small for mandatory capsule metadata: "
+            f"requires {serialized_bytes} serialized bytes, received {token_budget}"
+        )
+    return capsule, text
+
+
+def _conflicts_within_budget(
+    groups: Sequence[ConflictItem],
+    probe: CapsuleResult,
+    token_budget: int,
+) -> tuple[list[ConflictItem], int]:
+    """Keep the conflict groups the capsule can actually deliver, and count the rest.
+
+    A group is only ever removed whole, and eviction reaches it last, so a group
+    too large to fit on its own made the builder empty every other section to
+    make room and then remove the group as well. The caller paid for information
+    it never received: asking for conflicts returned strictly less than not
+    asking for them, which is the opposite of what the flag promises.
+
+    Deciding here, before anything is evicted, keeps the priority the sections
+    were ordered for -- a conflict that fits still outranks lower-priority
+    context -- while making sure nothing is sacrificed for a group that will not
+    survive. Groups are offered in retrieval rank order and measured
+    cumulatively, so a smaller later group can still be kept after a larger one
+    is refused.
+    """
+    kept: list[ConflictItem] = []
+    omitted = 0
+    for group in groups:
+        probe.conflicts.append(group)
+        _refresh_sources(probe)
+        if estimate_capsule_bytes(probe) > token_budget:
+            probe.conflicts.pop()
+            omitted += len(group.versions)
+        else:
+            kept.append(group)
+    return kept, omitted
 
 
 def _unique_entries(entries: Sequence[Entry]) -> tuple[Entry, ...]:

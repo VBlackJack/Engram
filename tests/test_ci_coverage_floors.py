@@ -96,11 +96,19 @@ def test_percentages_are_read_from_the_report_summary() -> None:
 
 
 def test_the_declared_set_is_not_the_set_that_already_passed() -> None:
-    """Guard the definition itself: comfort would have selected different files."""
+    """Guard the definition itself: comfort would have selected different files.
+
+    The set may only grow by argument. db, store and process_lock hold the memory;
+    capsule and retrieval decide whether it can be reached, and an entry nobody
+    can reach costs the reader what a lost one costs. Anything outside that
+    definition still has no floor, however well covered it happens to be.
+    """
     assert set(CRITICAL_MODULES) == {
         "src/engram/db.py",
         "src/engram/store.py",
         "src/engram/process_lock.py",
+        "src/engram/capsule.py",
+        "src/engram/retrieval.py",
     }
     for module in CRITICAL_MODULES:
         assert Path(module).is_file(), f"{module} is declared critical but does not exist"

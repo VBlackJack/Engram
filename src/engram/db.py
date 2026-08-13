@@ -56,6 +56,12 @@ from .normalization import (
 
 LOGGER = logging.getLogger(__name__)
 MINIMUM_SQLITE_VERSION = (3, 51, 3)
+# A refusal has to be actionable for someone who installed a wheel and has no
+# checkout, so it names a document that can be opened rather than a repository
+# path that only exists for contributors.
+WINDOWS_SQLITE_GUIDE_URL = (
+    "https://github.com/VBlackJack/Engram/blob/main/docs/en/installation-windows.md"
+)
 SQLITE_VERSION_COMPONENTS = 3
 LIFECYCLE_SCHEMA_VERSION = 5
 MINIMUM_PREFLIGHT_SCHEMA_VERSION = 3
@@ -178,6 +184,25 @@ def _run_v5_preflight(
 ) -> None:
     _preflight_lifecycle_v5(connection, limits=limits)
 
+
+_EXPIRY_IS_NOT_IDENTITY = """
+            CREATE TRIGGER entries_immutable_identity
+            BEFORE UPDATE OF
+                id, kind, scope, statement, recorded_at,
+                idempotency_key, canonical_key
+            ON entries
+            WHEN
+                NEW.id != OLD.id
+                OR NEW.kind != OLD.kind
+                OR NEW.scope != OLD.scope
+                OR NEW.statement != OLD.statement
+                OR NEW.recorded_at != OLD.recorded_at
+                OR NEW.idempotency_key != OLD.idempotency_key
+                OR NEW.canonical_key != OLD.canonical_key
+            BEGIN
+                SELECT RAISE(ABORT, 'entry identity is immutable');
+            END
+            """
 
 MIGRATIONS = (
     Migration(
@@ -752,6 +777,21 @@ MIGRATIONS = (
             """,
         ),
     ),
+    Migration(
+        version=6,
+        statements=(
+            # An entry's expiry is a lifecycle attribute, not part of its
+            # identity, and grouping it with id, statement and canonical_key made
+            # it unchangeable. Promoting a candidate in place therefore had to
+            # leave the model's short clock running, so a human attestation made
+            # near the candidate's expiry inherited what remained of it and then
+            # disappeared -- while the same attestation with no candidate present
+            # lived its full term. The trigger keeps every genuine identity
+            # column and releases this one.
+            "DROP TRIGGER IF EXISTS entries_immutable_identity",
+            _EXPIRY_IS_NOT_IDENTITY,
+        ),
+    ),
 )
 
 
@@ -915,7 +955,8 @@ def verify_sqlite_version(
             "SQLite "
             f"{minimum_text} or newer is required; found {actual_text}. "
             "Older runtimes are rejected because they do not contain the WAL-reset bug fix. "
-            "See docs/en/installation-windows.md for supported Windows installation steps."
+            "Run 'engram doctor' for the repair that applies to this machine, or see "
+            f"{WINDOWS_SQLITE_GUIDE_URL} for the Windows installation steps."
         )
 
 
@@ -1454,7 +1495,16 @@ def _precheck_entry_payload_lengths(
         raise DatabaseError(
             "Persisted entry payload exceeds a fixed preflight allocation bound or has "
             f"an invalid SQLite type at {location}, "
-            f"field {invalid['invalid_field']!s}"
+            f"field {invalid['invalid_field']!s}. "
+            # The bound is the smaller of the fixed ceiling and the configured
+            # limit, so lowering limits.max_statement_chars or
+            # limits.max_subject_keys below what is already stored refuses to open
+            # a database that was valid a moment earlier. Naming the keys turns an
+            # opaque identifier into something the operator can act on: restoring
+            # the previous value opens it again with every row intact.
+            "If limits.max_statement_chars or limits.max_subject_keys was lowered, "
+            "restore the previous value; the stored row is unchanged and 'engram doctor' "
+            "reports which configuration is in force"
         )
     if _schema_version(connection) >= LIFECYCLE_SCHEMA_VERSION:
         invalid_v5 = connection.execute(
@@ -2202,28 +2252,36 @@ def _expected_canonical_table_schemas() -> dict[str, str]:
 
 
 def _expected_v5_schema_definitions(names: tuple[str, ...]) -> dict[str, str]:
-    migration = next(
-        (candidate for candidate in MIGRATIONS if candidate.version == LIFECYCLE_SCHEMA_VERSION),
-        None,
-    )
-    if migration is None:  # pragma: no cover - package invariant
-        raise RuntimeError("Migration v5 is missing")
+    """Return each required object as the newest migration defines it.
+
+    The lifecycle objects arrived with v5, so this used to read that migration
+    alone. A later migration may correct one of them -- v6 rebuilds the identity
+    trigger -- and an upgraded database then carries the newer text while the
+    check still expected the older, which fails a database that is exactly right.
+    Scanning every migration in order and keeping the last definition of each
+    name describes the schema this build actually installs.
+    """
+    if not any(candidate.version == LIFECYCLE_SCHEMA_VERSION for candidate in MIGRATIONS):
+        raise RuntimeError("Migration v5 is missing")  # pragma: no cover - package invariant
     expected: dict[str, str] = {}
-    for statement in migration.statements:
-        normalized = _normalize_schema_sql(statement)
-        for name in names:
-            upper_name = name.upper()
-            prefixes = (
-                f"CREATE TRIGGER {upper_name} ",
-                f"CREATE INDEX {upper_name} ",
-                f"CREATE UNIQUE INDEX {upper_name} ",
-            )
-            if normalized.startswith(prefixes):
-                expected[name] = normalized
+    for migration in sorted(MIGRATIONS, key=lambda candidate: candidate.version):
+        if migration.version < LIFECYCLE_SCHEMA_VERSION:
+            continue
+        for statement in migration.statements:
+            normalized = _normalize_schema_sql(statement)
+            for name in names:
+                upper_name = name.upper()
+                prefixes = (
+                    f"CREATE TRIGGER {upper_name} ",
+                    f"CREATE INDEX {upper_name} ",
+                    f"CREATE UNIQUE INDEX {upper_name} ",
+                )
+                if normalized.startswith(prefixes):
+                    expected[name] = normalized
     missing = set(names) - set(expected)
     if missing:  # pragma: no cover - package invariant
         raise RuntimeError(
-            "Migration v5 lacks required schema definitions: " + ", ".join(sorted(missing))
+            "The migrations lack required schema definitions: " + ", ".join(sorted(missing))
         )
     return expected
 

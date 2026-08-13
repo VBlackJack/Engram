@@ -1,17 +1,17 @@
 # Guide utilisateur
 
-[Francais](user-guide.md) | [English](../en/user-guide.md)
+[Français](user-guide.md) | [English](../en/user-guide.md)
 
 > **Objectif :** utiliser Engram au quotidien sans administrer la base.<br>
-> **Temps :** moins d'une minute au debut et a la fin d'une tache.<br>
-> **Resultat :** la session retrouve le contexte utile et laisse une prochaine action claire.
+> **Temps :** moins d'une minute au début et à la fin d'une tâche.<br>
+> **Résultat :** la session retrouve le contexte utile et laisse une prochaine action claire.
 
-Pour l'installation, commencez par le [demarrage en 5 minutes](quick-start.md). Les operations
-avancees sont separees dans le [guide operateur](operator-guide.md).
+Pour l'installation, commencez par le [démarrage en 5 minutes](quick-start.md). Les opérations
+avancées sont séparées dans le [guide opérateur](operator-guide.md).
 
 ## La routine en trois moments
 
-### 1. Au debut : rappeler
+### 1. Au début : rappeler
 
 Demandez au client d'appeler `recall` avant le travail substantiel :
 
@@ -20,23 +20,23 @@ query = "Engram audit documentation Datacron Cortex"
 scope = "project/engram"
 ```
 
-Une bonne requete nomme :
+Une bonne requête nomme :
 
 - le projet ;
-- la tache actuelle ;
+- la tâche actuelle ;
 - deux ou trois sujets utiles.
 
 **Lisez d'abord :** `current`, `next_action` et `notes.recall_complete`.
 
-### 2. Pendant : travailler, puis memoriser seulement le durable
+### 2. Pendant : travailler, puis mémoriser seulement le durable
 
-Appelez `remember` apres une information explicite qui aidera une prochaine session :
+Appelez `remember` après une information explicite qui aidera une prochaine session :
 
-- une preference confirmee ;
-- une decision et sa raison utile ;
-- un fait verifie ;
+- une préférence confirmée ;
+- une décision et sa raison utile ;
+- un fait vérifié ;
 - une correction importante ;
-- un changement d'etat du projet.
+- un changement d'état du projet.
 
 Exemple :
 
@@ -47,12 +47,12 @@ scope = "project/engram"
 subject_keys = ["engram:documentation"]
 ```
 
-N'enregistrez pas les secrets, transcripts, hypotheses, raisonnements intermediaires, grandes
-sorties d'outils ou details ephemeres.
+N'enregistrez pas les secrets, transcripts, hypothèses, raisonnements intermédiaires, grandes
+sorties d'outils ou détails éphémères.
 
-### 3. A la fin : laisser le prochain pas
+### 3. À la fin : laisser le prochain pas
 
-Si l'etat a change, enregistrez un seul `project_state` concis :
+Si l'état a changé, enregistrez un seul `project_state` concis :
 
 ```text
 statement = "Le guide utilisateur est termine. Etat: liens a valider. Prochaine action: lancer les tests documentaires."
@@ -63,20 +63,20 @@ subject_keys = ["engram:documentation", "engram:release"]
 
 Il doit dire :
 
-1. ce qui est termine ;
-2. l'etat actuel ;
-3. le blocage confirme eventuel ;
-4. la prochaine action concrete.
+1. ce qui est terminé ;
+2. l'état actuel ;
+3. le blocage confirmé éventuel ;
+4. la prochaine action concrète.
 
 ## Choisir le type (`kind`)
 
 | Situation | Type |
 | --- | --- |
-| "Toujours utiliser des chemins absolus dans ce projet" | `preference` |
-| "SQLite a ete retenu pour ces raisons" | `decision` |
-| "La migration est finie ; prochaine action : deployer" | `project_state` |
-| "Le service ecoute sur le port 8377" | `fact` |
-| "Le test a echoue une fois apres un timeout" | `episode` |
+| « Toujours utiliser des chemins absolus dans ce projet » | `preference` |
+| « SQLite a été retenu pour ces raisons » | `decision` |
+| « La migration est finie ; prochaine action : déployer » | `project_state` |
+| « Le service écoute sur le port 8377 » | `fact` |
+| « Le test a échoué une fois après un timeout » | `episode` |
 
 Utilisez peu de `subject_keys`, stables et descriptives, par exemple `engram:storage` ou
 `project:release`.
@@ -85,54 +85,59 @@ Utilisez peu de `subject_keys`, stables et descriptives, par exemple `engram:sto
 
 Lisez dans cet ordre :
 
-| Zone | Question a se poser |
+| Zone | Question à se poser |
 | --- | --- |
 | `current` | Quelle information fiable puis-je utiliser maintenant ? |
-| `next_action` | Quel etat de projet ou prochain pas est encore utile ? |
-| `conflicts` | Plusieurs versions fiables sont-elles non resolues ? |
-| `own_pending` | Qu'ai-je propose depuis ce meme client sans validation ? |
-| `relevant` | Quel episode recent peut aider ? |
-| `notes` | Le rappel est-il complet et pourquoi ces elements sont-ils la ? |
+| `next_action` | Quel état de projet ou prochain pas est encore utile ? |
+| `conflicts` | Plusieurs versions fiables sont-elles non résolues ? |
+| `own_pending` | Qu'ai-je proposé depuis ce même client sans validation ? |
+| `relevant` | Quel épisode récent peut aider ? |
+| `notes` | Le rappel est-il complet et pourquoi ces éléments sont-ils là ? |
 | `sources` | Quels identifiants soutiennent la capsule ? |
 
-### Deux regles de securite
+Chaque `kind` a sa section : `current` regroupe les `preference`, `decision` et `fact` ; un
+`project_state` apparaît dans `next_action` et un `episode` dans `relevant`. Une information
+attendue qui manque dans `current` est peut-être simplement dans la section de son type.
 
-1. `own_pending` signifie **candidat non confirme**. Ne l'utilisez jamais pour justifier une action
-   irreversible.
+### Deux règles de sécurité
+
+1. `own_pending` signifie **candidat non confirmé**. Ne l'utilisez jamais pour justifier une action
+   irréversible.
 2. Si `notes.recall_complete` vaut `false`, l'absence d'un souvenir ne prouve rien. Lisez
-   `notes.warnings`, puis resserrez la requete ou demandez une action operateur.
+   `notes.warnings`, puis resserrez la requête ou demandez une action opérateur.
 
-Si `conflicts` contient plusieurs versions, presentez-les de maniere symetrique. Ne choisissez pas
+Si `conflicts` contient plusieurs versions, présentez-les de manière symétrique. Ne choisissez pas
 silencieusement celle qui semble la plus pratique.
 
-## Comprendre le resultat de `remember`
+## Comprendre le résultat de `remember`
 
 | Outcome | Sens |
 | --- | --- |
 | `created` | Nouveau candidat en quarantaine |
-| `retry` | Meme observation renvoyee sans nouvelle generation |
-| `corroborated` | Nouvelle observation d'un contenu candidat deja present |
-| `existing_trusted` | Un contenu canonique identique est deja fiable |
-| `renewed` | Nouvelle generation d'un souvenir expire, encore en quarantaine |
+| `retry` | Même observation renvoyée sans nouvelle génération |
+| `corroborated` | Nouvelle observation d'un contenu candidat déjà présent |
+| `existing_trusted` | Un contenu canonique identique est déjà fiable |
+| `renewed` | Nouvelle génération d'un souvenir expiré, encore en quarantaine |
 
-Un contenu nouveau ou renouvele n'entre pas automatiquement dans `current`.
+Un contenu nouveau ou renouvelé n'entre pas automatiquement dans `current`.
 
-## Quand demander l'aide d'un operateur
+## Quand demander l'aide d'un opérateur
 
-Passez au [guide operateur](operator-guide.md) pour :
+Passez au [guide opérateur](operator-guide.md) pour :
 
-- attester ou corriger une memoire ;
+- attester ou corriger une mémoire ;
 - migrer une base ;
 - reconstruire FTS ou les vecteurs ;
 - consolider vers Datacron ;
 - diagnostiquer un code de sortie CLI.
 
-Pour une erreur visible dans le client, commencez par la [FAQ](faq.md).
+Pour une erreur visible dans le client, lancez `engram doctor`, puis commencez par la
+[FAQ](faq.md).
 
-## Quel outil apres Engram ?
+## Quel outil après Engram ?
 
-- Besoin d'une note canonique ou d'une ecriture durable : **Datacron**.
-- Besoin de rechercher une idee dans beaucoup de documents : **Cortex**.
+- Besoin d'une note canonique ou d'une écriture durable : **Datacron**.
+- Besoin de rechercher une idée dans beaucoup de documents : **Cortex**.
 - Besoin de retrouver le contexte de la session : **Engram**.
 
 Le flux complet est dans [Engram, Datacron et Cortex](datacron-cortex.md).

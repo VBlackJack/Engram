@@ -15,6 +15,7 @@ import socket
 import sqlite3
 import sys
 import threading
+import time
 from collections.abc import Mapping
 from datetime import date, datetime
 from pathlib import Path
@@ -33,9 +34,19 @@ from .autostart import (
     install,
     is_installed,
     registered_command,
+    request_stop,
     resolve_conflicts,
     stop_requested,
     uninstall,
+)
+from .clients import (
+    ClientConfigError,
+    ClientKind,
+    connect,
+    default_home,
+    endpoint_url,
+    install_protocol,
+    plan_client,
 )
 from .config import (
     DEFAULT_CONFIG_PATH,
@@ -61,6 +72,7 @@ from .db import (
     latest_schema_version,
     preflight_database,
 )
+from .doctor import Outcome, diagnose, worst_outcome
 from .eval.gate import EvaluationGateError
 from .eval.models import EvalMode
 from .eval.runner import run_evaluation
@@ -78,6 +90,7 @@ from .process_lock import (
     DatabaseLockRole,
     DatabaseProcessLock,
 )
+from .resources import example_config_text
 from .retrieval import HybridRetriever, VectorRebuildError, build_retriever
 from .server import create_mcp_server
 from .store import EngramReader, EngramStore, StoreBusyError, StoreValidationError
@@ -93,6 +106,21 @@ DEBUG_TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
 WINDOWS_ADDRESS_IN_USE = getattr(errno, "WSAEADDRINUSE", 10048)
 STOP_WATCH_INTERVAL_SECONDS = 0.5
 STOP_WATCH_JOIN_TIMEOUT_SECONDS = 5.0
+# A clean stop closes the last SQLite connection, which is what removes the
+# write-ahead log. Waiting for that is the point of the command, so the budget
+# is generous enough to cover a daemon finishing a request.
+STOP_COMMAND_TIMEOUT_SECONDS = 30.0
+# Commands that must run before a configuration exists, or in spite of one that
+# does not load. Everything else is dispatched with a loaded configuration.
+CONFIGLESS_COMMANDS = frozenset({"init", "doctor"})
+# A diagnosis is read by someone who is stuck, so the verdict has to be
+# legible at a glance before any of the detail is.
+DOCTOR_MARKS = {Outcome.OK: "[ ok ]", Outcome.WARN: "[warn]", Outcome.FAIL: "[fail]"}
+DOCTOR_VERDICTS = {
+    Outcome.OK: "Engram is ready.",
+    Outcome.WARN: "Engram can run, but something above needs attention.",
+    Outcome.FAIL: "Engram cannot run until the failures above are repaired.",
+}
 
 
 class ServerBindError(OSError):
@@ -107,6 +135,10 @@ class UpgradePreflightError(RuntimeError):
     """Raised when a read-only upgrade check finds incompatible persisted data."""
 
 
+class DaemonStopError(RuntimeError):
+    """Raised when the daemon cannot be asked to stop, or does not stop in time."""
+
+
 def main() -> None:
     """Parse one supported command and execute its isolated workflow."""
     parser = _build_parser()
@@ -115,6 +147,11 @@ def main() -> None:
     logger: logging.Logger | None = None
     try:
         config_path = _resolve_config_path(arguments.config)
+        # A first run has no configuration to load, and a diagnosis whose first
+        # act is to fail on the file it exists to inspect explains nothing.
+        if arguments.command in CONFIGLESS_COMMANDS:
+            _dispatch_configless(arguments, config_path=config_path)
+            return
         # An explicit path is forwarded; otherwise the loader applies its own
         # default resolution, which stays the single definition of that default.
         selected = () if arguments.config is None else (config_path,)
@@ -135,7 +172,9 @@ def main() -> None:
         DatabaseError,
         DatabaseLockError,
         DatacronGatewayError,
+        ClientConfigError,
         ConsolidationApplyError,
+        DaemonStopError,
         UpgradePreflightError,
         EvaluationGateError,
         VectorRebuildError,
@@ -171,7 +210,30 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     commands = parser.add_subparsers(dest="command", required=True)
+    initialize = commands.add_parser(
+        "init",
+        help="Write a starting configuration where Engram will look for it",
+    )
+    initialize.add_argument(
+        "--force",
+        action="store_true",
+        help="Replace an existing configuration file instead of refusing",
+    )
+    doctor = commands.add_parser(
+        "doctor",
+        help="Report why Engram is not working, and what repairs each finding",
+    )
+    doctor.add_argument(
+        "--json",
+        action="store_true",
+        dest="as_json",
+        help="Emit the checks as one JSON document instead of readable lines",
+    )
     commands.add_parser("serve", help="Run the streamable HTTP MCP server")
+    commands.add_parser(
+        "stop",
+        help="Ask the running daemon to close the database and exit, and verify it did",
+    )
     commands.add_parser("migrate", help="Migrate and validate storage offline")
     commands.add_parser(
         "preflight",
@@ -221,6 +283,31 @@ def _add_setup_parser(
         action="store_true",
         help="With --install: install even though a competing task was found or left undetermined",
     )
+    client = targets.add_parser(
+        "client",
+        help="Point an MCP client at this Engram, and install the session protocol",
+    )
+    client.add_argument(
+        "kind",
+        choices=tuple(kind.value for kind in ClientKind),
+        help="Which client to configure",
+    )
+    client.add_argument(
+        "--print",
+        action="store_true",
+        dest="print_only",
+        help="Show the configuration block instead of writing it",
+    )
+    client.add_argument(
+        "--protocol",
+        action="store_true",
+        help="Also append the session protocol to this client's instructions file",
+    )
+    client.add_argument(
+        "--force",
+        action="store_true",
+        help="Replace an entry that already names a different endpoint",
+    )
 
 
 def _resolve_config_path(
@@ -248,7 +335,11 @@ def _add_trusted_command_parsers(
     """Add local attestation and lifecycle inspection commands."""
     attest = commands.add_parser("attest", help="Create a trusted local attestation")
     attest.add_argument("statement", help="Canonical statement to attest")
-    attest.add_argument("kind", choices=tuple(kind.value for kind in EntryKind))
+    attest.add_argument(
+        "kind",
+        choices=tuple(kind.value for kind in EntryKind),
+        help="Memory family; preference, decision and fact also require --claim-key",
+    )
     attest.add_argument("scope", help="global, user, project/<id>, or session/<id>")
     attest.add_argument(
         "--subject-key",
@@ -260,11 +351,13 @@ def _add_trusted_command_parsers(
         "--source-type",
         choices=(SourceType.HUMAN.value, SourceType.TOOL_VERIFIED.value),
         default=SourceType.HUMAN.value,
+        help="Provenance recorded for the entry (default: human)",
     )
     attest.add_argument(
         "--confidence",
         choices=tuple(confidence.value for confidence in Confidence),
         default=Confidence.HIGH.value,
+        help="Confidence recorded with the entry (default: high)",
     )
     attest.add_argument(
         "--evidence",
@@ -274,9 +367,24 @@ def _add_trusted_command_parsers(
         metavar="TYPE=REF",
         help="Evidence reference (repeatable)",
     )
-    attest.add_argument("--valid-from", type=_parse_date, metavar="YYYY-MM-DD")
-    attest.add_argument("--valid-until", type=_parse_date, metavar="YYYY-MM-DD")
-    attest.add_argument("--observed-at", type=_parse_datetime, metavar="ISO-8601")
+    attest.add_argument(
+        "--valid-from",
+        type=_parse_date,
+        metavar="YYYY-MM-DD",
+        help="First day the statement holds; before it, the entry is not yet current",
+    )
+    attest.add_argument(
+        "--valid-until",
+        type=_parse_date,
+        metavar="YYYY-MM-DD",
+        help="Last day the statement holds; after it, the entry stops being current",
+    )
+    attest.add_argument(
+        "--observed-at",
+        type=_parse_datetime,
+        metavar="ISO-8601",
+        help="When the fact was observed, with a UTC offset (default: now)",
+    )
     attest.add_argument("--actor", help="Audit actor (default: attestation.default_actor)")
     attest.add_argument(
         "--claim-key",
@@ -293,15 +401,33 @@ def _add_trusted_command_parsers(
         help="Entry replaced by this attestation (repeatable)",
     )
     supersede = commands.add_parser("supersede", help="Link a replacement entry")
-    supersede.add_argument("--old", required=True, metavar="ENTRY_ID")
-    supersede.add_argument("--new", required=True, metavar="ENTRY_ID")
+    supersede.add_argument(
+        "--old",
+        required=True,
+        metavar="ENTRY_ID",
+        help="Entry being replaced",
+    )
+    supersede.add_argument(
+        "--new",
+        required=True,
+        metavar="ENTRY_ID",
+        help="Replacement, which must be an active classified trusted entry",
+    )
     supersede.add_argument("--actor", help="Audit actor (default: attestation.default_actor)")
     classify = commands.add_parser(
         "classify",
         help="Assign a claim key to one trusted legacy entry",
     )
-    classify.add_argument("entry_id", metavar="ENTRY_ID")
-    classify.add_argument("--claim-key", required=True)
+    classify.add_argument(
+        "entry_id",
+        metavar="ENTRY_ID",
+        help="Entry to classify, as reported by 'engram list --unclassified'",
+    )
+    classify.add_argument(
+        "--claim-key",
+        required=True,
+        help="Conflict-family identity, as topic/claim; never infer these in bulk",
+    )
     classify.add_argument(
         "--actor",
         help="Audit actor (default: attestation.default_actor)",
@@ -311,6 +437,7 @@ def _add_trusted_command_parsers(
     list_filter.add_argument(
         "--status",
         choices=tuple(status.value for status in EntryStatus),
+        help="Lifecycle status to inventory; quarantined lists unconfirmed candidates",
     )
     list_filter.add_argument(
         "--unclassified",
@@ -381,6 +508,8 @@ def _dispatch(  # noqa: C901, PLR0912
     """Execute one parsed command."""
     if arguments.command == "serve":
         _serve(config=config, logger=logger)
+    elif arguments.command == "stop":
+        _stop(config=config, logger=logger)
     elif arguments.command == "migrate":
         _migrate(config=config, logger=logger)
     elif arguments.command == "preflight":
@@ -443,6 +572,8 @@ def _dispatch(  # noqa: C901, PLR0912
             check_freshness=bool(arguments.check_freshness),
             output_path=arguments.out,
         )
+    elif arguments.command == "setup" and arguments.setup_target == "client":
+        _setup_client(config=config, arguments=arguments)
     elif arguments.command == "setup":
         if (arguments.replace or arguments.force) and not arguments.install:
             parser.error("--replace and --force apply to --install only")
@@ -587,6 +718,153 @@ def _ensure_server_bind_available(host: str, port: int) -> None:
             raise ServerBindError(
                 f"Cannot bind Engram to {host}:{port}: {reason}; verify server.host and server.port"
             ) from exc
+
+
+def _setup_client(*, config: AppConfig, arguments: argparse.Namespace) -> None:
+    """Point one MCP client at this Engram, reporting every file it touched.
+
+    The endpoint comes from the configuration this command loaded, so a user who
+    changed the port never has to notice that the documented block still says
+    8377. Nothing is guessed and nothing else in the vendor file is rewritten.
+    """
+    plan = plan_client(ClientKind(arguments.kind), config, home=default_home())
+    if arguments.print_only:
+        _write_lines(
+            f"# {plan.kind.value}: {plan.config_path}",
+            "",
+            plan.block.rstrip("\n"),
+        )
+        return
+    changed = connect(plan, force=bool(arguments.force))
+    lines = [
+        f"{'Wrote' if changed else 'Already correct in'} {plan.config_path}",
+        f"Endpoint: {endpoint_url(config)}",
+    ]
+    if arguments.protocol:
+        added = install_protocol(plan)
+        lines.append(
+            f"{'Appended the session protocol to' if added else 'Protocol already in'} "
+            f"{plan.instructions_path}"
+        )
+    else:
+        lines.extend(
+            (
+                "",
+                "The client can now reach Engram but has not been told when to use it.",
+                f"Run the same command with --protocol to write {plan.instructions_path.name}.",
+            )
+        )
+    _write_lines(*lines)
+
+
+def _stop(*, config: AppConfig, logger: logging.Logger) -> None:
+    """Ask the daemon that owns this database to stop, and verify that it did.
+
+    A daemon started without a console can receive no console control event, so
+    the only way to ask it to stop is a sentinel beside its database. Building
+    that path by hand was the documented procedure, and the path the
+    documentation published matched no shipped configuration, so the request was
+    written where nothing was watching and the command looked like it worked.
+    Resolving the path from the configuration the daemon itself loaded removes
+    that possibility, and waiting on the ownership lock turns the answer into a
+    measurement rather than an assumption.
+    """
+    owner = database_ownership(config)
+    if not owner.locked:
+        _write_json({"requested": False, "stopped": True, "pid": None})
+        return
+    if not owner.daemon_running:
+        raise DaemonStopError(
+            f"The database is held by an offline writer (pid {owner.pid}), not by a daemon; "
+            "wait for it to finish"
+        )
+    request_stop(config.database.path)
+    logger.info("Stop requested for the daemon owning %s", config.database.path)
+    deadline = time.monotonic() + STOP_COMMAND_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        if not database_ownership(config).locked:
+            _write_json({"requested": True, "stopped": True, "pid": owner.pid})
+            return
+        time.sleep(STOP_WATCH_INTERVAL_SECONDS)
+    raise DaemonStopError(
+        f"The daemon (pid {owner.pid}) still holds the database "
+        f"{STOP_COMMAND_TIMEOUT_SECONDS:.0f} seconds after the stop request. "
+        "The request stays in place and it will be honoured when the daemon can; "
+        "inspect the log before terminating the process, which leaves the write-ahead log behind"
+    )
+
+
+def _dispatch_configless(arguments: argparse.Namespace, *, config_path: Path) -> None:
+    """Execute the commands that run without a loaded configuration."""
+    if arguments.command == "init":
+        _init(config_path, force=bool(arguments.force))
+    elif arguments.command == "doctor":
+        _doctor(config_path, as_json=bool(arguments.as_json))
+
+
+def _doctor(config_path: Path, *, as_json: bool) -> None:
+    """Report every measurable fact about this installation, and repair each one.
+
+    The command exits non-zero on a failure so a script can gate on it, but the
+    answer is the report rather than the code: a diagnosis that stopped at the
+    first problem would hide the second, and the second is often the one that
+    explains the first.
+    """
+    checks = diagnose(config_path)
+    if as_json:
+        _write_json(
+            {
+                "outcome": worst_outcome(checks).value,
+                "checks": [
+                    {
+                        "name": check.name,
+                        "outcome": check.outcome.value,
+                        "detail": check.detail,
+                        "remedy": check.remedy,
+                    }
+                    for check in checks
+                ],
+            }
+        )
+    else:
+        lines: list[str] = []
+        for check in checks:
+            lines.append(f"{DOCTOR_MARKS[check.outcome]} {check.name}: {check.detail}")
+            if check.remedy is not None:
+                lines.append(f"    -> {check.remedy}")
+        lines.append("")
+        lines.append(DOCTOR_VERDICTS[worst_outcome(checks)])
+        _write_lines(*lines)
+    if worst_outcome(checks) is Outcome.FAIL:
+        raise SystemExit(EXIT_USAGE_OR_CONFIG)
+
+
+def _init(config_path: Path, *, force: bool) -> None:
+    """Write the starting configuration where the loader will look for it.
+
+    The first documented step used to be a shell copy of a file that exists only
+    in a checkout, guarded by two lines that do not stop the copy when the block
+    is pasted into a live session. Writing it from the package removes the
+    checkout, the shell, and the guard that did not guard.
+    """
+    if config_path.exists() and not force:
+        raise ConfigError(
+            f"Configuration already exists: {config_path}. "
+            "Read it, or pass --force to replace it with the starting configuration."
+        )
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(example_config_text(), encoding="utf-8")
+    # Loading what was just written proves the file the daemon will read is
+    # valid, and reports the database it resolves to rather than the one the
+    # relative path appears to name.
+    config = load_config(config_path)
+    _write_lines(
+        f"Wrote {config_path}",
+        f"Database: {config.database.path}",
+        f"Endpoint: {endpoint_url(config)}",
+        "",
+        "Next: engram doctor",
+    )
 
 
 def _migrate(*, config: AppConfig, logger: logging.Logger) -> None:
@@ -761,7 +1039,10 @@ def _environment_debug_enabled() -> bool:
 
 
 def _error_exit_code(error: BaseException) -> int:
-    if isinstance(error, AutostartUnsupportedError | ConfigError | StoreValidationError):
+    if isinstance(
+        error,
+        AutostartUnsupportedError | ClientConfigError | ConfigError | StoreValidationError,
+    ):
         return EXIT_USAGE_OR_CONFIG
     if isinstance(error, DatacronGatewayError | VectorRebuildError):
         return EXIT_EXTERNAL_DEPENDENCY
@@ -929,7 +1210,7 @@ def _list_entries(
             )
         else:
             entries = tuple(entry for entry in entries if entry.status is status)
-    _write_json([_entry_payload(entry) for entry in entries])
+    _write_readable_json([_entry_payload(entry) for entry in entries])
 
 
 def _reindex(*, config: AppConfig, logger: logging.Logger) -> None:
@@ -1099,3 +1380,17 @@ def _entry_payload(entry: Entry) -> dict[str, object]:
 def _write_json(payload: object) -> None:
     serialized = json.dumps(payload, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
     sys.stdout.write(f"{serialized}\n")
+
+
+def _write_readable_json(payload: object) -> None:
+    """Emit an inventory a person can read without losing machine parsing.
+
+    This is the only surface for reviewing candidates before attesting them, and
+    it used to arrive as one unbroken minified line. Indenting keeps every
+    consumer working, json.loads included, and makes the review possible.
+    """
+    _write_lines(json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True))
+
+
+def _write_lines(*lines: str) -> None:
+    sys.stdout.write("".join(f"{line}\n" for line in lines))

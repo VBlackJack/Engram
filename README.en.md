@@ -8,7 +8,7 @@
 [![MCP Streamable HTTP](https://img.shields.io/badge/MCP-Streamable%20HTTP-5A45FF.svg)](server.json)
 [![CI](https://github.com/VBlackJack/Engram/actions/workflows/ci.yml/badge.svg)](https://github.com/VBlackJack/Engram/actions/workflows/ci.yml)
 
-[Francais](README.md) | English
+[Français](README.md) | English
 
 Engram is a local-first MCP server that captures working memories and returns compact capsules
 ranked by trust. In the trilogy, **Datacron** is the durable Markdown notebook and source of truth,
@@ -23,9 +23,11 @@ operational memory across clients and proposes reviewed consolidation into Datac
 | Use memory every day | [User guide](docs/en/user-guide.md) |
 | Understand Engram, Datacron, and Cortex | [Trilogy guide](docs/en/datacron-cortex.md) |
 | Administer, migrate, or consolidate | [Operator guide](docs/en/operator-guide.md) |
+| Keep Engram running after a logoff | [Windows logon task](docs/en/setup.md#windows-the-logon-task) or [systemd / launchd](docs/en/installation-unix.md) |
+| Find out why Engram is not working | `engram doctor`, then the [FAQ](docs/en/faq.md) |
 
 The rest of this README is a release reference. You do not need to read it all before starting.
-Documentation verified with Engram `2026.0730.02` on 2026-07-30.
+Documentation verified with Engram `2026.0730.02` on 2026-08-13.
 
 ## What is in place
 
@@ -47,40 +49,66 @@ Requirements:
 
 - Git for source installation;
 - Python 3.13 or newer;
-- `uv` 0.12.1 or newer recommended;
+- **`uv` 0.12.1 or newer** — required, not merely advised: it is the first release that knows the
+  `3.14.6` build, and continuous integration pins `uv==0.12.1` on both the Windows and Linux legs;
 - **SQLite 3.51.3 or newer in the Python runtime**.
 
 The SQLite floor is mandatory. Versions 3.7.0 through 3.51.2 are affected by SQLite's documented
 WAL-reset bug. Engram checks `sqlite3.sqlite_version` when opening a database and rejects an older
-runtime. See [Windows installation](docs/en/installation-windows.md) for the official SQLite 3.53.x
-DLL method. SQLite documents the [WAL-reset bug](https://sqlite.org/wal.html#walreset) and publishes
-the [3.53.3 binaries](https://www.sqlite.org/download.html).
+runtime; the refusal names `engram doctor` and the documentation URL, both of which report the
+repair for the machine in front of you. See
+[Windows installation](docs/en/installation-windows.md) for the official SQLite 3.53.x DLL method.
+SQLite documents the [WAL-reset bug](https://sqlite.org/wal.html#walreset) and publishes the
+[3.53.3 binaries](https://www.sqlite.org/download.html).
 
-```powershell
+Identical on Windows, macOS, and Linux:
+
+```text
 git clone https://github.com/VBlackJack/Engram.git
 cd Engram
 uv sync --python 3.14.6
-uv run --python 3.14.6 python -c "import sqlite3; print(sqlite3.sqlite_version)"
-if (Test-Path -LiteralPath "engram.toml") { throw "Existing Engram configuration: stop" }
-if (Test-Path -LiteralPath "engram.db") { throw "Existing Engram database: stop" }
-Copy-Item engram.example.toml engram.toml -ErrorAction Stop
+uv run --python 3.14.6 engram init
+uv run --python 3.14.6 engram doctor
 ```
+
+`engram init` writes `engram.toml` from the copy packaged inside the distribution, so it works from
+a wheel install as well as from a checkout, and refuses to replace an existing file unless you pass
+`--force`. `engram doctor` then reports the interpreter, the SQLite floor, the configuration that
+was resolved, the database, the lock, the endpoint, and the log file — each with the command that
+repairs it.
 
 The PyPI package is not published. Before this GitHub release is published, use the current source
 checkout; after publication, the wheel/sdist attached to the release can also be used.
 
 ## Quick start
 
-```powershell
+```text
 uv run --python 3.14.6 engram serve
 ```
 
 The default MCP endpoint is `http://127.0.0.1:8377/mcp`. Keep this loopback address: the server
 does not implement network authentication.
 
-Add the server to Claude Code, Codex, or Gemini, then install the
-[client protocol](docs/en/client-protocol.md). Exact configuration blocks are in the
-[setup guide](docs/en/setup.md).
+`engram serve` lasts exactly as long as its terminal. To keep Engram after a logoff:
+
+| Platform | Command |
+| --- | --- |
+| Windows | `uv run --python 3.14.6 engram setup autostart --install` registers a logon task that runs the daemon with no console window. `--status` reports it, `--uninstall` removes it. |
+| macOS / Linux | `engram setup autostart` is Windows-only and exits `2` elsewhere. Use the systemd user unit or launchd LaunchAgent in [Install as a service on macOS and Linux](docs/en/installation-unix.md). |
+
+Stop the daemon from any installation with `uv run --python 3.14.6 engram stop`, which asks it to
+close the database, waits on the ownership lock, and reports whether it actually stopped.
+
+Connect a client with one command, using the endpoint from your own configuration:
+
+```text
+uv run --python 3.14.6 engram setup client claude --protocol
+```
+
+Replace `claude` with `codex` or `gemini`. It writes `.mcp.json`, `~/.codex/config.toml`, or
+`~/.gemini/settings.json`, merging rather than overwriting, and `--protocol` appends the
+[client protocol](docs/en/client-protocol.md) to `CLAUDE.md`, `AGENTS.md`, or `GEMINI.md`. Exact
+hand-written blocks are in the [setup guide](docs/en/setup.md).
 
 ## Configuration
 
@@ -134,8 +162,20 @@ See the complete [security model](docs/en/security.md).
 ```text
 engram --version
 engram --debug serve
+engram init
+engram init --force
+engram doctor
+engram doctor --json
 engram serve
+engram stop
+engram setup autostart --install
+engram setup autostart --status
+engram setup autostart --uninstall
+engram setup client claude --protocol
+engram setup client codex --print
+engram setup client gemini --force
 engram migrate
+engram preflight
 engram reindex
 engram list --status quarantined
 engram list --unclassified
@@ -148,6 +188,20 @@ engram consolidate --apply local/consolidation/plan.json
 engram consolidate --check-freshness
 ```
 
+`--config <path>` is global and goes **before** the subcommand.
+
+| Command | What it is for |
+| --- | --- |
+| `engram init` | Writes the starting `engram.toml` from the copy packaged in the distribution — no checkout, no shell syntax, no platform difference. Refuses to overwrite; `--force` replaces deliberately. |
+| `engram doctor` | The single diagnosis to run before anything else, and the one to send anyone whose client cannot connect. Reports the interpreter, the SQLite floor, the resolved configuration and whether it loads, the database and schema version, the ownership lock, the endpoint, and the log file, each with its repair. Exits `0` unless something failed; `--json` for scripts. |
+| `engram stop` | Asks the daemon owning this database to close it and exit, waits on the lock, and reports whether it stopped. The only way to stop a windowless logon task or a supervised service cleanly. |
+| `engram setup autostart` | **Windows only.** Registers, inspects, or removes the logon task that starts the daemon without a console window. Exits `2` on any other platform and changes nothing; use [systemd or launchd](docs/en/installation-unix.md) there. Without it, Engram stops at the next logoff. |
+| `engram setup client` | Writes `.mcp.json` (Claude Code, current directory), `~/.codex/config.toml` (Codex), or `~/.gemini/settings.json` (Gemini) using the endpoint from the loaded configuration. Merges instead of clobbering: other servers, keys, and TOML comments survive. `--protocol` appends the session protocol to `CLAUDE.md` / `AGENTS.md` / `GEMINI.md`; `--print` writes nothing; `--force` replaces an entry naming a different endpoint. |
+
+The Codex block this command writes deliberately omits the `required` key: OpenAI defines it as
+failing Codex startup when the server cannot initialise, so a memory broker that is merely down
+would take the whole assistant with it.
+
 `consolidate --plan` remains read-only for Datacron, but anchors the immutable propositions in the
 Engram database. Edit only each JSON `decision` (`approve` or `reject`) before `--apply`. The plan is
 single-use: changing any other field or replaying it after apply is refused and requires a new plan.
@@ -158,8 +212,8 @@ verified durable identity anchor.
 Every create targets one canonical path containing the candidate ID. After an ambiguous write
 response, a new plan reconciles only identical full canonical content at that path instead of
 creating a duplicate.
-Stop the daemon before `migrate`, `classify`, `attest`, `supersede`, `reindex`, or `consolidate`,
-then restart it before recall. These commands acquire the same OS lock as the daemon and fail
+Stop the daemon with `engram stop` before `migrate`, `classify`, `attest`, `supersede`, `reindex`,
+or `consolidate`, then restart it before recall. These commands acquire the same OS lock as the daemon and fail
 clearly while it is active; `list` remains available through a read-only SQLite connection. For an
 existing database, first take a SQLite-consistent backup, stop the daemon, and run
 `engram preflight`. It holds the offline-writer lock, keeps the source database read-only, copies its
@@ -204,10 +258,11 @@ Use global `--debug` before the command, or `ENGRAM_DEBUG=1`, only when a traceb
 | [Five-minute path](docs/en/quick-start.md) | [User guide](docs/en/user-guide.md) | [Operator guide](docs/en/operator-guide.md) |
 | [Installation](docs/en/setup.md) | [Engram, Datacron, and Cortex](docs/en/datacron-cortex.md) | [Security](docs/en/security.md) |
 | [Client protocol](docs/en/client-protocol.md) | [Architecture](docs/en/architecture.md) | [FAQ and hub](docs/en/index.md) |
+| [Windows and SQLite](docs/en/installation-windows.md) | [Data contract](docs/en/spec.md) | [macOS and Linux service install](docs/en/installation-unix.md) |
 
 ## Development
 
-```powershell
+```text
 uv sync --extra dev --python 3.14.6
 uv run --python 3.14.6 ruff check .
 uv run --python 3.14.6 ruff format --check .

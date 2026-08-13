@@ -1,6 +1,6 @@
 # Security and privacy
 
-[Francais](../fr/security.md) | [English](security.md)
+[Français](../fr/security.md) | [English](security.md)
 
 > **Reference document:** to start, remember only that the server stays local, `own_pending` is
 > untrusted, and human review precedes every promotion. See the [user guide](user-guide.md).

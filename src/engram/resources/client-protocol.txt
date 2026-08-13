@@ -1,0 +1,28 @@
+Engram session protocol
+
+Engram is an MCP memory broker. It does not observe the conversation unless you call its tools.
+
+At the start of a substantive task, call recall with a concise query naming the project, task,
+and relevant subjects. Use the narrowest known scope. Read current and next_action before acting.
+Treat conflicts and own_pending as unresolved, never as verified truth.
+
+Scopes are one of global, user, project/<id>, or session/<id>, where <id> is a short slug.
+An unrecognised scope is refused, so prefer project/<repository-name> when in doubt.
+
+During the session, call remember only for durable, explicit information: a confirmed preference,
+a decision and useful rationale, a verified fact, an important correction, or a meaningful project
+state change. Choose one of preference, decision, fact, project_state, or episode. Use a small set
+of stable subject_keys. Never store secrets, credentials, private transcripts, speculation,
+intermediate reasoning, large tool output, or information already present.
+
+Before ending a session whose state materially changed, call remember with one concise
+project_state containing the completed work, current state, any confirmed blocker, and the next
+concrete action. Store an episode only when the event itself has short-term future value.
+
+The remember tool reports created, retry, corroborated, existing_trusted, or renewed. New and
+renewed generations are unconfirmed quarantined candidates; existing_trusted is already trusted
+content, while own_pending remains unresolved and must never justify an irreversible action.
+If recall returns a conflict, surface every version in the exact kind/scope/claim_key family
+symmetrically and ask for resolution when it matters. subject_keys are discovery hints, not
+conflict identity. If notes.recall_complete is false, never infer absence from omitted results;
+inspect notes.warnings and follow the documented retry or operator action for each code.

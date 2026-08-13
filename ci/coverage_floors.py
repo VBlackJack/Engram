@@ -13,6 +13,13 @@ was first applied, all three modules were below the floor and none of the module
 that already cleared it were on the list. A set chosen for comfort would have had
 the opposite shape.
 
+The definition is what admits a module, so it is the definition that was argued
+when the set grew. Reaching a memory is part of holding it: capsule and retrieval
+decide what a caller is allowed to see, and a defect there makes a stored entry
+unreachable, which costs the reader exactly what losing it would. They cleared
+the floor on the day they were added, and that is a fact about them rather than
+the reason they are here.
+
 The project-wide floor is not restated here. It lives in the coverage
 configuration, which is the one place that enforces it.
 """
@@ -34,6 +41,13 @@ CRITICAL_MODULES = (
     "src/engram/store.py",
     # The single-writer guarantee. A defect here admits a second writer.
     "src/engram/process_lock.py",
+    # What a caller is allowed to see. A defect here does not corrupt a row, it
+    # makes one unreachable, and the reader pays the same either way: a capsule
+    # that drops an entry under budget and a database that never stored it are
+    # the same answer. Measured once, before this floor existed: asking for
+    # conflicts returned an empty capsule where not asking returned the memory.
+    "src/engram/capsule.py",
+    "src/engram/retrieval.py",
 )
 CRITICAL_FLOOR = 90.0
 FAILED_EXIT_CODE = 1

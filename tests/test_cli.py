@@ -20,6 +20,7 @@ import pytest
 import engram.cli as cli_module
 import engram.db as db_module
 from engram import __version__
+from engram.autostart import DatabaseOwnership
 from engram.cli import (
     EXIT_EXTERNAL_DEPENDENCY,
     EXIT_INTERRUPTED,
@@ -28,6 +29,7 @@ from engram.cli import (
     EXIT_TRANSIENT_BUSY,
     EXIT_USAGE_OR_CONFIG,
     ConsolidationApplyError,
+    DaemonStopError,
     ServerBindError,
     UpgradePreflightError,
     _attest,
@@ -39,12 +41,18 @@ from engram.cli import (
     _preflight,
     _reindex,
     _serve,
+    _stop,
     _supersede,
     main,
 )
-from engram.config import AppConfig, ConfigError
+from engram.config import AppConfig, ConfigError, load_config
 from engram.consolidation.gateway import DatacronGatewayError
-from engram.db import MAX_SQLITE_VALUE_BYTES, DatabaseError, SQLiteVersionError
+from engram.db import (
+    MAX_SQLITE_VALUE_BYTES,
+    DatabaseError,
+    SQLiteVersionError,
+    latest_schema_version,
+)
 from engram.logging_setup import FileLogger
 from engram.models import (
     AuditAction,
@@ -57,6 +65,7 @@ from engram.models import (
 )
 from engram.normalization import canonical_key
 from engram.process_lock import DatabaseLockError, DatabaseLockRole, DatabaseProcessLock
+from engram.resources import example_config_text
 from engram.retrieval import FtsRetriever, RetrievalRequest, VectorRebuildError
 from engram.store import (
     EngramStore,
@@ -425,7 +434,7 @@ def test_migrate_inventory_and_classify_are_retry_safe(
     first_migration = json.loads(capsys.readouterr().out)
     _migrate(config=app_config, logger=logger)
     second_migration = json.loads(capsys.readouterr().out)
-    assert first_migration == second_migration == {"schema_version": 5}
+    assert first_migration == second_migration == {"schema_version": latest_schema_version()}
 
     _list_entries(config=app_config, unclassified=True)
     inventory = json.loads(capsys.readouterr().out)
@@ -505,7 +514,7 @@ def test_preflight_validates_compatible_database_without_writing(
 
     payload = json.loads(capsys.readouterr().out)
     assert payload["compatible"] is True
-    assert payload["schema_version"] == 5
+    assert payload["schema_version"] == latest_schema_version()
     assert app_config.database.path.read_bytes() == before
 
 
@@ -596,7 +605,7 @@ def test_preflight_accepts_v4_with_missing_derived_indexes(
         "compatible": True,
         "database": str(app_config.database.path),
         "schema_version": 4,
-        "target_schema_version": 5,
+        "target_schema_version": latest_schema_version(),
         "fts_rebuild_required": True,
         "vector_rebuild_required": True,
     }
@@ -905,3 +914,141 @@ def test_daemon_lock_blocks_offline_writers_but_allows_list(
 
     with EngramStore(app_config) as store:
         assert store.count_entries() == 0
+
+
+def test_packaged_configuration_matches_the_repository_example() -> None:
+    """The template the wheel carries and the one the checkout shows must not drift."""
+    checkout = Path(__file__).resolve().parent.parent / "engram.example.toml"
+
+    assert example_config_text() == checkout.read_text(encoding="utf-8")
+
+
+def test_init_writes_a_configuration_the_loader_can_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    target = tmp_path / "engram.toml"
+    monkeypatch.setattr(sys, "argv", ["engram", "--config", str(target), "init"])
+
+    main()
+
+    captured = capsys.readouterr()
+    assert target.is_file()
+    assert target.read_text(encoding="utf-8") == example_config_text()
+    assert str(target) in captured.out
+    assert load_config(target).database.path == (tmp_path / "engram.db").resolve()
+
+
+def test_init_refuses_to_replace_an_existing_configuration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    target = tmp_path / "engram.toml"
+    target.write_text("[database]\npath = 'kept.db'\n", encoding="utf-8")
+    monkeypatch.setattr(sys, "argv", ["engram", "--config", str(target), "init"])
+
+    with pytest.raises(SystemExit) as exit_info:
+        main()
+
+    captured = capsys.readouterr()
+    assert exit_info.value.code == EXIT_USAGE_OR_CONFIG
+    assert "--force" in captured.err
+    assert target.read_text(encoding="utf-8") == "[database]\npath = 'kept.db'\n"
+
+
+def test_init_replaces_an_existing_configuration_when_forced(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    target = tmp_path / "engram.toml"
+    target.write_text("[database]\npath = 'replaced.db'\n", encoding="utf-8")
+    monkeypatch.setattr(sys, "argv", ["engram", "--config", str(target), "init", "--force"])
+
+    main()
+
+    capsys.readouterr()
+    assert target.read_text(encoding="utf-8") == example_config_text()
+
+
+def test_stop_reports_that_nothing_owns_a_free_database(
+    app_config: AppConfig,
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _stop(config=app_config, logger=logging.getLogger("engram.test.stop"))
+
+    assert json.loads(capsys.readouterr().out) == {
+        "pid": None,
+        "requested": False,
+        "stopped": True,
+    }
+    assert caplog.records == []
+
+
+def test_stop_confirms_the_daemon_released_the_database(
+    app_config: AppConfig,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The answer is the ownership lock, never the fact that a request was written."""
+    observed = iter(
+        (
+            DatabaseOwnership(locked=True, role=DatabaseLockRole.DAEMON, pid=4242),
+            DatabaseOwnership(locked=False, role=None, pid=None),
+        )
+    )
+    requested: list[Path] = []
+
+    def record(path: Path) -> Path:
+        requested.append(path)
+        return path
+
+    monkeypatch.setattr(cli_module, "database_ownership", lambda _config: next(observed))
+    monkeypatch.setattr(cli_module, "request_stop", record)
+
+    _stop(config=app_config, logger=logging.getLogger("engram.test.stop"))
+
+    assert requested == [app_config.database.path]
+    assert json.loads(capsys.readouterr().out) == {
+        "pid": 4242,
+        "requested": True,
+        "stopped": True,
+    }
+
+
+def test_stop_refuses_when_an_offline_writer_holds_the_database(
+    app_config: AppConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        cli_module,
+        "database_ownership",
+        lambda _config: DatabaseOwnership(
+            locked=True,
+            role=DatabaseLockRole.OFFLINE_WRITER,
+            pid=99,
+        ),
+    )
+
+    with pytest.raises(DaemonStopError, match="offline writer"):
+        _stop(config=app_config, logger=logging.getLogger("engram.test.stop"))
+
+
+def test_stop_reports_a_daemon_that_did_not_release_the_database(
+    app_config: AppConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A request that was written is not a daemon that stopped."""
+    monkeypatch.setattr(
+        cli_module,
+        "database_ownership",
+        lambda _config: DatabaseOwnership(locked=True, role=DatabaseLockRole.DAEMON, pid=7),
+    )
+    monkeypatch.setattr(cli_module, "request_stop", lambda path: path)
+    monkeypatch.setattr(cli_module, "STOP_COMMAND_TIMEOUT_SECONDS", 0.0)
+
+    with pytest.raises(DaemonStopError, match="still holds the database"):
+        _stop(config=app_config, logger=logging.getLogger("engram.test.stop"))

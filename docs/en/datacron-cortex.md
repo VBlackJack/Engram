@@ -1,11 +1,11 @@
 # Engram, Datacron, and Cortex
 
-[Francais](../fr/datacron-cortex.md) | [English](datacron-cortex.md)
+[Français](../fr/datacron-cortex.md) | [English](datacron-cortex.md)
 
 > **Goal:** choose the right tool and make all three work over the same corpus.<br>
 > **Time:** 10 minutes to read.<br>
 > **Risk:** Datacron writes and Engram promotions require human review.<br>
-> **Verified with:** Engram `2026.0730.02` on 2026-07-30.
+> **Verified with:** Engram `2026.0730.02` on 2026-08-13.
 
 ## In 30 seconds
 
@@ -67,7 +67,7 @@ Replace `G:/Knowledge` with the absolute path to your vault.
 
 ### 1. Initialize Datacron
 
-```powershell
+```text
 datacron setup --vault "G:/Knowledge" --client all --scope both
 datacron status --vault "G:/Knowledge"
 ```
@@ -103,7 +103,7 @@ Datacron. This is the expected fail-closed behavior.
 
 Run the Cortex assistant and select `G:/Knowledge` as `kb_path`:
 
-```powershell
+```text
 cortex setup
 cortex sync
 ```
@@ -153,7 +153,7 @@ cannot be consolidated.
 
 1. Correct the canonical source in Datacron using Datacron history and controls.
 2. Run the `cortex sync` CLI command to update the derived index.
-3. Stop the Engram daemon.
+3. Stop the Engram daemon with `uv run --python 3.14.6 engram stop`.
 4. If Engram contains a conflicting active version, follow
    [Attest a candidate](operator-guide.md#attest-a-candidate) to identify the replaced entry or
    link both entries.

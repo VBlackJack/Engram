@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import tomllib
 from copy import deepcopy
+from fnmatch import fnmatch
 from pathlib import Path
 from typing import Any
 
@@ -119,6 +120,7 @@ def test_documentation_trees_are_mirrored() -> None:
         "datacron-cortex.md",
         "faq.md",
         "index.md",
+        "installation-unix.md",
         "installation-windows.md",
         "operator-guide.md",
         "quick-start.md",
@@ -127,3 +129,60 @@ def test_documentation_trees_are_mirrored() -> None:
         "spec.md",
         "user-guide.md",
     }
+
+
+def test_the_declared_version_is_its_own_normal_form() -> None:
+    """A version that is not canonical is stamped differently on what users download.
+
+    setuptools normalises before it names an artifact, so `2026.0730.02` became
+    `engram_memory_broker-2026.730.2-py3-none-any.whl` while the tag, the docs and
+    `engram --version` all said `2026.0730.02`. Nothing failed; the release simply
+    carried two different version strings.
+    """
+    components = __version__.split(".")
+
+    assert all(component.isdigit() for component in components), __version__
+    assert all(str(int(component)) == component for component in components), (
+        f"{__version__} is not in PEP 440 normal form; setuptools would stamp "
+        f"{'.'.join(str(int(component)) for component in components)} on every artifact"
+    )
+
+
+def test_the_release_tag_pattern_accepts_the_declared_version() -> None:
+    """The workflow only builds for a tag it matches, and it verifies tag == version."""
+    workflow = (
+        Path(__file__).resolve().parent.parent / ".github" / "workflows" / "release.yml"
+    ).read_text(encoding="utf-8")
+    pattern = next(line for line in workflow.splitlines() if line.strip().startswith("tags:"))
+    expression = pattern.split("[", 1)[1].rsplit("]", 1)[0].strip().strip('"')
+
+    assert fnmatch(f"v{__version__}", expression), (
+        f"the release workflow would not build a tag for v{__version__}"
+    )
+
+
+def test_every_packaged_resource_is_declared_as_package_data() -> None:
+    """A data file the wheel does not carry is one an installed Engram cannot read.
+
+    The starting configuration lived at the repository root, so MANIFEST.in
+    carried it into the source archive and nothing carried it into the wheel: an
+    installation that was not a checkout refused to start and named a file the
+    user had no way to obtain. Declaring the package is what fixed it, and
+    nothing else would notice its removal.
+    """
+    root = Path(__file__).resolve().parent.parent
+    pyproject = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
+    declared = pyproject["tool"]["setuptools"]["package-data"]["engram.resources"]
+    suffixes = {pattern.removeprefix("*") for pattern in declared}
+    shipped = sorted(
+        path
+        for path in (root / "src" / "engram" / "resources").iterdir()
+        if path.is_file() and path.suffix != ".py"
+    )
+
+    assert shipped, "the resources package holds no data file"
+    for path in shipped:
+        assert path.suffix in suffixes, (
+            f"{path.name} lives in engram.resources but no package-data pattern carries it "
+            "into the wheel"
+        )

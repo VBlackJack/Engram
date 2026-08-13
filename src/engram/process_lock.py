@@ -295,7 +295,10 @@ def _locked_message(owner: DatabaseLockOwner | None) -> str:
     if owner is None:
         return "Engram database is locked by another process; wait for it to finish"
     if owner.role is DatabaseLockRole.DAEMON:
-        return f"Engram daemon is active (pid {owner.pid}); stop it before an offline write"
+        return (
+            f"Engram daemon is active (pid {owner.pid}); "
+            "stop it before an offline write by running 'engram stop'"
+        )
     if owner.role is DatabaseLockRole.WRITER:
         return f"Engram writer '{owner.command}' is active (pid {owner.pid}); wait for it to finish"
     return (
