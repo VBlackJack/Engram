@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import os
 import stat
+import sys
 import tempfile
 import tomllib
 from collections.abc import Mapping
@@ -46,6 +47,21 @@ class ClientKind(StrEnum):
 
 class ClientConfigError(RuntimeError):
     """Raised when a vendor configuration cannot be read or would be clobbered."""
+
+
+@dataclass(frozen=True, slots=True)
+class _Metadata:
+    """What a replacement promises to carry over from the file it replaces.
+
+    The promise is deliberately narrow and stated here rather than implied: the
+    permission bits, and every extended attribute this process can reproduce.
+    Anything a rename cannot preserve at all -- an inode's identity, and so its
+    hard links and its type -- is refused by `_require_replaceable` instead of
+    being lost quietly.
+    """
+
+    mode: int | None
+    xattrs: Mapping[str, bytes]
 
 
 @dataclass(frozen=True, slots=True)
@@ -318,7 +334,8 @@ def _replace_atomically(path: Path, data: bytes) -> None:
     and the canonical file receives the change.
     """
     destination = path.resolve() if path.is_symlink() else path
-    mode = _destination_mode(destination)
+    _require_replaceable(destination)
+    carried = _carried_metadata(destination)
     destination.parent.mkdir(parents=True, exist_ok=True)
     descriptor, name = tempfile.mkstemp(
         dir=destination.parent,
@@ -332,12 +349,131 @@ def _replace_atomically(path: Path, data: bytes) -> None:
             stream.flush()
             os.fsync(stream.fileno())
         _require_written(temporary, destination, data)
-        if mode is not None:
-            temporary.chmod(mode)
+        _apply_metadata(temporary, destination, carried)
         temporary.replace(destination)
     except BaseException:
         temporary.unlink(missing_ok=True)
         raise
+
+
+def _require_replaceable(destination: Path) -> None:
+    """Refuse a destination whose identity a rename is unable to preserve.
+
+    Renaming swaps a directory entry, so the inode behind the old name is
+    discarded together with everything only that inode carried. Two properties
+    are lost without a sound in the process, and neither is a change this command
+    is entitled to make: a hard-linked configuration keeps the old content under
+    its other names while this one silently becomes a different file, and a FIFO,
+    a socket or a device is replaced by an ordinary file.
+
+    Neither can be preserved by any atomic write -- preserving them means writing
+    through the existing inode, which is exactly the non-atomic operation this
+    function exists to avoid. So the contract is narrowed instead of quietly
+    broken: what cannot be honoured is refused, and the message says why.
+    """
+    try:
+        info = destination.lstat()
+    except (FileNotFoundError, NotADirectoryError):
+        return
+    if not stat.S_ISREG(info.st_mode):
+        raise ClientConfigError(
+            f"{destination} is {_describe_file_type(info.st_mode)}, not a regular file. "
+            "Engram replaces a configuration by writing a new file in its place, which would "
+            "destroy this one. Point the client at a regular file, or use --print."
+        )
+    if info.st_nlink > 1:
+        raise ClientConfigError(
+            f"{destination} has {info.st_nlink} hard links. Replacing it would leave every other "
+            "name holding the old content while this one changed, so it is refused rather than "
+            "done silently. Break the link first, or use --print and edit the file in place."
+        )
+
+
+def _describe_file_type(mode: int) -> str:
+    for predicate, description in (
+        (stat.S_ISDIR, "a directory"),
+        (stat.S_ISFIFO, "a FIFO"),
+        (stat.S_ISSOCK, "a socket"),
+        (stat.S_ISBLK, "a block device"),
+        (stat.S_ISCHR, "a character device"),
+        (stat.S_ISLNK, "a symbolic link"),
+    ):
+        if predicate(mode):
+            return description
+    return "of an unsupported type"
+
+
+def _carried_metadata(destination: Path) -> _Metadata:
+    """Collect everything the replacement promises to bring across."""
+    return _Metadata(mode=_destination_mode(destination), xattrs=_read_xattrs(destination))
+
+
+def _read_xattrs(path: Path) -> Mapping[str, bytes]:
+    # The guard is a platform comparison rather than hasattr so that the type
+    # checker follows it: Windows has no extended attributes at all.
+    if sys.platform == "win32" or not path.exists():
+        return {}
+    try:
+        names = os.listxattr(path)
+    except OSError:
+        return {}
+    carried: dict[str, bytes] = {}
+    for name in names:
+        try:
+            carried[name] = os.getxattr(path, name)
+        except OSError:
+            continue
+    return carried
+
+
+def _carry_xattrs(temporary: Path, xattrs: Mapping[str, bytes]) -> None:
+    """Copy every extended attribute across, tolerating the ones we may not set.
+
+    A namespace such as `security.` belongs to the kernel rather than to this
+    process. Failing to set one is only acceptable when the value already there
+    matches, which the caller's read-back is what decides.
+    """
+    if sys.platform == "win32":
+        return
+    for name, value in xattrs.items():
+        try:
+            os.setxattr(temporary, name, value)
+        except OSError:
+            continue
+
+
+def _apply_metadata(temporary: Path, destination: Path, carried: _Metadata) -> None:
+    """Put the carried metadata on the replacement and prove each promise landed.
+
+    Extended attributes survive nothing about a rename either: the new file is a
+    new inode and starts with whatever the kernel gives it. They are copied, then
+    read back, because setting one can fail silently for a namespace that belongs
+    to the kernel rather than to this process. A value the kernel already applied
+    identically is honoured; anything genuinely lost is a refusal, so the command
+    never reports a success that dropped metadata a user put there.
+    """
+    if carried.mode is not None:
+        temporary.chmod(carried.mode)
+        landed = stat.S_IMODE(temporary.stat().st_mode)
+        if landed != carried.mode:
+            raise ClientConfigError(
+                f"{destination} could not be replaced: the new file carries mode {landed:o} "
+                f"rather than the {carried.mode:o} it had"
+            )
+    _carry_xattrs(temporary, carried.xattrs)
+    lost = tuple(
+        sorted(
+            name
+            for name, value in carried.xattrs.items()
+            if _read_xattrs(temporary).get(name) != value
+        )
+    )
+    if lost:
+        raise ClientConfigError(
+            f"{destination} could not be replaced without dropping the extended "
+            f"attribute(s) {', '.join(lost)}. The file is untouched; copy them across by hand, "
+            "or use --print and edit the file in place."
+        )
 
 
 def _destination_mode(path: Path) -> int | None:
