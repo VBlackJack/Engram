@@ -1461,7 +1461,16 @@ def _precheck_entry_payload_lengths(
         raise DatabaseError(
             "Persisted entry payload exceeds a fixed preflight allocation bound or has "
             f"an invalid SQLite type at {location}, "
-            f"field {invalid['invalid_field']!s}"
+            f"field {invalid['invalid_field']!s}. "
+            # The bound is the smaller of the fixed ceiling and the configured
+            # limit, so lowering limits.max_statement_chars or
+            # limits.max_subject_keys below what is already stored refuses to open
+            # a database that was valid a moment earlier. Naming the keys turns an
+            # opaque identifier into something the operator can act on: restoring
+            # the previous value opens it again with every row intact.
+            "If limits.max_statement_chars or limits.max_subject_keys was lowered, "
+            "restore the previous value; the stored row is unchanged and 'engram doctor' "
+            "reports which configuration is in force"
         )
     if _schema_version(connection) >= LIFECYCLE_SCHEMA_VERSION:
         invalid_v5 = connection.execute(
