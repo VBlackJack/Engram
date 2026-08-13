@@ -453,3 +453,80 @@ def _security_descriptor(path: Path) -> str:
         check=True,
     )
     return completed.stdout.replace(str(path), "<path>")
+
+
+@pytest.mark.parametrize("kind", [ClientKind.CLAUDE, ClientKind.CODEX, ClientKind.GEMINI])
+def test_a_write_creates_no_file_other_than_the_destination(
+    kind: ClientKind,
+    app_config: AppConfig,
+    workspace: Path,
+) -> None:
+    """No auxiliary file means no predictable path to aim at and no second copy.
+
+    A sidecar beside the destination was neither: a pre-created hard link at its
+    predictable name turned the staging write into a write through to an
+    unrelated file, and on POSIX the copy carried the content out of a 0400
+    destination at the umask default.
+    """
+    plan = plan_client(kind, app_config, home=workspace)
+    _seed(kind, plan.config_path)
+    before = {entry.name for entry in plan.config_path.parent.iterdir()}
+
+    connect(plan_client(kind, app_config, home=workspace), force=False)
+
+    assert {entry.name for entry in plan.config_path.parent.iterdir()} == before
+
+
+def test_the_protocol_append_creates_no_file_other_than_the_instructions(
+    app_config: AppConfig,
+    workspace: Path,
+) -> None:
+    plan = plan_client(ClientKind.CLAUDE, app_config, home=workspace)
+    plan.instructions_path.write_bytes(b"# My project\n")
+    before = {entry.name for entry in plan.instructions_path.parent.iterdir()}
+
+    assert install_protocol(plan) is True
+
+    assert {entry.name for entry in plan.instructions_path.parent.iterdir()} == before
+
+
+def test_a_file_at_the_old_staging_name_is_never_written_through(
+    app_config: AppConfig,
+    workspace: Path,
+) -> None:
+    """The name the sidecar used is no longer special, and must never be opened.
+
+    Reproduced against the previous commit: pre-creating it as a hard link to an
+    unrelated file made install_protocol write the protocol into that file and
+    then unlink the name, reporting success.
+    """
+    plan = plan_client(ClientKind.CODEX, app_config, home=workspace)
+    unrelated = workspace.parent / "unrelated.txt"
+    unrelated.write_bytes(b"PRIVATE CONTENT\n")
+    decoy = plan.instructions_path.with_name(f".{plan.instructions_path.name}.engram-new")
+    os.link(unrelated, decoy)
+
+    assert install_protocol(plan) is True
+
+    assert unrelated.read_bytes() == b"PRIVATE CONTENT\n"
+    assert decoy.read_bytes() == b"PRIVATE CONTENT\n"
+    assert b"Engram session protocol" in plan.instructions_path.read_bytes()
+
+
+@posix_only
+def test_a_refused_write_leaves_no_readable_copy_of_a_private_file(
+    app_config: AppConfig,
+    workspace: Path,
+) -> None:
+    """A staged copy at the umask default carried a 0400 secret into the open."""
+    plan = plan_client(ClientKind.GEMINI, app_config, home=workspace)
+    plan.config_path.parent.mkdir(parents=True, exist_ok=True)
+    plan.config_path.write_bytes(b'{"secret": "do-not-leak"}')
+    plan.config_path.chmod(0o400)
+    before = {entry.name for entry in plan.config_path.parent.iterdir()}
+
+    with pytest.raises(ClientConfigError):
+        connect(plan_client(ClientKind.GEMINI, app_config, home=workspace), force=True)
+
+    assert {entry.name for entry in plan.config_path.parent.iterdir()} == before
+    assert stat.S_IMODE(plan.config_path.stat().st_mode) == 0o400

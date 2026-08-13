@@ -307,39 +307,38 @@ def _write_preserving_identity(path: Path, data: bytes) -> None:
     platforms, with no platform-specific code. A symlink is followed by the open
     itself, so the link keeps pointing at the file that receives the change.
 
-    The cost is the rename's all-or-nothing guarantee, and it is bought back
-    rather than dropped: the complete content is written and flushed to a sidecar
-    first, the destination is then rewritten and read back, and the sidecar is
-    removed only once the destination is proven. An interrupted run leaves the
-    sidecar holding exactly what was intended, and the failure names it.
+    **This write is not atomic, and does not pretend to be.** A process killed
+    during it can leave the file partly written. That is stated rather than
+    papered over, because the attempt to paper over it was worse than the gap.
+
+    An earlier version staged the content in a sidecar beside the destination and
+    claimed the guarantee was bought back. It was not. A hard kill still left the
+    destination half written, and nothing survived the kill to report where the
+    good copy was. What the sidecar did add was real: a predictable path in a
+    directory the user does not solely control, which a pre-created hard link
+    turned into a write through to an unrelated file, and a second copy of the
+    content at default permissions, which carried a secret out of a `0400`
+    destination. Three defects for no guarantee, so no auxiliary file is created
+    at all now.
+
+    What is guaranteed instead: nothing else on disk is touched, the bytes are
+    read back and compared before the call returns, and a file left unparseable
+    by an interrupted run is refused loudly by the next one rather than extended.
     """
     _require_writable_target(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    sidecar = path.with_name(f".{path.name}.engram-new")
-    _write_and_verify(sidecar, data, exclusive=False)
+    # Exclusive creation when the file is absent, so a path that appears between
+    # the check and the open is a refusal rather than a silent overwrite.
+    mode = "r+b" if path.exists() else "xb"
     try:
-        _write_and_verify(path, data, exclusive=not path.exists())
+        with path.open(mode) as stream:
+            stream.seek(0)
+            stream.write(data)
+            stream.truncate()
+            stream.flush()
+            os.fsync(stream.fileno())
     except OSError as exc:
-        raise ClientConfigError(
-            f"{path} could not be written: {exc}. The content that was meant for it is "
-            f"complete in {sidecar}; move that file into place once the cause is repaired."
-        ) from exc
-    sidecar.unlink(missing_ok=True)
-
-
-def _write_and_verify(path: Path, data: bytes, *, exclusive: bool) -> None:
-    """Put bytes in one file and prove they are the bytes on disk afterwards.
-
-    An existing file is rewritten through its own descriptor rather than
-    recreated, which is what keeps its identity and everything attached to it.
-    """
-    mode = "wb" if exclusive or not path.exists() else "r+b"
-    with path.open(mode) as stream:
-        stream.seek(0)
-        stream.write(data)
-        stream.truncate()
-        stream.flush()
-        os.fsync(stream.fileno())
+        raise ClientConfigError(f"{path} could not be written: {exc}") from exc
     landed = path.read_bytes()
     if landed != data:
         raise ClientConfigError(
