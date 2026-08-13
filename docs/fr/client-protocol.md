@@ -88,6 +88,9 @@ At the start of a substantive task, call recall with a concise query naming the 
 and relevant subjects. Use the narrowest known scope. Read current and next_action before acting.
 Treat conflicts and own_pending as unresolved, never as verified truth.
 
+Scopes are one of global, user, project/<id>, or session/<id>, where <id> is a short slug.
+An unrecognised scope is refused, so prefer project/<repository-name> when in doubt.
+
 During the session, call remember only for durable, explicit information: a confirmed preference,
 a decision and useful rationale, a verified fact, an important correction, or a meaningful project
 state change. Choose one of preference, decision, fact, project_state, or episode. Use a small set

@@ -39,6 +39,15 @@ from .autostart import (
     stop_requested,
     uninstall,
 )
+from .clients import (
+    ClientConfigError,
+    ClientKind,
+    connect,
+    default_home,
+    endpoint_url,
+    install_protocol,
+    plan_client,
+)
 from .config import (
     DEFAULT_CONFIG_PATH,
     ENV_PREFIX,
@@ -163,6 +172,7 @@ def main() -> None:
         DatabaseError,
         DatabaseLockError,
         DatacronGatewayError,
+        ClientConfigError,
         ConsolidationApplyError,
         DaemonStopError,
         UpgradePreflightError,
@@ -272,6 +282,31 @@ def _add_setup_parser(
         "--force",
         action="store_true",
         help="With --install: install even though a competing task was found or left undetermined",
+    )
+    client = targets.add_parser(
+        "client",
+        help="Point an MCP client at this Engram, and install the session protocol",
+    )
+    client.add_argument(
+        "kind",
+        choices=tuple(kind.value for kind in ClientKind),
+        help="Which client to configure",
+    )
+    client.add_argument(
+        "--print",
+        action="store_true",
+        dest="print_only",
+        help="Show the configuration block instead of writing it",
+    )
+    client.add_argument(
+        "--protocol",
+        action="store_true",
+        help="Also append the session protocol to this client's instructions file",
+    )
+    client.add_argument(
+        "--force",
+        action="store_true",
+        help="Replace an entry that already names a different endpoint",
     )
 
 
@@ -497,6 +532,8 @@ def _dispatch(  # noqa: C901, PLR0912
             check_freshness=bool(arguments.check_freshness),
             output_path=arguments.out,
         )
+    elif arguments.command == "setup" and arguments.setup_target == "client":
+        _setup_client(config=config, arguments=arguments)
     elif arguments.command == "setup":
         if (arguments.replace or arguments.force) and not arguments.install:
             parser.error("--replace and --force apply to --install only")
@@ -641,6 +678,43 @@ def _ensure_server_bind_available(host: str, port: int) -> None:
             raise ServerBindError(
                 f"Cannot bind Engram to {host}:{port}: {reason}; verify server.host and server.port"
             ) from exc
+
+
+def _setup_client(*, config: AppConfig, arguments: argparse.Namespace) -> None:
+    """Point one MCP client at this Engram, reporting every file it touched.
+
+    The endpoint comes from the configuration this command loaded, so a user who
+    changed the port never has to notice that the documented block still says
+    8377. Nothing is guessed and nothing else in the vendor file is rewritten.
+    """
+    plan = plan_client(ClientKind(arguments.kind), config, home=default_home())
+    if arguments.print_only:
+        _write_lines(
+            f"# {plan.kind.value}: {plan.config_path}",
+            "",
+            plan.block.rstrip("\n"),
+        )
+        return
+    changed = connect(plan, force=bool(arguments.force))
+    lines = [
+        f"{'Wrote' if changed else 'Already correct in'} {plan.config_path}",
+        f"Endpoint: {endpoint_url(config)}",
+    ]
+    if arguments.protocol:
+        added = install_protocol(plan)
+        lines.append(
+            f"{'Appended the session protocol to' if added else 'Protocol already in'} "
+            f"{plan.instructions_path}"
+        )
+    else:
+        lines.extend(
+            (
+                "",
+                "The client can now reach Engram but has not been told when to use it.",
+                f"Run the same command with --protocol to write {plan.instructions_path.name}.",
+            )
+        )
+    _write_lines(*lines)
 
 
 def _stop(*, config: AppConfig, logger: logging.Logger) -> None:
@@ -925,7 +999,10 @@ def _environment_debug_enabled() -> bool:
 
 
 def _error_exit_code(error: BaseException) -> int:
-    if isinstance(error, AutostartUnsupportedError | ConfigError | StoreValidationError):
+    if isinstance(
+        error,
+        AutostartUnsupportedError | ClientConfigError | ConfigError | StoreValidationError,
+    ):
         return EXIT_USAGE_OR_CONFIG
     if isinstance(error, DatacronGatewayError | VectorRebuildError):
         return EXIT_EXTERNAL_DEPENDENCY

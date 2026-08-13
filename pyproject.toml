@@ -58,7 +58,7 @@ namespaces = false
 # archive. Without this, an install that was not a checkout refused to start and
 # named a file the user could not obtain from anywhere.
 [tool.setuptools.package-data]
-"engram.resources" = ["*.toml"]
+"engram.resources" = ["*.toml", "*.txt"]
 
 [tool.ruff]
 target-version = "py313"
