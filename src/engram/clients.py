@@ -24,7 +24,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import IO, TYPE_CHECKING, Any
 
 from .config import format_endpoint
 from .resources import client_protocol_text
@@ -112,14 +112,25 @@ def connect(plan: ClientPlan, *, force: bool) -> bool:
 def install_protocol(plan: ClientPlan) -> bool:
     """Append the session protocol to the client's instructions, once."""
     protocol = client_protocol_text().strip()
-    existing = plan.instructions_path.read_bytes() if plan.instructions_path.is_file() else b""
-    if protocol.encode("utf-8") in existing.replace(b"\r\n", b"\n"):
+    existing = _read_optional_bytes(plan.instructions_path)
+    if protocol.encode("utf-8") in (existing or b"").replace(b"\r\n", b"\n"):
         return False
     _write_preserving_identity(
         plan.instructions_path,
-        existing + _line_separated_appendix(existing, f"{protocol}\n"),
+        (existing or b"") + _line_separated_appendix(existing or b"", f"{protocol}\n"),
+        expected=existing,
     )
     return True
+
+
+def _read_optional_bytes(path: Path) -> bytes | None:
+    """Return the bytes a file holds, or None when there is no file to read.
+
+    The distinction matters to every caller: it is the state the content is
+    built from, and the writer compares against it rather than looking the path
+    up a second time.
+    """
+    return path.read_bytes() if path.is_file() else None
 
 
 def _render_json_block(entry: dict[str, str]) -> str:
@@ -140,11 +151,16 @@ def _render_codex_block(url: str) -> str:
 
 
 def _load_json(path: Path) -> dict[str, Any]:
-    if not path.is_file():
+    return _parse_json(path, _read_optional_bytes(path))
+
+
+def _parse_json(path: Path, raw: bytes | None) -> dict[str, Any]:
+    """Parse the bytes the caller read, so the write can be checked against them."""
+    if raw is None:
         return {}
     try:
-        loaded = json.loads(path.read_text(encoding="utf-8") or "{}")
-    except (OSError, json.JSONDecodeError) as exc:
+        loaded = json.loads(raw.decode("utf-8") or "{}")
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ClientConfigError(f"{path} is not readable JSON: {exc}") from exc
     if not isinstance(loaded, dict):
         raise ClientConfigError(f"{path} does not contain a JSON object")
@@ -164,7 +180,8 @@ def _json_entry(path: Path, keys: tuple[str, ...]) -> object:
 
 
 def _write_json_client(plan: ClientPlan, *, force: bool) -> None:
-    document = _load_json(plan.config_path)
+    raw = _read_optional_bytes(plan.config_path)
+    document = _parse_json(plan.config_path, raw)
     servers = document.get("mcpServers")
     if servers is None:
         servers = {}
@@ -180,6 +197,7 @@ def _write_json_client(plan: ClientPlan, *, force: bool) -> None:
     _write_preserving_identity(
         plan.config_path,
         (json.dumps(document, indent=2) + "\n").encode("utf-8"),
+        expected=raw,
     )
 
 
@@ -259,8 +277,8 @@ def _write_codex(plan: ClientPlan, *, force: bool) -> None:
             "document this project does not own loses comments and ordering. Edit the url in "
             "place, or run with --print and merge the block yourself."
         )
-    existing = plan.config_path.read_bytes() if plan.config_path.is_file() else b""
-    candidate = existing + _line_separated_appendix(existing, plan.block)
+    existing = _read_optional_bytes(plan.config_path)
+    candidate = (existing or b"") + _line_separated_appendix(existing or b"", plan.block)
     try:
         tomllib.loads(candidate.decode("utf-8"))
     except (UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
@@ -269,7 +287,7 @@ def _write_codex(plan: ClientPlan, *, force: bool) -> None:
             "The file is untouched. Repair the conflicting entry, or run with --print and "
             "merge the block yourself."
         ) from exc
-    _write_preserving_identity(plan.config_path, candidate)
+    _write_preserving_identity(plan.config_path, candidate, expected=existing)
 
 
 def _line_separated_appendix(existing: bytes, block: str) -> bytes:
@@ -287,7 +305,7 @@ def _line_separated_appendix(existing: bytes, block: str) -> bytes:
     return newline + newline + encoded
 
 
-def _write_preserving_identity(path: Path, data: bytes) -> None:
+def _write_preserving_identity(path: Path, data: bytes, *, expected: bytes | None) -> None:
     """Write bytes to a path while keeping everything about the file that is not content.
 
     Five review rounds chased metadata off the edge of a rename: the permission
@@ -327,23 +345,77 @@ def _write_preserving_identity(path: Path, data: bytes) -> None:
     """
     _require_writable_target(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    # Exclusive creation when the file is absent, so a path that appears between
-    # the check and the open is a refusal rather than a silent overwrite.
-    mode = "r+b" if path.exists() else "xb"
-    try:
-        with path.open(mode) as stream:
-            stream.seek(0)
-            stream.write(data)
-            stream.truncate()
-            stream.flush()
-            os.fsync(stream.fileno())
-    except OSError as exc:
-        raise ClientConfigError(f"{path} could not be written: {exc}") from exc
+    if expected is None:
+        _create_exclusively(path, data)
+    else:
+        _rewrite_unchanged(path, data, expected)
     landed = path.read_bytes()
     if landed != data:
         raise ClientConfigError(
             f"{path} holds {len(landed)} bytes after a {len(data)}-byte write; "
             "the file system did not store what was written"
+        )
+
+
+def _create_exclusively(path: Path, data: bytes) -> None:
+    """Create the file, refusing if anything already occupies the name.
+
+    The caller found no file and built its content on that basis. Asking again
+    whether the path exists would let a file created in between be adopted and
+    overwritten; creating exclusively makes that a refusal instead, including
+    when the newcomer is a hard link to somebody else's file.
+    """
+    try:
+        with path.open("xb") as stream:
+            _store(stream, data)
+    except FileExistsError as exc:
+        raise ClientConfigError(
+            f"{path} appeared after Engram read the directory and found nothing there, so the "
+            "block was prepared against a state that no longer holds. Nothing was written; "
+            "run the command again."
+        ) from exc
+    except OSError as exc:
+        raise ClientConfigError(f"{path} could not be created: {exc}") from exc
+
+
+def _rewrite_unchanged(path: Path, data: bytes, expected: bytes) -> None:
+    """Rewrite the file only if it still holds the bytes the content was built from.
+
+    The content is a function of what was read. If the file changed in between,
+    writing would discard somebody else's edit without a word, so the bytes are
+    compared through the descriptor that will do the writing -- not through a
+    second look at the path, which is what let a concurrent file be adopted.
+    """
+    try:
+        stream = path.open("r+b")
+    except OSError as exc:
+        raise ClientConfigError(f"{path} could not be opened for writing: {exc}") from exc
+    with stream:
+        _require_regular_descriptor(path, stream.fileno())
+        current = stream.read()
+        if current != expected:
+            raise ClientConfigError(
+                f"{path} changed after Engram read it: it held {len(expected)} bytes and now "
+                f"holds {len(current)}. Nothing was written, so the other change is intact; "
+                "run the command again to build the block from the current file."
+            )
+        stream.seek(0)
+        _store(stream, data)
+
+
+def _store(stream: IO[bytes], data: bytes) -> None:
+    """Put the bytes in the open file and make the file system commit to them."""
+    stream.write(data)
+    stream.truncate()
+    stream.flush()
+    os.fsync(stream.fileno())
+
+
+def _require_regular_descriptor(path: Path, descriptor: int) -> None:
+    """Check the type of the object actually opened, not of the name that led to it."""
+    if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+        raise ClientConfigError(
+            f"{path} is not a regular file. Engram will not write a configuration over it."
         )
 
 

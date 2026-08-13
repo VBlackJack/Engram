@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import os
 import tomllib
 from dataclasses import replace
 from pathlib import Path
@@ -17,6 +18,7 @@ import engram.clients as clients_module
 from engram.clients import (
     ClientConfigError,
     ClientKind,
+    _read_optional_bytes,
     _render_codex_block,
     connect,
     endpoint_url,
@@ -426,3 +428,104 @@ def test_the_protocol_append_keeps_the_instructions_file_bytes(
     written = plan.instructions_path.read_bytes()
     assert written.startswith(raw)
     assert written.count(b"Engram session protocol") == 1
+
+
+def test_a_target_that_changed_after_it_was_read_is_refused(
+    app_config: AppConfig,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The content is a function of what was read, so writing it over something else loses an edit.
+
+    The bytes are compared through the descriptor that will do the writing, not
+    by looking the path up again: a second existence test reclassified the
+    situation instead of checking it.
+    """
+    plan = plan_client(ClientKind.CODEX, app_config, home=workspace)
+    plan.instructions_path.write_bytes(b"# original\n")
+    concurrent = b"# original\n# an edit from somewhere else\n"
+    genuine = _read_optional_bytes
+
+    def racing_read(path: Path) -> bytes | None:
+        seen = genuine(path)
+        if path == plan.instructions_path and seen == b"# original\n":
+            path.write_bytes(concurrent)
+        return seen
+
+    monkeypatch.setattr(clients_module, "_read_optional_bytes", racing_read)
+
+    with pytest.raises(ClientConfigError, match="changed after Engram read it"):
+        install_protocol(plan)
+
+    assert plan.instructions_path.read_bytes() == concurrent
+
+
+def test_a_file_appearing_where_none_was_found_is_refused(
+    app_config: AppConfig,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Absent is a state too: a newcomer must not be adopted and overwritten."""
+    plan = plan_client(ClientKind.CODEX, app_config, home=workspace)
+    intruder = b"# created between the read and the write\n"
+    genuine = _read_optional_bytes
+
+    def racing_read(path: Path) -> bytes | None:
+        seen = genuine(path)
+        if path == plan.instructions_path and seen is None:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(intruder)
+        return seen
+
+    monkeypatch.setattr(clients_module, "_read_optional_bytes", racing_read)
+
+    with pytest.raises(ClientConfigError, match="appeared after Engram"):
+        install_protocol(plan)
+
+    assert plan.instructions_path.read_bytes() == intruder
+
+
+def test_a_hard_link_appearing_where_none_was_found_never_reaches_its_target(
+    app_config: AppConfig,
+    workspace: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The same race, aimed: the newcomer is another name for somebody else's file."""
+    plan = plan_client(ClientKind.CODEX, app_config, home=workspace)
+    victim = tmp_path / "victim.txt"
+    victim.write_bytes(b"THIRD PARTY CONTENT\n")
+    genuine = _read_optional_bytes
+
+    def racing_read(path: Path) -> bytes | None:
+        seen = genuine(path)
+        if path == plan.instructions_path and seen is None:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            os.link(victim, path)
+        return seen
+
+    monkeypatch.setattr(clients_module, "_read_optional_bytes", racing_read)
+
+    with pytest.raises(ClientConfigError, match="appeared after Engram"):
+        install_protocol(plan)
+
+    assert victim.read_bytes() == b"THIRD PARTY CONTENT\n"
+
+
+def test_a_configuration_written_between_planning_and_connecting_is_merged_not_replaced(
+    app_config: AppConfig,
+    workspace: Path,
+) -> None:
+    """A plan is not a promise about the file; the write reads it again and merges."""
+    plan = plan_client(ClientKind.GEMINI, app_config, home=workspace)
+    plan.config_path.parent.mkdir(parents=True, exist_ok=True)
+    plan.config_path.write_bytes(
+        b'{"theme":"dark","mcpServers":{"datacron":{"httpUrl":"http://x/mcp"}}}'
+    )
+
+    connect(plan, force=False)
+
+    document = json.loads(plan.config_path.read_bytes())
+    assert document["theme"] == "dark"
+    assert document["mcpServers"]["datacron"] == {"httpUrl": "http://x/mcp"}
+    assert document["mcpServers"]["engram"]["httpUrl"] == endpoint_url(app_config)
