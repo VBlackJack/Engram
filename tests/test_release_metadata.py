@@ -158,3 +158,30 @@ def test_the_release_tag_pattern_accepts_the_declared_version() -> None:
     assert fnmatch(f"v{__version__}", expression), (
         f"the release workflow would not build a tag for v{__version__}"
     )
+
+
+def test_every_packaged_resource_is_declared_as_package_data() -> None:
+    """A data file the wheel does not carry is one an installed Engram cannot read.
+
+    The starting configuration lived at the repository root, so MANIFEST.in
+    carried it into the source archive and nothing carried it into the wheel: an
+    installation that was not a checkout refused to start and named a file the
+    user had no way to obtain. Declaring the package is what fixed it, and
+    nothing else would notice its removal.
+    """
+    root = Path(__file__).resolve().parent.parent
+    pyproject = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
+    declared = pyproject["tool"]["setuptools"]["package-data"]["engram.resources"]
+    suffixes = {pattern.removeprefix("*") for pattern in declared}
+    shipped = sorted(
+        path
+        for path in (root / "src" / "engram" / "resources").iterdir()
+        if path.is_file() and path.suffix != ".py"
+    )
+
+    assert shipped, "the resources package holds no data file"
+    for path in shipped:
+        assert path.suffix in suffixes, (
+            f"{path.name} lives in engram.resources but no package-data pattern carries it "
+            "into the wheel"
+        )
