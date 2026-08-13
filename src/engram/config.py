@@ -412,7 +412,10 @@ def load_config(
         selected_path = environment.get(f"{ENV_PREFIX}CONFIG", str(DEFAULT_CONFIG_PATH))
     config_path = Path(selected_path).expanduser().resolve()
     if not config_path.is_file():
-        raise ConfigError(f"Configuration file does not exist: {config_path}")
+        raise ConfigError(
+            f"Configuration file does not exist: {config_path}. "
+            "Run 'engram init' to write a starting configuration there."
+        )
 
     try:
         with config_path.open("rb") as config_file:
@@ -690,7 +693,10 @@ def load_preflight_config(
         selected_path = environment.get(f"{ENV_PREFIX}CONFIG", str(DEFAULT_CONFIG_PATH))
     config_path = Path(selected_path).expanduser().resolve()
     if not config_path.is_file():
-        raise ConfigError(f"Configuration file does not exist: {config_path}")
+        raise ConfigError(
+            f"Configuration file does not exist: {config_path}. "
+            "Run 'engram init' to write a starting configuration there."
+        )
     try:
         with config_path.open("rb") as config_file:
             raw = tomllib.load(config_file)

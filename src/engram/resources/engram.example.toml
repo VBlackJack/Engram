@@ -1,0 +1,69 @@
+[database]
+path = "engram.db"
+busy_timeout_ms = 5000
+
+[ttl_days]
+preference = 0
+decision = 0
+fact = 0
+project_state = 30
+episode = 7
+
+[limits]
+max_statement_chars = 2000
+max_subject_keys = 8
+
+[logging]
+path = "logs/engram.log"
+file_level = "INFO"
+console_level = "INFO"
+
+[attestation]
+default_actor = "local-operator"
+
+[server]
+host = "127.0.0.1"
+port = 8377
+path = "/mcp"
+write_wait_timeout_ms = 2000
+ttl_sweep_interval_seconds = 60
+# Hard ceiling: 524288 bytes. Lower values are allowed for constrained deployments.
+max_request_body_bytes = 524288
+
+[capsule]
+default_token_budget = 4800
+min_token_budget = 1200
+max_token_budget = 6000
+
+[retrieval]
+mode = "fts"
+# Hard-bounded lexical query and SQL result limits.
+fts_top_k = 64
+fts_max_query_chars = 1024
+fts_max_query_terms = 24
+fts_min_prefix_chars = 4
+# Absolute deadline shared by phrase, AND, OR, and prefix stages.
+fts_query_timeout_ms = 250
+hybrid_max_candidates = 4096
+embeddings_endpoint = "http://127.0.0.1:1234/v1/embeddings"
+# Reference: nomic-embed-text-v1.5. Alternative: bge-m3.
+embeddings_model = ""
+embeddings_timeout_ms = 3000
+rrf_k = 60
+
+[datacron]
+command = "datacron"
+args = ["mcp", "serve"]
+# Empty vault/read values inherit the Datacron server environment.
+# An empty write_paths always disables writes, even if the parent environment allows them.
+vault_root = ""
+read_paths = []
+write_paths = []
+new_note_directory = "_memory/engram"
+# Accepted range: 1..64. Search also caps single-term query variants at 8.
+neighbor_limit = 8
+# Operation wait budgets. Keep the default 5000 ms shutdown budget for the pinned MCP stdio
+# process-tree cleanup unless the transport guarantee is revalidated.
+startup_timeout_ms = 10000
+request_timeout_ms = 30000
+shutdown_timeout_ms = 5000

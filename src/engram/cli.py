@@ -15,6 +15,7 @@ import socket
 import sqlite3
 import sys
 import threading
+import time
 from collections.abc import Mapping
 from datetime import date, datetime
 from pathlib import Path
@@ -33,6 +34,7 @@ from .autostart import (
     install,
     is_installed,
     registered_command,
+    request_stop,
     resolve_conflicts,
     stop_requested,
     uninstall,
@@ -78,6 +80,7 @@ from .process_lock import (
     DatabaseLockRole,
     DatabaseProcessLock,
 )
+from .resources import example_config_text
 from .retrieval import HybridRetriever, VectorRebuildError, build_retriever
 from .server import create_mcp_server
 from .store import EngramReader, EngramStore, StoreBusyError, StoreValidationError
@@ -93,6 +96,13 @@ DEBUG_TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
 WINDOWS_ADDRESS_IN_USE = getattr(errno, "WSAEADDRINUSE", 10048)
 STOP_WATCH_INTERVAL_SECONDS = 0.5
 STOP_WATCH_JOIN_TIMEOUT_SECONDS = 5.0
+# A clean stop closes the last SQLite connection, which is what removes the
+# write-ahead log. Waiting for that is the point of the command, so the budget
+# is generous enough to cover a daemon finishing a request.
+STOP_COMMAND_TIMEOUT_SECONDS = 30.0
+# Commands that must run before a configuration exists, or in spite of one that
+# does not load. Everything else is dispatched with a loaded configuration.
+CONFIGLESS_COMMANDS = frozenset({"init"})
 
 
 class ServerBindError(OSError):
@@ -107,6 +117,10 @@ class UpgradePreflightError(RuntimeError):
     """Raised when a read-only upgrade check finds incompatible persisted data."""
 
 
+class DaemonStopError(RuntimeError):
+    """Raised when the daemon cannot be asked to stop, or does not stop in time."""
+
+
 def main() -> None:
     """Parse one supported command and execute its isolated workflow."""
     parser = _build_parser()
@@ -115,6 +129,11 @@ def main() -> None:
     logger: logging.Logger | None = None
     try:
         config_path = _resolve_config_path(arguments.config)
+        # A first run has no configuration to load, and a diagnosis whose first
+        # act is to fail on the file it exists to inspect explains nothing.
+        if arguments.command in CONFIGLESS_COMMANDS:
+            _dispatch_configless(arguments, config_path=config_path)
+            return
         # An explicit path is forwarded; otherwise the loader applies its own
         # default resolution, which stays the single definition of that default.
         selected = () if arguments.config is None else (config_path,)
@@ -136,6 +155,7 @@ def main() -> None:
         DatabaseLockError,
         DatacronGatewayError,
         ConsolidationApplyError,
+        DaemonStopError,
         UpgradePreflightError,
         EvaluationGateError,
         VectorRebuildError,
@@ -171,7 +191,20 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     commands = parser.add_subparsers(dest="command", required=True)
+    initialize = commands.add_parser(
+        "init",
+        help="Write a starting configuration where Engram will look for it",
+    )
+    initialize.add_argument(
+        "--force",
+        action="store_true",
+        help="Replace an existing configuration file instead of refusing",
+    )
     commands.add_parser("serve", help="Run the streamable HTTP MCP server")
+    commands.add_parser(
+        "stop",
+        help="Ask the running daemon to close the database and exit, and verify it did",
+    )
     commands.add_parser("migrate", help="Migrate and validate storage offline")
     commands.add_parser(
         "preflight",
@@ -381,6 +414,8 @@ def _dispatch(  # noqa: C901, PLR0912
     """Execute one parsed command."""
     if arguments.command == "serve":
         _serve(config=config, logger=logger)
+    elif arguments.command == "stop":
+        _stop(config=config, logger=logger)
     elif arguments.command == "migrate":
         _migrate(config=config, logger=logger)
     elif arguments.command == "preflight":
@@ -587,6 +622,77 @@ def _ensure_server_bind_available(host: str, port: int) -> None:
             raise ServerBindError(
                 f"Cannot bind Engram to {host}:{port}: {reason}; verify server.host and server.port"
             ) from exc
+
+
+def _stop(*, config: AppConfig, logger: logging.Logger) -> None:
+    """Ask the daemon that owns this database to stop, and verify that it did.
+
+    A daemon started without a console can receive no console control event, so
+    the only way to ask it to stop is a sentinel beside its database. Building
+    that path by hand was the documented procedure, and the path the
+    documentation published matched no shipped configuration, so the request was
+    written where nothing was watching and the command looked like it worked.
+    Resolving the path from the configuration the daemon itself loaded removes
+    that possibility, and waiting on the ownership lock turns the answer into a
+    measurement rather than an assumption.
+    """
+    owner = database_ownership(config)
+    if not owner.locked:
+        _write_json({"requested": False, "stopped": True, "pid": None})
+        return
+    if not owner.daemon_running:
+        raise DaemonStopError(
+            f"The database is held by an offline writer (pid {owner.pid}), not by a daemon; "
+            "wait for it to finish"
+        )
+    request_stop(config.database.path)
+    logger.info("Stop requested for the daemon owning %s", config.database.path)
+    deadline = time.monotonic() + STOP_COMMAND_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        if not database_ownership(config).locked:
+            _write_json({"requested": True, "stopped": True, "pid": owner.pid})
+            return
+        time.sleep(STOP_WATCH_INTERVAL_SECONDS)
+    raise DaemonStopError(
+        f"The daemon (pid {owner.pid}) still holds the database "
+        f"{STOP_COMMAND_TIMEOUT_SECONDS:.0f} seconds after the stop request. "
+        "The request stays in place and it will be honoured when the daemon can; "
+        "inspect the log before terminating the process, which leaves the write-ahead log behind"
+    )
+
+
+def _dispatch_configless(arguments: argparse.Namespace, *, config_path: Path) -> None:
+    """Execute the commands that run without a loaded configuration."""
+    if arguments.command == "init":
+        _init(config_path, force=bool(arguments.force))
+
+
+def _init(config_path: Path, *, force: bool) -> None:
+    """Write the starting configuration where the loader will look for it.
+
+    The first documented step used to be a shell copy of a file that exists only
+    in a checkout, guarded by two lines that do not stop the copy when the block
+    is pasted into a live session. Writing it from the package removes the
+    checkout, the shell, and the guard that did not guard.
+    """
+    if config_path.exists() and not force:
+        raise ConfigError(
+            f"Configuration already exists: {config_path}. "
+            "Read it, or pass --force to replace it with the starting configuration."
+        )
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(example_config_text(), encoding="utf-8")
+    # Loading what was just written proves the file the daemon will read is
+    # valid, and reports the database it resolves to rather than the one the
+    # relative path appears to name.
+    config = load_config(config_path)
+    _write_lines(
+        f"Wrote {config_path}",
+        f"Database: {config.database.path}",
+        f"Endpoint: http://{config.server.host}:{config.server.port}{config.server.path}",
+        "",
+        "Next: engram doctor",
+    )
 
 
 def _migrate(*, config: AppConfig, logger: logging.Logger) -> None:
@@ -1099,3 +1205,7 @@ def _entry_payload(entry: Entry) -> dict[str, object]:
 def _write_json(payload: object) -> None:
     serialized = json.dumps(payload, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
     sys.stdout.write(f"{serialized}\n")
+
+
+def _write_lines(*lines: str) -> None:
+    sys.stdout.write("".join(f"{line}\n" for line in lines))
