@@ -24,6 +24,7 @@ from engram.db import (
     MAX_CONSOLIDATION_SNAPSHOT_BYTES,
     DatabaseError,
     SQLiteVersionError,
+    latest_schema_version,
     open_database,
     verify_sqlite_version,
 )
@@ -304,7 +305,7 @@ def test_database_uses_wal_and_numbered_migration(
     assert foreign_keys is not None
     assert foreign_keys[0] == 1
     assert schema_version is not None
-    assert schema_version[0] == 5
+    assert schema_version[0] == latest_schema_version()
     assert schema_tables == {
         "entries_fts",
         "entry_vectors",
@@ -379,7 +380,7 @@ def test_migration_five_preserves_existing_version_four_entries(
         observations = connection.execute("SELECT count(*) FROM entry_observations").fetchone()
     finally:
         connection.close()
-    assert version == (5,)
+    assert version == (latest_schema_version(),)
     assert observations == (0,)
 
 
@@ -1420,4 +1421,179 @@ def test_consolidation_plan_consumption_detects_snapshot_corruption(
         store.consume_consolidation_plan(
             created.plan_id,
             expected_hash=created.snapshot_hash,
+        )
+
+
+def test_attesting_a_candidate_restarts_the_lifetime_at_the_attestation(
+    store: EngramStore,
+    clock: MutableClock,
+    app_config: AppConfig,
+) -> None:
+    """A human attestation must not inherit the clock a model's guess was given.
+
+    Promoting in place kept the candidate's expiry, so an attestation made shortly
+    before that expiry lived only the remainder and then vanished from recall,
+    while the same attestation made with no candidate present lived the full term.
+    """
+    candidate = store.add_candidate(
+        kind="episode",
+        scope="user",
+        statement="The release rehearsal completed.",
+        writer_model="client-a/1.0",
+        subject_keys=("release",),
+    )
+    assert candidate.expires_at is not None
+    clock.current = candidate.expires_at - timedelta(minutes=30)
+
+    attested = store.add_attested(
+        kind="episode",
+        scope="user",
+        statement="The release rehearsal completed.",
+        source_type=SourceType.HUMAN,
+    )
+
+    assert attested.id == candidate.id
+    assert attested.expires_at is not None
+    lifetime = timedelta(days=app_config.ttl_days.for_kind(EntryKind.EPISODE))
+    assert attested.expires_at == clock.current + lifetime
+    assert attested.expires_at > candidate.expires_at
+
+
+def test_attesting_a_candidate_leaves_a_kind_without_expiry_unexpiring(
+    store: EngramStore,
+    clock: MutableClock,
+) -> None:
+    """Restarting the clock must not invent one for a kind configured never to expire."""
+    store.add_candidate(
+        kind="fact",
+        scope="user",
+        statement="The endpoint is loopback only.",
+        writer_model="client-a/1.0",
+    )
+    clock.current += timedelta(days=1)
+
+    attested = store.add_attested(
+        kind="fact",
+        scope="user",
+        statement="The endpoint is loopback only.",
+        source_type=SourceType.HUMAN,
+        claim_key="endpoint/binding",
+    )
+
+    assert attested.expires_at is None
+
+
+def test_re_attesting_trusted_content_with_new_metadata_is_refused(
+    store: EngramStore,
+) -> None:
+    """Nothing can amend a trusted entry's metadata, so accepting it dropped it silently."""
+    store.add_attested(
+        kind="fact",
+        scope="user",
+        statement="Retention is thirty days.",
+        source_type=SourceType.HUMAN,
+        subject_keys=("retention",),
+        claim_key="retention/days",
+    )
+
+    with pytest.raises(StoreValidationError, match="subject_keys"):
+        store.add_attested(
+            kind="fact",
+            scope="user",
+            statement="Retention is thirty days.",
+            source_type=SourceType.HUMAN,
+            subject_keys=("retention", "policy"),
+            claim_key="retention/days",
+        )
+
+    stored = store.get_entry(store.list_entries()[0].id)
+    assert stored is not None
+    assert stored.subject_keys == ("retention",)
+
+
+def test_re_attesting_identical_trusted_content_is_still_a_no_op(
+    store: EngramStore,
+) -> None:
+    """The refusal is about divergence; an identical repeat must stay idempotent."""
+    first = store.add_attested(
+        kind="fact",
+        scope="user",
+        statement="Retention is thirty days.",
+        source_type=SourceType.HUMAN,
+        subject_keys=("retention",),
+        claim_key="retention/days",
+    )
+
+    second = store.add_attested(
+        kind="fact",
+        scope="user",
+        statement="Retention is thirty days.",
+        source_type=SourceType.HUMAN,
+        subject_keys=("retention",),
+        claim_key="retention/days",
+    )
+
+    assert second.id == first.id
+    assert store.count_entries() == 1
+
+
+def test_corroborating_with_extra_subject_keys_makes_them_searchable(
+    store: EngramStore,
+) -> None:
+    """A key added to make a memory findable has to actually make it findable.
+
+    The corroborating keys were recorded in the observation only, which nothing
+    reads, so the entry and the lexical index kept the original set.
+    """
+    first = store.add_candidate(
+        kind="fact",
+        scope="user",
+        statement="The retriever warms its cache on the first call.",
+        writer_model="client-a/1.0",
+        subject_keys=("retriever",),
+    )
+    assert store.search_fts("coldstart", scope=None, kinds=None, writer_model="client-a/1.0") == ()
+
+    corroborated = store.add_candidate(
+        kind="fact",
+        scope="user",
+        statement="The retriever warms its cache on the first call.",
+        writer_model="client-a/1.0",
+        subject_keys=("retriever", "coldstart"),
+        include_outcome=True,
+    )
+
+    assert corroborated.entry.id == first.id
+    assert corroborated.idempotent is False
+    assert corroborated.outcome is RememberOutcome.CORROBORATED
+    assert corroborated.entry.subject_keys == ("retriever", "coldstart")
+    assert [
+        entry.id
+        for entry in store.search_fts(
+            "coldstart", scope=None, kinds=None, writer_model="client-a/1.0"
+        )
+    ] == [first.id]
+
+
+def test_corroboration_refuses_to_exceed_the_configured_subject_key_limit(
+    store: EngramStore,
+    app_config: AppConfig,
+) -> None:
+    """Dropping the overflow would be the same silent loss one level along."""
+    limit = app_config.limits.max_subject_keys
+    store.add_candidate(
+        kind="fact",
+        scope="user",
+        statement="The index is rebuilt on demand.",
+        writer_model="client-a/1.0",
+        subject_keys=tuple(f"key-{index}" for index in range(limit)),
+    )
+
+    with pytest.raises(StoreValidationError, match="above the configured limit"):
+        store.add_candidate(
+            kind="fact",
+            scope="user",
+            statement="The index is rebuilt on demand.",
+            writer_model="client-a/1.0",
+            subject_keys=("key-0", "one-key-too-many"),
         )

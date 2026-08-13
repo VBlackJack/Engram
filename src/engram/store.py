@@ -1660,6 +1660,11 @@ class EngramStore:
                             subject_keys=normalized_subject_keys,
                             evidence=normalized_evidence,
                         )
+                        existing = self._widen_subject_keys(
+                            row=own_row,
+                            existing=existing,
+                            incoming=normalized_subject_keys,
+                        )
                         self._append_audit(
                             ts=now,
                             actor=actor,
@@ -1668,6 +1673,7 @@ class EngramStore:
                             detail={
                                 "canonical_key": canonical_key,
                                 "writer_model": writer_model,
+                                "subject_keys": list(existing.subject_keys),
                             },
                         )
                         return existing, False, RememberOutcome.CORROBORATED
@@ -1801,6 +1807,16 @@ class EngramStore:
                 existing = self._materialize_entry(refreshed_row)
                 audit_action = AuditAction.ATTEST
             else:
+                _require_attestation_adds_nothing(
+                    existing,
+                    source_type=source_type,
+                    confidence=confidence,
+                    observed_at=observed_at,
+                    valid_from=valid_from,
+                    valid_until=valid_until,
+                    subject_keys=subject_keys,
+                    evidence=evidence,
+                )
                 audit_action = AuditAction.IDEMPOTENT_NOOP
             self._append_audit(
                 ts=now,
@@ -1841,6 +1857,7 @@ class EngramStore:
             valid_from=valid_from,
             valid_until=valid_until,
             evidence=evidence,
+            now=now,
         )
         self._append_audit(
             ts=now,
@@ -2135,6 +2152,53 @@ class EngramStore:
         ).fetchone()
         return row is not None
 
+    def _widen_subject_keys(
+        self,
+        *,
+        row: sqlite3.Row,
+        existing: Entry,
+        incoming: tuple[str, ...],
+    ) -> Entry:
+        """Attach the corroborating keys to the entry, so they can be searched.
+
+        A second remember from the same writer carrying extra subject keys
+        reported `corroborated` and recorded those keys in the observation only.
+        Nothing reads them from there: the entry kept its original keys, the
+        lexical index kept them too, and the key the caller added to make the
+        memory findable never made it findable. Measured: `coldstart` added on a
+        corroboration returned zero hits.
+
+        The union is written instead. Keys are discovery hints rather than
+        identity, and the writer already owns this candidate, so widening its own
+        hints changes nothing about what the entry claims. A union that would
+        exceed the configured maximum is refused rather than truncated, because
+        dropping the overflow is the same silent loss one level along.
+        """
+        merged = tuple(dict.fromkeys((*existing.subject_keys, *incoming)))
+        if merged == existing.subject_keys:
+            return existing
+        limit = self._config.limits.max_subject_keys
+        if len(merged) > limit:
+            raise StoreValidationError(
+                f"Corroboration would give the entry {len(merged)} subject keys, above the "
+                f"configured limit of {limit}; remember it with fewer keys, or attest a "
+                "replacement"
+            )
+        encoded = _encode_json(list(merged))
+        self._delete_fts_row(row)
+        self._connection.execute(
+            "UPDATE entries SET subject_keys = ? WHERE id = ?",
+            (encoded, existing.id),
+        )
+        self._connection.execute(
+            "INSERT INTO entries_fts(rowid, statement, subject_keys) VALUES (?, ?, ?)",
+            (int(row["entry_rowid"]), existing.statement, encoded),
+        )
+        widened_row = self._fetch_entry_row(existing.id)
+        if widened_row is None:  # pragma: no cover - protected by the transaction
+            raise RuntimeError("Corroborated entry disappeared")
+        return self._materialize_entry(widened_row)
+
     def _attest_existing_candidate(  # noqa: PLR0913
         self,
         *,
@@ -2148,8 +2212,22 @@ class EngramStore:
         valid_from: date | None,
         valid_until: date | None,
         evidence: tuple[Evidence, ...],
+        now: datetime,
     ) -> Entry:
-        """Promote matching canonical candidate content without duplicating its identity."""
+        """Promote matching canonical candidate content without duplicating its identity.
+
+        The lifetime restarts here. A candidate carries the short expiry its kind
+        gives a model's guess, and promoting it in place used to leave that clock
+        running: a human attestation made half an hour before the candidate was
+        due inherited half an hour of life, then expired and disappeared from
+        recall. Measured on both kinds that expire -- episode and project_state --
+        against the same attestation made with no candidate present, which lived
+        the full term. `recorded_at` deliberately stays as it was, because it
+        records when the content was first seen rather than when it was trusted,
+        so the recomputed expiry is no longer `recorded_at` plus the lifetime.
+        """
+        ttl_days = self._config.ttl_days.for_kind(existing.kind)
+        expires_at = None if ttl_days == 0 else now + timedelta(days=ttl_days)
         updated_subject_keys = subject_keys or existing.subject_keys
         updated_evidence = evidence or existing.evidence
         updated_observed_at = observed_at or existing.observed_at
@@ -2163,7 +2241,7 @@ class EngramStore:
             UPDATE entries
             SET subject_keys = ?, status = ?, promotion_state = ?, source_type = ?,
                 writer_model = NULL, confidence = ?, observed_at = ?, valid_from = ?,
-                valid_until = ?, evidence = ?, claim_key = ?
+                valid_until = ?, expires_at = ?, evidence = ?, claim_key = ?
             WHERE id = ?
             """,
             (
@@ -2175,6 +2253,7 @@ class EngramStore:
                 _format_optional_datetime(updated_observed_at),
                 None if updated_valid_from is None else updated_valid_from.isoformat(),
                 None if updated_valid_until is None else updated_valid_until.isoformat(),
+                _format_optional_datetime(expires_at),
                 _encode_evidence(updated_evidence),
                 claim_key,
                 existing.id,
@@ -2705,6 +2784,51 @@ def _validate_stored_entry(
 def _require_equal(actual: object, expected: object, message: str) -> None:
     if actual != expected:
         raise StoreValidationError(message)
+
+
+def _require_attestation_adds_nothing(  # noqa: PLR0913
+    existing: Entry,
+    *,
+    source_type: SourceType,
+    confidence: Confidence,
+    observed_at: datetime | None,
+    valid_from: date | None,
+    valid_until: date | None,
+    subject_keys: tuple[str, ...],
+    evidence: tuple[Evidence, ...],
+) -> None:
+    """Refuse a re-attestation whose metadata this entry cannot be given.
+
+    Attesting content that already has an active trusted entry returned that
+    entry and reported success while every field the caller supplied was dropped:
+    different subject keys, a different confidence, new evidence, a different
+    validity window. Nothing recorded the loss either, because the audit row is
+    content-free, and nothing could undo it -- no path updates a trusted entry's
+    metadata in place, deliberately, since attested content is not rewritten
+    without history.
+
+    So the honest answer is a refusal that names what differs. The caller who
+    genuinely wants different metadata supersedes the entry, which keeps both
+    generations.
+    """
+    differing = sorted(
+        name
+        for name, matches in (
+            ("source_type", existing.source_type is source_type),
+            ("confidence", existing.confidence is confidence),
+            ("observed_at", existing.observed_at == observed_at),
+            ("valid_from", existing.valid_from == valid_from),
+            ("valid_until", existing.valid_until == valid_until),
+            ("subject_keys", existing.subject_keys == subject_keys),
+            ("evidence", existing.evidence == evidence),
+        )
+        if not matches
+    )
+    if differing:
+        raise StoreValidationError(
+            "Canonical trusted content already exists with different "
+            f"{', '.join(differing)}; supersede it instead of re-attesting"
+        )
 
 
 def _entry_matches_observation(  # noqa: PLR0913

@@ -47,7 +47,12 @@ from engram.cli import (
 )
 from engram.config import AppConfig, ConfigError, load_config
 from engram.consolidation.gateway import DatacronGatewayError
-from engram.db import MAX_SQLITE_VALUE_BYTES, DatabaseError, SQLiteVersionError
+from engram.db import (
+    MAX_SQLITE_VALUE_BYTES,
+    DatabaseError,
+    SQLiteVersionError,
+    latest_schema_version,
+)
 from engram.logging_setup import FileLogger
 from engram.models import (
     AuditAction,
@@ -429,7 +434,7 @@ def test_migrate_inventory_and_classify_are_retry_safe(
     first_migration = json.loads(capsys.readouterr().out)
     _migrate(config=app_config, logger=logger)
     second_migration = json.loads(capsys.readouterr().out)
-    assert first_migration == second_migration == {"schema_version": 5}
+    assert first_migration == second_migration == {"schema_version": latest_schema_version()}
 
     _list_entries(config=app_config, unclassified=True)
     inventory = json.loads(capsys.readouterr().out)
@@ -509,7 +514,7 @@ def test_preflight_validates_compatible_database_without_writing(
 
     payload = json.loads(capsys.readouterr().out)
     assert payload["compatible"] is True
-    assert payload["schema_version"] == 5
+    assert payload["schema_version"] == latest_schema_version()
     assert app_config.database.path.read_bytes() == before
 
 
@@ -600,7 +605,7 @@ def test_preflight_accepts_v4_with_missing_derived_indexes(
         "compatible": True,
         "database": str(app_config.database.path),
         "schema_version": 4,
-        "target_schema_version": 5,
+        "target_schema_version": latest_schema_version(),
         "fts_rebuild_required": True,
         "vector_rebuild_required": True,
     }
