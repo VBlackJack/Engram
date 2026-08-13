@@ -56,6 +56,12 @@ from .normalization import (
 
 LOGGER = logging.getLogger(__name__)
 MINIMUM_SQLITE_VERSION = (3, 51, 3)
+# A refusal has to be actionable for someone who installed a wheel and has no
+# checkout, so it names a document that can be opened rather than a repository
+# path that only exists for contributors.
+WINDOWS_SQLITE_GUIDE_URL = (
+    "https://github.com/VBlackJack/Engram/blob/main/docs/en/installation-windows.md"
+)
 SQLITE_VERSION_COMPONENTS = 3
 LIFECYCLE_SCHEMA_VERSION = 5
 MINIMUM_PREFLIGHT_SCHEMA_VERSION = 3
@@ -915,7 +921,8 @@ def verify_sqlite_version(
             "SQLite "
             f"{minimum_text} or newer is required; found {actual_text}. "
             "Older runtimes are rejected because they do not contain the WAL-reset bug fix. "
-            "See docs/en/installation-windows.md for supported Windows installation steps."
+            "Run 'engram doctor' for the repair that applies to this machine, or see "
+            f"{WINDOWS_SQLITE_GUIDE_URL} for the Windows installation steps."
         )
 
 

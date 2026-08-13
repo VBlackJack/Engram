@@ -63,6 +63,7 @@ from .db import (
     latest_schema_version,
     preflight_database,
 )
+from .doctor import Outcome, diagnose, worst_outcome
 from .eval.gate import EvaluationGateError
 from .eval.models import EvalMode
 from .eval.runner import run_evaluation
@@ -102,7 +103,15 @@ STOP_WATCH_JOIN_TIMEOUT_SECONDS = 5.0
 STOP_COMMAND_TIMEOUT_SECONDS = 30.0
 # Commands that must run before a configuration exists, or in spite of one that
 # does not load. Everything else is dispatched with a loaded configuration.
-CONFIGLESS_COMMANDS = frozenset({"init"})
+CONFIGLESS_COMMANDS = frozenset({"init", "doctor"})
+# A diagnosis is read by someone who is stuck, so the verdict has to be
+# legible at a glance before any of the detail is.
+DOCTOR_MARKS = {Outcome.OK: "[ ok ]", Outcome.WARN: "[warn]", Outcome.FAIL: "[fail]"}
+DOCTOR_VERDICTS = {
+    Outcome.OK: "Engram is ready.",
+    Outcome.WARN: "Engram can run, but something above needs attention.",
+    Outcome.FAIL: "Engram cannot run until the failures above are repaired.",
+}
 
 
 class ServerBindError(OSError):
@@ -199,6 +208,16 @@ def _build_parser() -> argparse.ArgumentParser:
         "--force",
         action="store_true",
         help="Replace an existing configuration file instead of refusing",
+    )
+    doctor = commands.add_parser(
+        "doctor",
+        help="Report why Engram is not working, and what repairs each finding",
+    )
+    doctor.add_argument(
+        "--json",
+        action="store_true",
+        dest="as_json",
+        help="Emit the checks as one JSON document instead of readable lines",
     )
     commands.add_parser("serve", help="Run the streamable HTTP MCP server")
     commands.add_parser(
@@ -665,6 +684,45 @@ def _dispatch_configless(arguments: argparse.Namespace, *, config_path: Path) ->
     """Execute the commands that run without a loaded configuration."""
     if arguments.command == "init":
         _init(config_path, force=bool(arguments.force))
+    elif arguments.command == "doctor":
+        _doctor(config_path, as_json=bool(arguments.as_json))
+
+
+def _doctor(config_path: Path, *, as_json: bool) -> None:
+    """Report every measurable fact about this installation, and repair each one.
+
+    The command exits non-zero on a failure so a script can gate on it, but the
+    answer is the report rather than the code: a diagnosis that stopped at the
+    first problem would hide the second, and the second is often the one that
+    explains the first.
+    """
+    checks = diagnose(config_path)
+    if as_json:
+        _write_json(
+            {
+                "outcome": worst_outcome(checks).value,
+                "checks": [
+                    {
+                        "name": check.name,
+                        "outcome": check.outcome.value,
+                        "detail": check.detail,
+                        "remedy": check.remedy,
+                    }
+                    for check in checks
+                ],
+            }
+        )
+    else:
+        lines: list[str] = []
+        for check in checks:
+            lines.append(f"{DOCTOR_MARKS[check.outcome]} {check.name}: {check.detail}")
+            if check.remedy is not None:
+                lines.append(f"    -> {check.remedy}")
+        lines.append("")
+        lines.append(DOCTOR_VERDICTS[worst_outcome(checks)])
+        _write_lines(*lines)
+    if worst_outcome(checks) is Outcome.FAIL:
+        raise SystemExit(EXIT_USAGE_OR_CONFIG)
 
 
 def _init(config_path: Path, *, force: bool) -> None:
