@@ -148,13 +148,20 @@ def _hard_limit_config(app_config: AppConfig) -> AppConfig:
 
 
 def test_public_argument_schemas_publish_every_hard_input_limit(app_config: AppConfig) -> None:
+    """The published bounds are the ones this server enforces, not the ones it may be given.
+
+    `statement` and `subject_keys` are configurable, so they are published from
+    the configuration: advertising the hard ceiling made a client compose calls
+    the server then refused, on exactly the long rationales worth keeping. Every
+    other bound here is fixed, so its published value is the constant.
+    """
     schemas = publish_tool_schemas(app_config)
     remember_properties = schemas["remember"]["properties"]
     recall_properties = schemas["recall"]["properties"]
 
-    assert remember_properties["statement"]["maxLength"] == HARD_MAX_STATEMENT_CHARS
+    assert remember_properties["statement"]["maxLength"] == app_config.limits.max_statement_chars
     assert remember_properties["scope"]["maxLength"] == MAX_SCOPE_CHARS
-    assert remember_properties["subject_keys"]["maxItems"] == HARD_MAX_SUBJECT_KEYS
+    assert remember_properties["subject_keys"]["maxItems"] == app_config.limits.max_subject_keys
     assert remember_properties["subject_keys"]["items"]["maxLength"] == MAX_SUBJECT_KEY_CHARS
     assert remember_properties["evidence"]["maxItems"] == MAX_EVIDENCE_ITEMS
     assert remember_properties["evidence"]["items"]["properties"]["ref"]["maxLength"] == (

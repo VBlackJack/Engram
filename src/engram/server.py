@@ -511,8 +511,41 @@ def _strict_tool(  # noqa: PLR0913
 def publish_tool_schemas(config: AppConfig) -> dict[str, dict[str, Any]]:
     """Return the exact argument schemas both tools publish under one configuration."""
     return {
-        REMEMBER_TOOL: _publish_schema(RememberArguments, EMPTY_SCHEMA_OVERRIDES),
+        REMEMBER_TOOL: _publish_schema(RememberArguments, _remember_schema_overrides(config)),
         RECALL_TOOL: _publish_schema(RecallArguments, _recall_schema_overrides(config)),
+    }
+
+
+def _remember_schema_overrides(config: AppConfig) -> Mapping[str, Mapping[str, object]]:
+    """Publish the input bounds this server enforces, not the ones it could be given.
+
+    The argument models carry the hard ceilings, which are the maximum any
+    configuration may set rather than the limit this installation applies. A
+    client reading the schema alone -- which is the whole point of MCP, and what
+    Claude, Codex and Gemini all do -- therefore composed calls the server then
+    refused: measured against the shipped limits, 1999 characters accepted and
+    2001, 4000 and 16384 all refused while the schema advertised 16384. The
+    failure lands on exactly the memories worth keeping, the long rationale and
+    the richly tagged fact.
+
+    Recall already published its configured capsule bounds this way. Remember now
+    does the same, so both tools describe the server a client is talking to.
+    """
+    limits = config.limits
+    return {
+        "statement": {
+            "maxLength": limits.max_statement_chars,
+            "description": (
+                "Canonical statement to remember, at most "
+                f"{limits.max_statement_chars} characters on this server."
+            ),
+        },
+        "subject_keys": {
+            "maxItems": limits.max_subject_keys,
+            "description": (
+                f"Stable retrieval keys, at most {limits.max_subject_keys} on this server."
+            ),
+        },
     }
 
 
