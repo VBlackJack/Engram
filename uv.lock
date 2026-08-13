@@ -289,7 +289,7 @@ wheels = [
 
 [[package]]
 name = "engram-memory-broker"
-version = "2026.813.1"
+version = "2026.813.2"
 source = { editable = "." }
 dependencies = [
     { name = "httpx" },
