@@ -20,8 +20,27 @@ from mcp.server.fastmcp.exceptions import ToolError
 from mcp.server.fastmcp.tools import Tool
 from mcp.server.fastmcp.utilities.func_metadata import ArgModelBase
 from mcp.server.session import ServerSession
-from mcp.types import AnyFunction, CallToolResult, TextContent, ToolAnnotations
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, field_validator
+from mcp.types import (
+    INVALID_PARAMS,
+    INVALID_REQUEST,
+    PARSE_ERROR,
+    AnyFunction,
+    CallToolResult,
+    ErrorData,
+    JSONRPCError,
+    JSONRPCMessage,
+    JSONRPCRequest,
+    TextContent,
+    ToolAnnotations,
+)
+from pydantic import (
+    AwareDatetime,
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+)
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
@@ -56,11 +75,18 @@ from .retrieval import EntryIndexer, RetrievalRequest, Retriever, build_retrieve
 from .store import EngramStore, StoreBusyError
 
 MAX_HTTP_BODY_CHUNKS = 256
-# The media types the streamable HTTP transport requires, named here so the
-# guard in front of it cannot drift from the transport behind it.
+# The media types and refusals of the streamable HTTP transport, named here so
+# the guard in front of it cannot drift from the transport behind it.
 CONTENT_TYPE_JSON = "application/json"
 CONTENT_TYPE_SSE = "text/event-stream"
 MCP_SESSION_HEADER = b"mcp-session-id"
+INITIALIZE_METHOD = "initialize"
+MISSING_SESSION_DETAIL = "Bad Request: Missing session ID"
+NOT_ACCEPTABLE_POST_DETAIL = (
+    "Not Acceptable: Client must accept both application/json and text/event-stream"
+)
+NOT_ACCEPTABLE_STREAM_DETAIL = "Not Acceptable: Client must accept text/event-stream"
+UNSUPPORTED_MEDIA_TYPE_DETAIL = "Unsupported Media Type: Content-Type must be application/json"
 MAX_CLIENT_COMPONENT_CHARS = MAX_MCP_CLIENT_COMPONENT_CHARS
 ASCII_ZERO = ord("0")
 ASCII_NINE = ord("9")
@@ -154,28 +180,49 @@ class RememberResult(BaseModel):
 
 
 class RequestBodyLimitMiddleware:
-    """Reject oversized POST bodies before the MCP SDK buffers or parses them."""
+    """Refuse what the transport would refuse, before it can open a session.
 
-    def __init__(self, app: ASGIApp, *, max_body_bytes: int) -> None:
-        """Bind one downstream ASGI application and its byte ceiling."""
+    The SDK registers a transport in its session table, and starts the anyio task
+    behind it, for **any** request that carries no session id — whatever the
+    method, and before a single byte of the body is looked at. Only then does the
+    transport discover the request was never acceptable and answer 4xx. The
+    session stays. Measured on the 2026.813.1 build: 500 rejected requests, 500
+    live sessions, for seven distinct request shapes, and 50 more for each of GET
+    and DELETE. A daemon installed to run from logon and stay up for weeks grows
+    without bound under a misconfigured client, or under anything that can reach
+    the port.
+
+    Without a session id there is exactly one request the transport can accept:
+    a POST carrying a valid JSON-RPC ``initialize`` request. That is the rule
+    applied here, one layer earlier, using the SDK's own message model so the two
+    cannot disagree about what "valid" means. Every refusal below reproduces the
+    transport's status code, its JSON-RPC error code and its wording, so a client
+    cannot tell which layer answered. Requests carrying a session id are untouched:
+    they reach an existing transport and create nothing.
+    """
+
+    def __init__(self, app: ASGIApp, *, max_body_bytes: int, mcp_path: str) -> None:
+        """Bind one downstream ASGI application, its byte ceiling and its path."""
         self._app = app
         self._max_body_bytes = max_body_bytes
+        self._mcp_path = mcp_path
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        """Buffer one bounded POST body and replay it exactly once."""
-        if scope["type"] != "http" or scope.get("method") != "POST":
+        """Screen one request, then replay its bounded body exactly once."""
+        if scope["type"] != "http" or scope.get("path") != self._mcp_path:
             await self._app(scope, receive, send)
             return
 
         try:
-            self._validate_content_length(scope)
-            body = await self._read_body(receive)
-            if body is not None:
-                self._validate_session_opening(scope, body)
+            body = await self._screen(scope, receive)
         except _RequestBodyRejectedError as exc:
-            await self._reject(send, exc.status_code, exc.detail)
+            await self._reject(send, exc)
             return
+        except _RequestAbandonedError:
+            return
+
         if body is None:
+            await self._app(scope, receive, send)
             return
 
         replayed = False
@@ -193,42 +240,58 @@ class RequestBodyLimitMiddleware:
 
         await self._app(scope, replay_receive, send)
 
-    def _validate_session_opening(self, scope: Scope, body: bytes) -> None:
-        """Refuse a session-opening POST the transport would reject anyway.
-
-        The SDK registers a transport and starts its task before it validates
-        anything, so every rejected POST that carried no session id left a live
-        session and an anyio task behind for the lifetime of the process. Measured
-        on this build: 500 rejected requests, 500 leaked sessions. A daemon
-        installed to run from logon and stay up for weeks grows without bound
-        under a misconfigured client, or under anything that can send a request.
-
-        The checks are the transport's own, applied one layer earlier and with
-        the same status codes, so nothing the transport would have accepted is
-        refused here. Requests carrying a session id are untouched: they reach an
-        existing transport and create nothing.
-        """
+    async def _screen(self, scope: Scope, receive: Receive) -> bytes | None:
+        """Return the buffered POST body, or None when there is nothing to replay."""
         headers = {name.lower(): value for name, value in scope.get("headers", ())}
-        if MCP_SESSION_HEADER in headers:
-            return
-        accept = headers.get(b"accept", b"").decode("latin-1")
-        offered = {part.split(";")[0].strip() for part in accept.split(",")}
+        opening = MCP_SESSION_HEADER not in headers
+        if scope.get("method") != "POST":
+            if opening:
+                self._refuse_streaming_opening(scope, headers)
+            return None
+        self._validate_content_length(scope)
+        body = await self._read_body(receive)
+        if opening:
+            self._require_initialize(headers, body)
+        return body
+
+    @staticmethod
+    def _refuse_streaming_opening(scope: Scope, headers: Mapping[bytes, bytes]) -> None:
+        """Refuse a GET or DELETE that carries no session, before one is created.
+
+        Neither method can ever open a session: the transport answers 400 once it
+        finds the session id missing. A GET is checked for the event stream first,
+        exactly as the transport checks it.
+        """
+        if scope.get("method") == "GET" and CONTENT_TYPE_SSE not in _offered_media(
+            headers, b"accept"
+        ):
+            raise _RequestBodyRejectedError(406, NOT_ACCEPTABLE_STREAM_DETAIL)
+        raise _RequestBodyRejectedError(400, MISSING_SESSION_DETAIL)
+
+    @staticmethod
+    def _require_initialize(headers: Mapping[bytes, bytes], body: bytes) -> None:
+        """Refuse a session-opening POST that is not a valid initialize request."""
+        offered = _offered_media(headers, b"accept")
         if not {CONTENT_TYPE_JSON, CONTENT_TYPE_SSE} <= offered:
-            raise _RequestBodyRejectedError(
-                406,
-                "Not Acceptable: Client must accept both application/json and text/event-stream",
-            )
-        declared = headers.get(b"content-type", b"").decode("latin-1")
-        media_types = {part.strip() for part in declared.split(";")[0].split(",")}
-        if CONTENT_TYPE_JSON not in media_types:
-            raise _RequestBodyRejectedError(
-                415,
-                "Unsupported Media Type: Content-Type must be application/json",
-            )
+            raise _RequestBodyRejectedError(406, NOT_ACCEPTABLE_POST_DETAIL)
+        if CONTENT_TYPE_JSON not in _offered_media(headers, b"content-type"):
+            raise _RequestBodyRejectedError(415, UNSUPPORTED_MEDIA_TYPE_DETAIL)
         try:
-            json.loads(body)
+            raw = json.loads(body)
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise _RequestBodyRejectedError(400, "Parse error: invalid JSON") from exc
+            raise _RequestBodyRejectedError(
+                400, f"Parse error: {exc}", error_code=PARSE_ERROR
+            ) from exc
+        try:
+            message = JSONRPCMessage.model_validate(raw)
+        except ValidationError as exc:
+            raise _RequestBodyRejectedError(
+                400, f"Validation error: {exc}", error_code=INVALID_PARAMS
+            ) from exc
+        if not (
+            isinstance(message.root, JSONRPCRequest) and message.root.method == INITIALIZE_METHOD
+        ):
+            raise _RequestBodyRejectedError(400, MISSING_SESSION_DETAIL)
 
     def _validate_content_length(self, scope: Scope) -> None:
         content_lengths = [
@@ -247,12 +310,12 @@ class RequestBodyLimitMiddleware:
         ):
             raise _RequestBodyRejectedError(413, "request body too large")
 
-    async def _read_body(self, receive: Receive) -> bytes | None:
+    async def _read_body(self, receive: Receive) -> bytes:
         body = bytearray()
         for _ in range(MAX_HTTP_BODY_CHUNKS):
             message = await receive()
             if message["type"] == "http.disconnect":
-                return None
+                raise _RequestAbandonedError
             if message["type"] != "http.request":
                 raise _RequestBodyRejectedError(400, "invalid request body")
             chunk = message.get("body", b"")
@@ -266,29 +329,46 @@ class RequestBodyLimitMiddleware:
         raise _RequestBodyRejectedError(413, "request body too large")
 
     @staticmethod
-    async def _reject(send: Send, status_code: int, detail: str) -> None:
-        body = detail.encode("utf-8")
+    async def _reject(send: Send, refusal: _RequestBodyRejectedError) -> None:
+        """Answer with the JSON-RPC error body the transport itself would send."""
+        error = JSONRPCError(
+            jsonrpc="2.0",
+            id="server-error",
+            error=ErrorData(code=refusal.error_code, message=refusal.detail),
+        )
+        body = error.model_dump_json(by_alias=True, exclude_none=True).encode("utf-8")
         await send(
             {
                 "type": "http.response.start",
-                "status": status_code,
+                "status": refusal.status_code,
                 "headers": [
                     (b"cache-control", b"no-store"),
                     (b"content-length", str(len(body)).encode("ascii")),
-                    (b"content-type", b"text/plain; charset=utf-8"),
+                    (b"content-type", CONTENT_TYPE_JSON.encode("ascii")),
                 ],
             }
         )
         await send({"type": "http.response.body", "body": body})
 
 
-class _RequestBodyRejectedError(Exception):
-    """Carry one deliberate HTTP-layer body rejection."""
+def _offered_media(headers: Mapping[bytes, bytes], name: bytes) -> set[str]:
+    """Return the media types one header offers, without their parameters."""
+    declared = headers.get(name, b"").decode("latin-1")
+    return {part.split(";")[0].strip() for part in declared.split(",")}
 
-    def __init__(self, status_code: int, detail: str) -> None:
+
+class _RequestBodyRejectedError(Exception):
+    """Carry one deliberate HTTP-layer refusal, with the code the SDK would use."""
+
+    def __init__(self, status_code: int, detail: str, *, error_code: int = INVALID_REQUEST) -> None:
         super().__init__(detail)
         self.status_code = status_code
         self.detail = detail
+        self.error_code = error_code
+
+
+class _RequestAbandonedError(Exception):
+    """The client disconnected before its body arrived."""
 
 
 class EngramFastMCP(FastMCP[object]):
@@ -331,6 +411,7 @@ class EngramFastMCP(FastMCP[object]):
         app.add_middleware(
             RequestBodyLimitMiddleware,
             max_body_bytes=self._engram_config.server.max_request_body_bytes,
+            mcp_path=self._engram_config.server.path,
         )
         return app
 

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "engram-memory-broker"
-version = "2026.813.1"
+version = "2026.813.2"
 description = "Local-first MCP memory broker with trust-aware recall and reviewed consolidation."
 readme = "README.en.md"
 requires-python = ">=3.13"

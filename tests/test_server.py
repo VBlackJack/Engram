@@ -759,23 +759,54 @@ def _sessions(server: FastMCP[object]) -> int:
     return len(server.session_manager._server_instances)  # noqa: SLF001
 
 
+MCP_HEADERS = {
+    "content-type": "application/json",
+    "accept": "application/json, text/event-stream",
+}
+# Every shape below reaches the transport without a session id, and no shape but
+# a valid initialize request can ever be accepted. Well-formed JSON is the
+# interesting half: it survives a parse check, so it used to reach the SDK and
+# leave a session behind before the SDK answered 400.
 REJECTED_OPENINGS = {
     "content type is not json": (
+        "POST",
         {"content-type": "text/plain", "accept": "application/json, text/event-stream"},
         b"x",
         415,
     ),
-    "accept header absent": ({"content-type": "application/json"}, b"{}", 406),
+    "accept header absent": ("POST", {"content-type": "application/json"}, b"{}", 406),
     "accept omits the event stream": (
+        "POST",
         {"content-type": "application/json", "accept": "application/json"},
         b"{}",
         406,
     ),
-    "body is not json": (
-        {"content-type": "application/json", "accept": "application/json, text/event-stream"},
-        b"{ not json",
+    "body is not json": ("POST", MCP_HEADERS, b"{ not json", 400),
+    "body is an empty object": ("POST", MCP_HEADERS, b"{}", 400),
+    "body is an empty array": ("POST", MCP_HEADERS, b"[]", 400),
+    "body is bare null": ("POST", MCP_HEADERS, b"null", 400),
+    "body omits the jsonrpc version": (
+        "POST",
+        MCP_HEADERS,
+        b'{"id":1,"method":"initialize","params":{}}',
         400,
     ),
+    "body omits the method": ("POST", MCP_HEADERS, b'{"jsonrpc":"2.0","id":1}', 400),
+    "method is not initialize": (
+        "POST",
+        MCP_HEADERS,
+        b'{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}',
+        400,
+    ),
+    "notification carries no session": (
+        "POST",
+        MCP_HEADERS,
+        b'{"jsonrpc":"2.0","method":"notifications/initialized"}',
+        400,
+    ),
+    "get cannot open a session": ("GET", {"accept": "text/event-stream"}, None, 400),
+    "get does not accept the stream": ("GET", {"accept": "application/json"}, None, 406),
+    "delete cannot open a session": ("DELETE", {}, None, 400),
 }
 
 
@@ -788,11 +819,12 @@ async def test_a_rejected_session_opening_creates_no_session(
 ) -> None:
     """The SDK registers a transport before it validates, so a refusal used to leak one.
 
-    Measured before the guard existed: every rejected POST left a live session and
-    an anyio task for the lifetime of the process, so a daemon meant to run for
-    weeks grew without bound under anything that could send a request.
+    Measured before the guard existed: every rejected request that carried no
+    session id left a live session and an anyio task for the lifetime of the
+    process, so a daemon meant to run for weeks grew without bound under anything
+    that could reach the port.
     """
-    headers, body, expected_status = REJECTED_OPENINGS[shape]
+    method, headers, body, expected_status = REJECTED_OPENINGS[shape]
     server = create_mcp_server(app_config, store)
     app = server.streamable_http_app()
     transport = httpx.ASGITransport(app=app)
@@ -801,18 +833,26 @@ async def test_a_rejected_session_opening_creates_no_session(
         httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1:8377") as client,
     ):
         before = _sessions(server)
-        response = await client.post("/mcp", headers=headers, content=body)
+        response = await client.request(method, "/mcp", headers=headers, content=body)
 
         assert response.status_code == expected_status
+        assert response.json()["error"]["message"]
         assert _sessions(server) == before
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("shape", sorted(REJECTED_OPENINGS))
 async def test_a_flood_of_rejected_openings_leaves_the_session_table_bounded(
+    shape: str,
     app_config: AppConfig,
     store: EngramStore,
 ) -> None:
-    """One session per rejected request is unbounded growth; zero is the contract."""
+    """One session per rejected request is unbounded growth; zero is the contract.
+
+    Run for every refused shape, not one: a guard that closes the shape it was
+    written against and leaves the rest open is what shipped in 2026.813.1.
+    """
+    method, headers, body, _ = REJECTED_OPENINGS[shape]
     server = create_mcp_server(app_config, store)
     app = server.streamable_http_app()
     transport = httpx.ASGITransport(app=app)
@@ -821,8 +861,8 @@ async def test_a_flood_of_rejected_openings_leaves_the_session_table_bounded(
         httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1:8377") as client,
     ):
         before = _sessions(server)
-        for _ in range(200):
-            await client.post("/mcp", headers={"content-type": "text/plain"}, content=b"x")
+        for _ in range(500):
+            await client.request(method, "/mcp", headers=headers, content=body)
 
         assert _sessions(server) == before
 
@@ -859,4 +899,45 @@ async def test_the_guard_leaves_a_real_session_working_end_to_end(
         )
         capsule = _structured(recalled)
         assert len(capsule["own_pending"]) == 1
+        assert _sessions(server) == 1
+
+
+@pytest.mark.anyio
+async def test_a_flood_of_valid_json_cannot_disturb_a_live_session(
+    app_config: AppConfig,
+    store: EngramStore,
+) -> None:
+    """The two halves of the contract, measured against each other.
+
+    Well-formed JSON that is not an initialize request is the shape 2026.813.1
+    shipped open: it survived the parse check, reached the SDK, and left a session
+    behind. Five hundred of them must add nothing, and the session working
+    alongside them must not notice they happened.
+    """
+    server = create_mcp_server(app_config, store)
+    app = server.streamable_http_app()
+    transport = httpx.ASGITransport(app=app)
+    async with (
+        app.router.lifespan_context(app),
+        _client(app) as session,
+        httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1:8377") as flooder,
+    ):
+        assert _sessions(server) == 1
+
+        for _ in range(500):
+            refused = await flooder.post("/mcp", headers=MCP_HEADERS, content=b"{}")
+            assert refused.status_code == 400
+
+        assert _sessions(server) == 1
+        listed = await session.list_tools()
+        assert sorted(tool.name for tool in listed.tools) == ["recall", "remember"]
+        written = await session.call_tool(
+            "remember",
+            {
+                "statement": "A flood of refusals must not cost a live session anything.",
+                "kind": "fact",
+                "scope": "project/engram",
+            },
+        )
+        assert _structured(written)["outcome"] == "created"
         assert _sessions(server) == 1

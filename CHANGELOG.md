@@ -9,6 +9,31 @@ different version strings.
 
 ## [Unreleased]
 
+## [2026.813.2] - 2026-08-13
+
+### Fixed
+
+- Close the session leak for every request that cannot open a session, not only for the four shapes
+  2026.813.1 guarded. That release checked that a session-opening body parsed as JSON, which a
+  well-formed body that is not an MCP request passes: `{}`, `[]`, `null`, a request without its
+  JSON-RPC version, a request without a method, a method other than `initialize`, and a notification
+  each still reached the SDK, which registered a transport before answering `400`. Measured on the
+  published wheel: 500 requests of each shape, 500 sessions each. Two methods the guard never saw
+  were open as well, because it only screened `POST`: a `GET` or a `DELETE` carrying no session id
+  registered one transport per request too.
+
+  The rule the transport actually enforces is narrower than a parse check, and it is now the rule
+  applied: without a session id the only request that can be accepted is a `POST` carrying a valid
+  JSON-RPC `initialize`, validated with the SDK's own message model so the guard and the transport
+  cannot disagree about what valid means. Every refusal reproduces the status code, the JSON-RPC
+  error code and the wording the transport would have sent, so a client cannot tell which layer
+  answered. Requests that carry a session id are untouched; one the server never issued was already
+  answered `404` without allocating anything.
+
+  Measured after the change: 500 requests of each of the eleven refused shapes, and of each refused
+  method, grow the session table by zero, while a session initialising alongside the flood lists
+  both tools, remembers and recalls without noticing it.
+
 ## [2026.813.1] - 2026-08-13
 
 ### Added
@@ -19,6 +44,8 @@ different version strings.
   the process: measured, 500 rejected requests grew the table by exactly 500. The checks now run one
   layer earlier, with the transport's own rules and status codes, and 2000 rejected requests grow it
   by zero while a real session still initialises, lists both tools, remembers and recalls.
+  Corrected in 2026.813.2: that measurement covered the four shapes this release guarded, and the
+  guard left the rest of the class open.
 
 - `engram init` writes the starting configuration where the loader will look for it. The template
   now ships inside the distribution, so an installation that is not a checkout can be configured
@@ -340,6 +367,8 @@ different version strings.
 - Mirrored French and English product documentation, CI gates, release artifacts, and MCP Registry
   metadata.
 
-[Unreleased]: https://github.com/VBlackJack/Engram/compare/v2026.0730.02...HEAD
+[Unreleased]: https://github.com/VBlackJack/Engram/compare/v2026.813.2...HEAD
+[2026.813.2]: https://github.com/VBlackJack/Engram/compare/v2026.813.1...v2026.813.2
+[2026.813.1]: https://github.com/VBlackJack/Engram/compare/v2026.0730.02...v2026.813.1
 [2026.0730.02]: https://github.com/VBlackJack/Engram/compare/v2026.0721.04...v2026.0730.02
 [2026.0721.04]: https://github.com/VBlackJack/Engram/releases/tag/v2026.0721.04

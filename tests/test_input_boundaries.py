@@ -107,7 +107,11 @@ async def _invoke_body_middleware(
         "server": ("127.0.0.1", 8377),
         "state": {},
     }
-    middleware = RequestBodyLimitMiddleware(downstream, max_body_bytes=max_body_bytes)
+    middleware = RequestBodyLimitMiddleware(
+        downstream,
+        max_body_bytes=max_body_bytes,
+        mcp_path="/mcp",
+    )
     await middleware(scope, receive, send)
     return downstream, sent, receive_calls
 
@@ -183,7 +187,7 @@ async def test_body_limit_rejects_declared_oversize_without_reading() -> None:
     assert downstream.called is False
     assert receive_calls == 0
     assert sent[0]["status"] == 413
-    assert sent[1]["body"] == b"request body too large"
+    assert json.loads(sent[1]["body"])["error"]["message"] == "request body too large"
 
 
 @pytest.mark.anyio
@@ -215,9 +219,15 @@ async def test_body_limit_rejects_giant_numeric_content_length_without_int_conve
 
 @pytest.mark.anyio
 async def test_body_limit_accepts_and_replays_exact_boundary_once() -> None:
+    """A body of exactly the limit reaches the transport once, whole.
+
+    The request carries a session id because the limit is what is under test:
+    no session is being opened, so the guard has nothing to say about the body
+    beyond its size.
+    """
     downstream, sent, receive_calls = await _invoke_body_middleware(
         max_body_bytes=8,
-        headers=((b"content-length", b"8"),),
+        headers=((b"content-length", b"8"), (b"mcp-session-id", b"established")),
         messages=(
             {"type": "http.request", "body": b'{"a', "more_body": True},
             {"type": "http.request", "body": b'b":1}', "more_body": False},
