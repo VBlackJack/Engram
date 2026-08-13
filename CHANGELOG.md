@@ -3,11 +3,37 @@
 All notable changes to this project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
-project uses date-derived CalVer releases in the form `YYYY.MMDD.NN`.
+project uses date-derived CalVer releases in the form `YYYY.MMDD.NN`, written in the PEP 440
+normal form that packaging tools stamp on the built artifacts, so a release never carries two
+different version strings.
 
 ## [Unreleased]
 
+## [2026.813.1] - 2026-08-13
+
 ### Added
+
+- `engram init` writes the starting configuration where the loader will look for it. The template
+  now ships inside the distribution, so an installation that is not a checkout can be configured
+  at all: before this, the wheel contained no template and the documented remedy named a file only
+  a git clone has. It replaces a PowerShell block whose two guard lines do not stop the copy when
+  pasted into a live session, and it behaves identically on every operating system.
+- `engram stop` asks the daemon that owns the database to exit and waits on the ownership lock to
+  confirm it did. A windowless daemon can receive no console control event, so the only lever was a
+  sentinel file built by hand at a path the documentation published wrongly: the request landed
+  where nothing was watching, the command reported success, and every offline write stayed blocked
+  behind a daemon that never stopped.
+- `engram doctor` reports the interpreter, the SQLite floor, which configuration was resolved and
+  whether it loads, the database and its schema version, the ownership lock, the endpoint and the
+  log file, each beside the command that repairs it. The endpoint is judged against the lock,
+  because a port that accepts is not proof that this Engram is behind it: a second installation
+  holds the same loopback port and a client pointed there reaches whatever answers.
+- `engram setup client claude|codex|gemini` writes the vendor MCP configuration from the endpoint
+  this installation actually serves, and `--protocol` appends the session protocol to CLAUDE.md,
+  AGENTS.md or GEMINI.md. Every write merges, so other MCP servers and Codex comments survive. The
+  protocol text moved into the package, where a command can deliver it and a test can pin it
+  against the published page.
+
 
 - Add `engram setup autostart`, which registers the daemon as a Windows logon task run by the
   windowed interpreter beside the running one. The absence of a console window is a property of
@@ -61,16 +87,17 @@ project uses date-derived CalVer releases in the form `YYYY.MMDD.NN`.
   asserts the outcome that runtime actually produces: a working command when its SQLite clears the
   fail-closed minimum, and the documented exit code and message when it does not.
 
-### Fixed
-
-- Pin the interpreter to a build measured to link a recent enough SQLite on Windows **and** Linux.
-  The previously pinned build cleared the requirement on one platform only, so the Linux leg would
-  have refused every storage operation.
-- Assert the shared `OSError` contract, not the Windows-specific subclass, when configuration
-  refuses an unusable rotation lock. The narrower assertion failed on Linux, where the same
-  condition is reported as `IsADirectoryError`.
-
 ### Changed
+
+- The continuous-integration quality gate no longer lets a formatting difference decide whether the
+  tests run. Lint, format and types report their verdict and the run continues to pytest; each
+  still fails the build, at the end of the job. A red build and a failing test suite had become the
+  same statement, and four commits reached production through that gap.
+- The documented Codex block no longer sets `required = true`, which fails Codex startup when the
+  server cannot initialise and made a memory broker that is merely down take the whole assistant
+  with it.
+
+
 
 - Run continuous integration and release builds on the uv-managed interpreter the documentation
   tells users to install, instead of building or replacing SQLite on the runner. A gate that
@@ -110,6 +137,46 @@ project uses date-derived CalVer releases in the form `YYYY.MMDD.NN`.
   optional fields so their format and length limits stay visible at one level.
 - Reject an `observed_at` value carrying no UTC offset, and a non-textual instant, at argument
   validation instead of deeper in storage.
+
+### Fixed
+
+- Stop reading a scheduled task's command and arguments as paths relative to the directory Engram
+  happens to be invoked from. The scheduler stores those tokens as free text, routinely relative or
+  with an environment variable left unexpanded, and resolving them against the current directory
+  placed them inside the configuration directory, which the documented installation makes the
+  current directory. Measured on one ordinary machine: 89 of 109 registered tasks were reported as
+  competing for the database, so the single documented Windows install command refused, and the
+  remedy it printed would have disabled disk cleanup, Office updates and a browser updater. A
+  relative token now belongs to the working directory of its own task, and a refusal names the
+  first few conflicts rather than all of them.
+- Stop spending trusted content on a conflict family the capsule then drops. A conflict group is
+  removed whole and eviction reaches it last, so a family too large to fit on its own made the
+  builder empty every other section to make room and then remove the family as well: asking for
+  conflicts returned strictly less than not asking, while the capsule's own advice on the other
+  path is to retry with the flag set. Measured over 100 combinations of family size, statement
+  width and budget, 71 lost content and delivered no conflict in exchange. Groups are now measured
+  before anything is evicted, so only the ones the capsule can deliver are kept.
+- Refuse a configuration key Engram does not read instead of running on the default it hides. The
+  loader validated types and never names, so `[server] prot` and `[servr] port` both left the
+  endpoint on 8377 without a word, and a misspelt `[database] path` opened a different database
+  from the configured one. A near miss now names the key it resembles.
+- Correct the version to its own PEP 440 normal form. `2026.0730.02` was stamped `2026.730.2` on
+  every built artifact while the tag, the documentation and `engram --version` said otherwise, so
+  a release carried two version strings and nothing failed. A test now refuses a version that is
+  not canonical, and a second one refuses a version the release workflow's tag pattern would not
+  build.
+- Name a URL and `engram doctor` in the SQLite floor refusal instead of a repository path, which
+  someone who installed a distribution does not have.
+- Explain the six `attest` options that decide what a memory means and how long it lives, and the
+  identifiers `classify` and `supersede` take, none of which carried help text.
+
+
+- Pin the interpreter to a build measured to link a recent enough SQLite on Windows **and** Linux.
+  The previously pinned build cleared the requirement on one platform only, so the Linux leg would
+  have refused every storage operation.
+- Assert the shared `OSError` contract, not the Windows-specific subclass, when configuration
+  refuses an unusable rotation lock. The narrower assertion failed on Linux, where the same
+  condition is reported as `IsADirectoryError`.
 
 ## [2026.0730.02] - 2026-07-30
 
