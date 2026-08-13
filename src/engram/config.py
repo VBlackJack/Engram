@@ -198,7 +198,12 @@ class CapsuleConfig:
 
     default_token_budget: int = 4800
     min_token_budget: int = 1200
-    max_token_budget: int = 6000
+    # The ceiling a client may request, not the amount it usually gets. At 6000
+    # a conflict family of six recorded versions, or two long ones, needed more
+    # bytes than any permitted budget, so those memories were reachable through
+    # no MCP call at all -- only through the command line. The default stays
+    # conservative; what changes is that asking for more is now possible.
+    max_token_budget: int = 32_768
 
     def __post_init__(self) -> None:
         """Reject an impossible serialized MCP envelope in every construction path."""

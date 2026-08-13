@@ -33,7 +33,12 @@ max_request_body_bytes = 524288
 [capsule]
 default_token_budget = 4800
 min_token_budget = 1200
-max_token_budget = 6000
+# The ceiling a client may request. A conflict family of six versions needs more
+# than 6000 serialized bytes, so a lower ceiling makes those memories unreachable
+# through the MCP tools. Raising default_token_budget spends more tokens on every
+# recall; measured with 300-character statements, 4800 returns about four entries
+# and 16000 returns about fifteen.
+max_token_budget = 32768
 
 [retrieval]
 mode = "fts"
