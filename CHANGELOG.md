@@ -13,6 +13,13 @@ different version strings.
 
 ### Added
 
+- Refuse a session-opening request the MCP transport would reject anyway. The SDK registers a
+  transport and starts its task before it validates anything, and nothing reclaims the entry, so
+  every rejected POST that carried no session id left a live session and a task for the lifetime of
+  the process: measured, 500 rejected requests grew the table by exactly 500. The checks now run one
+  layer earlier, with the transport's own rules and status codes, and 2000 rejected requests grow it
+  by zero while a real session still initialises, lists both tools, remembers and recalls.
+
 - `engram init` writes the starting configuration where the loader will look for it. The template
   now ships inside the distribution, so an installation that is not a checkout can be configured
   at all: before this, the wheel contained no template and the documented remedy named a file only
@@ -89,6 +96,14 @@ different version strings.
 
 ### Changed
 
+- `capsule.py` and `retrieval.py` join the per-module coverage floors. Reaching a memory is part of
+  holding it: an entry a capsule drops under budget costs the reader what a lost row costs.
+- The client configuration write is in place and, deliberately, not atomic. Writing through the
+  existing file is what preserves its permissions, owner, access control list, extended attributes,
+  NTFS alternate data streams and hard links; the price is that an interrupted write can leave the
+  file partly written. Both documentation sets say so, and present `--print` as the path that writes
+  nothing.
+
 - The continuous-integration quality gate no longer lets a formatting difference decide whether the
   tests run. Lint, format and types report their verdict and the run continues to pytest; each
   still fails the build, at the end of the job. A red build and a failing test suite had become the
@@ -139,6 +154,29 @@ different version strings.
   validation instead of deeper in storage.
 
 ### Fixed
+
+- Re-read the vendor file before reporting that a client needs no change. `connect` trusted the
+  plan, which describes the file as it was when the plan was made, so an entry pointed elsewhere or
+  a file that had stopped parsing both answered "Already correct": nothing written, success
+  reported, and the client left aimed at an endpoint that is not this Engram.
+- Restart the lifetime when a candidate is attested. Promoting in place kept the candidate's expiry,
+  so a human attestation made shortly before it inherited what remained and then left recall, while
+  the same attestation with no candidate present lived its full term. This releases `expires_at`
+  from the identity trigger, in migration 6: an entry's expiry is a lifecycle attribute rather than
+  part of what makes it that entry. Migration 5 is unchanged, so every database converges through a
+  numbered step.
+- Refuse a re-attestation that carries metadata a trusted entry cannot be given. Different subject
+  keys, confidence, evidence or validity window were discarded while the call reported success, the
+  audit row is content-free so nothing recorded the loss, and no path amends trusted content in
+  place to undo it. An identical repeat is still the idempotent no-op it was.
+- Store the subject keys a corroboration adds. They were written to the observation, which nothing
+  reads, so the entry and the lexical index kept the original set and a key added to make a memory
+  findable did not: measured, zero hits. A union above the configured maximum is refused rather than
+  truncated.
+- Publish the input bounds the server enforces rather than the ceilings a configuration may set.
+  `remember` advertised 16384 characters and 64 subject keys while refusing anything over 2000 and
+  8, so a client composing from the schema alone failed on exactly the long rationales worth
+  keeping.
 
 - Stop reading a scheduled task's command and arguments as paths relative to the directory Engram
   happens to be invoked from. The scheduler stores those tokens as free text, routinely relative or
