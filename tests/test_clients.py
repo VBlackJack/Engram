@@ -446,9 +446,9 @@ def test_a_target_that_changed_after_it_was_read_is_refused(
     concurrent = b"# original\n# an edit from somewhere else\n"
     genuine = _read_optional_bytes
 
-    def racing_read(path: Path) -> bytes | None:
+    def racing_read(path: Path) -> object:
         seen = genuine(path)
-        if path == plan.instructions_path and seen == b"# original\n":
+        if path == plan.instructions_path and seen is not None and seen.data == b"# original\n":
             path.write_bytes(concurrent)
         return seen
 
@@ -470,7 +470,7 @@ def test_a_file_appearing_where_none_was_found_is_refused(
     intruder = b"# created between the read and the write\n"
     genuine = _read_optional_bytes
 
-    def racing_read(path: Path) -> bytes | None:
+    def racing_read(path: Path) -> object:
         seen = genuine(path)
         if path == plan.instructions_path and seen is None:
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -497,7 +497,7 @@ def test_a_hard_link_appearing_where_none_was_found_never_reaches_its_target(
     victim.write_bytes(b"THIRD PARTY CONTENT\n")
     genuine = _read_optional_bytes
 
-    def racing_read(path: Path) -> bytes | None:
+    def racing_read(path: Path) -> object:
         seen = genuine(path)
         if path == plan.instructions_path and seen is None:
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -529,3 +529,41 @@ def test_a_configuration_written_between_planning_and_connecting_is_merged_not_r
     assert document["theme"] == "dark"
     assert document["mcpServers"]["datacron"] == {"httpUrl": "http://x/mcp"}
     assert document["mcpServers"]["engram"]["httpUrl"] == endpoint_url(app_config)
+
+
+def test_a_target_repointed_at_another_file_with_the_same_bytes_is_refused(
+    app_config: AppConfig,
+    workspace: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Identical content is not identity: two files can hold the same bytes.
+
+    Comparing only the bytes accepted a destination repointed at somebody else's
+    file in between, so the comparison passed and the write landed on the wrong
+    inode. The identity is taken from the descriptor that was read and required
+    again on the descriptor that writes.
+    """
+    shared = b"# shared content\n"
+    plan = plan_client(ClientKind.CODEX, app_config, home=workspace)
+    plan.instructions_path.write_bytes(shared)
+    victim = tmp_path / "victim.md"
+    victim.write_bytes(shared)
+    genuine = _read_optional_bytes
+
+    def racing_read(path: Path) -> object:
+        seen = genuine(path)
+        if path == plan.instructions_path and seen is not None:
+            # Same bytes, different file: only the identity separates them.
+            path.unlink()
+            os.link(victim, path)
+        return seen
+
+    monkeypatch.setattr(clients_module, "_read_optional_bytes", racing_read)
+
+    with pytest.raises(ClientConfigError, match="no longer the file Engram read"):
+        install_protocol(plan)
+
+    assert victim.read_bytes() == shared, "the victim received the write"
+    assert plan.instructions_path.read_bytes() == shared
+    assert plan.instructions_path.samefile(victim)

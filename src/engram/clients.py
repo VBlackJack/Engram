@@ -48,6 +48,21 @@ class ClientConfigError(RuntimeError):
 
 
 @dataclass(frozen=True, slots=True)
+class _Snapshot:
+    """What a file held, and which file that was.
+
+    The content alone is not enough to identify what was read. Two files can
+    hold identical bytes, so comparing only the bytes accepted a destination
+    that had been repointed at somebody else's file in the meantime: the
+    comparison passed and the write went to the wrong inode. The identity
+    travels with the bytes so the writer can require both.
+    """
+
+    data: bytes
+    identity: tuple[int, int]
+
+
+@dataclass(frozen=True, slots=True)
 class ClientPlan:
     """What connecting one client would write, and where."""
 
@@ -113,24 +128,40 @@ def install_protocol(plan: ClientPlan) -> bool:
     """Append the session protocol to the client's instructions, once."""
     protocol = client_protocol_text().strip()
     existing = _read_optional_bytes(plan.instructions_path)
-    if protocol.encode("utf-8") in (existing or b"").replace(b"\r\n", b"\n"):
+    seen = b"" if existing is None else existing.data
+    if protocol.encode("utf-8") in seen.replace(b"\r\n", b"\n"):
         return False
     _write_preserving_identity(
         plan.instructions_path,
-        (existing or b"") + _line_separated_appendix(existing or b"", f"{protocol}\n"),
+        seen + _line_separated_appendix(seen, f"{protocol}\n"),
         expected=existing,
     )
     return True
 
 
-def _read_optional_bytes(path: Path) -> bytes | None:
-    """Return the bytes a file holds, or None when there is no file to read.
+def _read_optional_bytes(path: Path) -> _Snapshot | None:
+    """Return what a file held and which file held it, or None when there is none.
 
-    The distinction matters to every caller: it is the state the content is
-    built from, and the writer compares against it rather than looking the path
-    up a second time.
+    Both halves are taken from one open descriptor. Reading the bytes and asking
+    the path about itself separately would describe two different files if the
+    name were repointed in between, which is the whole thing the writer checks.
     """
-    return path.read_bytes() if path.is_file() else None
+    if not path.is_file():
+        # A stat before the open, so a FIFO is refused by the writer rather than
+        # blocking here. Correctness does not rest on it: the identity below
+        # comes from the descriptor actually opened.
+        return None
+    try:
+        stream = path.open("rb")
+    except OSError as exc:
+        raise ClientConfigError(f"{path} cannot be read: {exc}") from exc
+    with stream:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode):
+            raise ClientConfigError(
+                f"{path} is {_describe_file_type(info.st_mode)}, not a regular file."
+            )
+        return _Snapshot(data=stream.read(), identity=(info.st_dev, info.st_ino))
 
 
 def _render_json_block(entry: dict[str, str]) -> str:
@@ -151,7 +182,8 @@ def _render_codex_block(url: str) -> str:
 
 
 def _load_json(path: Path) -> dict[str, Any]:
-    return _parse_json(path, _read_optional_bytes(path))
+    snapshot = _read_optional_bytes(path)
+    return _parse_json(path, None if snapshot is None else snapshot.data)
 
 
 def _parse_json(path: Path, raw: bytes | None) -> dict[str, Any]:
@@ -181,7 +213,7 @@ def _json_entry(path: Path, keys: tuple[str, ...]) -> object:
 
 def _write_json_client(plan: ClientPlan, *, force: bool) -> None:
     raw = _read_optional_bytes(plan.config_path)
-    document = _parse_json(plan.config_path, raw)
+    document = _parse_json(plan.config_path, None if raw is None else raw.data)
     servers = document.get("mcpServers")
     if servers is None:
         servers = {}
@@ -278,7 +310,8 @@ def _write_codex(plan: ClientPlan, *, force: bool) -> None:
             "place, or run with --print and merge the block yourself."
         )
     existing = _read_optional_bytes(plan.config_path)
-    candidate = (existing or b"") + _line_separated_appendix(existing or b"", plan.block)
+    seen = b"" if existing is None else existing.data
+    candidate = seen + _line_separated_appendix(seen, plan.block)
     try:
         tomllib.loads(candidate.decode("utf-8"))
     except (UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
@@ -305,7 +338,7 @@ def _line_separated_appendix(existing: bytes, block: str) -> bytes:
     return newline + newline + encoded
 
 
-def _write_preserving_identity(path: Path, data: bytes, *, expected: bytes | None) -> None:
+def _write_preserving_identity(path: Path, data: bytes, *, expected: _Snapshot | None) -> None:
     """Write bytes to a path while keeping everything about the file that is not content.
 
     Five review rounds chased metadata off the edge of a rename: the permission
@@ -378,7 +411,7 @@ def _create_exclusively(path: Path, data: bytes) -> None:
         raise ClientConfigError(f"{path} could not be created: {exc}") from exc
 
 
-def _rewrite_unchanged(path: Path, data: bytes, expected: bytes) -> None:
+def _rewrite_unchanged(path: Path, data: bytes, expected: _Snapshot) -> None:
     """Rewrite the file only if it still holds the bytes the content was built from.
 
     The content is a function of what was read. If the file changed in between,
@@ -391,12 +424,19 @@ def _rewrite_unchanged(path: Path, data: bytes, expected: bytes) -> None:
     except OSError as exc:
         raise ClientConfigError(f"{path} could not be opened for writing: {exc}") from exc
     with stream:
-        _require_regular_descriptor(path, stream.fileno())
-        current = stream.read()
-        if current != expected:
+        info = os.fstat(stream.fileno())
+        _require_regular(path, info)
+        if (info.st_dev, info.st_ino) != expected.identity:
             raise ClientConfigError(
-                f"{path} changed after Engram read it: it held {len(expected)} bytes and now "
-                f"holds {len(current)}. Nothing was written, so the other change is intact; "
+                f"{path} is no longer the file Engram read: the name now leads to a different "
+                "one. Nothing was written, so whatever it points at is intact; run the command "
+                "again to work from the file that is there now."
+            )
+        current = stream.read()
+        if current != expected.data:
+            raise ClientConfigError(
+                f"{path} changed after Engram read it: it held {len(expected.data)} bytes and "
+                f"now holds {len(current)}. Nothing was written, so the other change is intact; "
                 "run the command again to build the block from the current file."
             )
         stream.seek(0)
@@ -411,9 +451,9 @@ def _store(stream: IO[bytes], data: bytes) -> None:
     os.fsync(stream.fileno())
 
 
-def _require_regular_descriptor(path: Path, descriptor: int) -> None:
+def _require_regular(path: Path, info: os.stat_result) -> None:
     """Check the type of the object actually opened, not of the name that led to it."""
-    if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+    if not stat.S_ISREG(info.st_mode):
         raise ClientConfigError(
             f"{path} is not a regular file. Engram will not write a configuration over it."
         )
