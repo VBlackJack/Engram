@@ -335,7 +335,11 @@ def _add_trusted_command_parsers(
     """Add local attestation and lifecycle inspection commands."""
     attest = commands.add_parser("attest", help="Create a trusted local attestation")
     attest.add_argument("statement", help="Canonical statement to attest")
-    attest.add_argument("kind", choices=tuple(kind.value for kind in EntryKind))
+    attest.add_argument(
+        "kind",
+        choices=tuple(kind.value for kind in EntryKind),
+        help="Memory family; preference, decision and fact also require --claim-key",
+    )
     attest.add_argument("scope", help="global, user, project/<id>, or session/<id>")
     attest.add_argument(
         "--subject-key",
@@ -347,11 +351,13 @@ def _add_trusted_command_parsers(
         "--source-type",
         choices=(SourceType.HUMAN.value, SourceType.TOOL_VERIFIED.value),
         default=SourceType.HUMAN.value,
+        help="Provenance recorded for the entry (default: human)",
     )
     attest.add_argument(
         "--confidence",
         choices=tuple(confidence.value for confidence in Confidence),
         default=Confidence.HIGH.value,
+        help="Confidence recorded with the entry (default: high)",
     )
     attest.add_argument(
         "--evidence",
@@ -361,9 +367,24 @@ def _add_trusted_command_parsers(
         metavar="TYPE=REF",
         help="Evidence reference (repeatable)",
     )
-    attest.add_argument("--valid-from", type=_parse_date, metavar="YYYY-MM-DD")
-    attest.add_argument("--valid-until", type=_parse_date, metavar="YYYY-MM-DD")
-    attest.add_argument("--observed-at", type=_parse_datetime, metavar="ISO-8601")
+    attest.add_argument(
+        "--valid-from",
+        type=_parse_date,
+        metavar="YYYY-MM-DD",
+        help="First day the statement holds; before it, the entry is not yet current",
+    )
+    attest.add_argument(
+        "--valid-until",
+        type=_parse_date,
+        metavar="YYYY-MM-DD",
+        help="Last day the statement holds; after it, the entry stops being current",
+    )
+    attest.add_argument(
+        "--observed-at",
+        type=_parse_datetime,
+        metavar="ISO-8601",
+        help="When the fact was observed, with a UTC offset (default: now)",
+    )
     attest.add_argument("--actor", help="Audit actor (default: attestation.default_actor)")
     attest.add_argument(
         "--claim-key",
@@ -380,15 +401,33 @@ def _add_trusted_command_parsers(
         help="Entry replaced by this attestation (repeatable)",
     )
     supersede = commands.add_parser("supersede", help="Link a replacement entry")
-    supersede.add_argument("--old", required=True, metavar="ENTRY_ID")
-    supersede.add_argument("--new", required=True, metavar="ENTRY_ID")
+    supersede.add_argument(
+        "--old",
+        required=True,
+        metavar="ENTRY_ID",
+        help="Entry being replaced",
+    )
+    supersede.add_argument(
+        "--new",
+        required=True,
+        metavar="ENTRY_ID",
+        help="Replacement, which must be an active classified trusted entry",
+    )
     supersede.add_argument("--actor", help="Audit actor (default: attestation.default_actor)")
     classify = commands.add_parser(
         "classify",
         help="Assign a claim key to one trusted legacy entry",
     )
-    classify.add_argument("entry_id", metavar="ENTRY_ID")
-    classify.add_argument("--claim-key", required=True)
+    classify.add_argument(
+        "entry_id",
+        metavar="ENTRY_ID",
+        help="Entry to classify, as reported by 'engram list --unclassified'",
+    )
+    classify.add_argument(
+        "--claim-key",
+        required=True,
+        help="Conflict-family identity, as topic/claim; never infer these in bulk",
+    )
     classify.add_argument(
         "--actor",
         help="Audit actor (default: attestation.default_actor)",
@@ -398,6 +437,7 @@ def _add_trusted_command_parsers(
     list_filter.add_argument(
         "--status",
         choices=tuple(status.value for status in EntryStatus),
+        help="Lifecycle status to inventory; quarantined lists unconfirmed candidates",
     )
     list_filter.add_argument(
         "--unclassified",
@@ -1170,7 +1210,7 @@ def _list_entries(
             )
         else:
             entries = tuple(entry for entry in entries if entry.status is status)
-    _write_json([_entry_payload(entry) for entry in entries])
+    _write_readable_json([_entry_payload(entry) for entry in entries])
 
 
 def _reindex(*, config: AppConfig, logger: logging.Logger) -> None:
@@ -1340,6 +1380,16 @@ def _entry_payload(entry: Entry) -> dict[str, object]:
 def _write_json(payload: object) -> None:
     serialized = json.dumps(payload, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
     sys.stdout.write(f"{serialized}\n")
+
+
+def _write_readable_json(payload: object) -> None:
+    """Emit an inventory a person can read without losing machine parsing.
+
+    This is the only surface for reviewing candidates before attesting them, and
+    it used to arrive as one unbroken minified line. Indenting keeps every
+    consumer working, json.loads included, and makes the review possible.
+    """
+    _write_lines(json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True))
 
 
 def _write_lines(*lines: str) -> None:
