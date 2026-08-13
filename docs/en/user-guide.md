@@ -1,6 +1,6 @@
 # User guide
 
-[Francais](../fr/user-guide.md) | [English](user-guide.md)
+[Français](../fr/user-guide.md) | [English](user-guide.md)
 
 > **Goal:** use Engram every day without administering the database.<br>
 > **Time:** less than one minute at the start and end of a task.<br>

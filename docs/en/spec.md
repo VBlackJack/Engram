@@ -1,6 +1,6 @@
 # Data contract
 
-[Francais](../fr/spec.md) | [English](spec.md)
+[Français](../fr/spec.md) | [English](spec.md)
 
 > **Reference document:** useful when implementing or auditing a client. For daily use, read the
 > [user guide](user-guide.md).

@@ -1,6 +1,6 @@
 # Architecture
 
-[Francais](../fr/architecture.md) | [English](architecture.md)
+[Français](../fr/architecture.md) | [English](architecture.md)
 
 > **Reference document:** not required to start. Use the
 > [quick start](quick-start.md) or the

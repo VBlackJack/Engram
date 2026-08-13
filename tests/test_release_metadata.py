@@ -120,6 +120,7 @@ def test_documentation_trees_are_mirrored() -> None:
         "datacron-cortex.md",
         "faq.md",
         "index.md",
+        "installation-unix.md",
         "installation-windows.md",
         "operator-guide.md",
         "quick-start.md",

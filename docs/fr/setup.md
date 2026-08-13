@@ -1,182 +1,273 @@
 # Mise en place
 
-[Francais](setup.md) | [English](../en/setup.md)
+[Français](setup.md) | [English](../en/setup.md)
 
 > **Objectif :** installer Engram et connecter un seul client MCP.<br>
-> **Temps :** 10 a 20 minutes.<br>
-> **Resultat :** le client affiche `recall` et `remember`.<br>
-> **Verifie avec :** Engram `2026.0730.02`, le 2026-07-30.
+> **Temps :** 10 à 20 minutes.<br>
+> **Résultat :** le client affiche `recall` et `remember`.<br>
+> **Vérifié avec :** Engram `2026.0730.02`, le 2026-08-13.
+
+Toutes les commandes des sections 1 et 3 sont identiques sous Windows, macOS et Linux. La section 2
+est le seul endroit où les systèmes diffèrent, et il est signalé.
 
 ## 1. Installer Engram
 
-Engram exige Git, `uv`, Python 3.13+ et SQLite 3.51.3+ dans le module `sqlite3` de ce Python.
+Engram exige Git, `uv` 0.12.1 ou plus récent, Python 3.13+ et SQLite 3.51.3+ dans le module
+`sqlite3` de ce Python.
 
-```powershell
+```text
 git --version
 uv --version
 ```
 
-**Resultat attendu :** les deux commandes affichent une version. Sinon, installez
+**Résultat attendu :** les deux commandes affichent une version. Sinon, installez
 [Git](https://git-scm.com/downloads) ou
-[`uv`](https://docs.astral.sh/uv/getting-started/installation/).
+[`uv`](https://docs.astral.sh/uv/getting-started/installation/). `uv` 0.12.1 est la première version
+qui connaît le build `3.14.6` ; les versions antérieures ne connaissent que des builds jusqu'à
+`3.14.3`.
 
-```powershell
+```text
 git clone https://github.com/VBlackJack/Engram.git
-Set-Location Engram
+cd Engram
 uv sync --python 3.14.6
-uv run --python 3.14.6 python -c "import sqlite3; print(sqlite3.sqlite_version)"
-if (Test-Path -LiteralPath "engram.toml") { throw "Existing Engram configuration: stop" }
-if (Test-Path -LiteralPath "engram.db") { throw "Existing Engram database: stop" }
-Copy-Item engram.example.toml engram.toml -ErrorAction Stop
+uv run --python 3.14.6 engram init
 ```
 
-**Resultat attendu :** SQLite affiche `3.51.3` ou plus recent et `engram.toml` existe.
+**Résultat attendu :** `engram init` affiche le fichier écrit, le chemin de base auquel ce fichier
+aboutit, l'endpoint, puis `Next: engram doctor`.
 
-Si la version est trop ancienne, arretez-vous et suivez
-[Windows et SQLite](installation-windows.md). Un `sqlite3.exe` recent dans le PATH ne remplace pas
-la bibliotheque chargee par Python.
+`engram init` écrit la configuration de départ depuis la copie empaquetée dans la distribution.
+Elle n'a besoin ni d'un checkout, ni d'une syntaxe propre à un shell, ni d'un `engram.example.toml`
+à côté d'elle : elle se comporte donc de la même façon depuis une installation par wheel et sur
+tous les systèmes. Elle refuse de remplacer un `engram.toml` existant ; `--force` le remplace
+délibérément.
+
+Vérifiez ensuite l'installation avant de lancer quoi que ce soit :
+
+```text
+uv run --python 3.14.6 engram doctor
+```
+
+**Résultat attendu :** `[ ok ]` pour `python`, `sqlite` et `configuration`. `database` et `daemon`
+restent en avertissement tant que le démon n'a pas tourné une première fois. Chaque ligne en échec
+affiche la commande qui la répare, et `engram doctor` ne sort en non-zéro que si un contrôle a
+échoué.
+
+Si SQLite est trop ancien, arrêtez-vous et suivez
+[Windows et SQLite](installation-windows.md). Une commande `sqlite3` récente dans le PATH ne
+remplace pas la bibliothèque chargée par Python.
 
 ## 2. Configurer et lancer
 
-Avec une nouvelle installation, les valeurs sures de `engram.example.toml` suffisent :
+Avec une nouvelle installation, les valeurs écrites par `engram init` suffisent :
 
 - endpoint IP loopback `127.0.0.1:8377/mcp` ;
 - base locale `engram.db` ;
 - retrieval FTS ;
-- ecritures Datacron desactivees.
+- écritures Datacron désactivées.
 
-> **STOP reprise :** si vous mettez a niveau ou reutilisez une base anterieure, ne lancez pas la
-> commande suivante. Le `engram.toml` neuf cree a l'etape 1 est normal. Pour une ancienne base,
+> **STOP reprise :** si vous mettez à niveau ou réutilisez une base antérieure, ne lancez pas la
+> commande suivante. Le `engram.toml` neuf créé à l'étape 1 est normal. Pour une ancienne base,
 > sauvegardez puis suivez
 > [Migrer une base existante](operator-guide.md#migrer-une-base-existante).
 
-Pour une nouvelle base uniquement, installez le demarrage automatique :
+<a id="windows-la-tache-douverture-de-session"></a>
 
-```powershell
+### Windows : la tâche d'ouverture de session
+
+Pour une nouvelle base uniquement, installez le démarrage automatique :
+
+```text
 uv run --python 3.14.6 engram setup autostart --install
 ```
 
-**Resultat attendu :** la commande sort en 0 et affiche un JSON dont `started` vaut `true`. Engram
-tourne des maintenant et redemarrera a chaque ouverture de session. **Aucun terminal ne doit rester
-ouvert :** la tache lance l'interpreteur sans console, donc il n'y a pas de fenetre a fermer par
+**Résultat attendu :** la commande sort en 0 et affiche un JSON dont `started` vaut `true`. Engram
+tourne dès maintenant et redémarrera à chaque ouverture de session. **Aucun terminal ne doit rester
+ouvert :** la tâche lance l'interpréteur sans console, donc il n'y a pas de fenêtre à fermer par
 inadvertance.
 
-Verifiez :
+Vérifiez :
 
-```powershell
+```text
 uv run --python 3.14.6 engram setup autostart --status
+uv run --python 3.14.6 engram doctor
 ```
 
-**Resultat attendu :** `installed` vaut `true` et `daemon_running` vaut `true`.
+**Résultat attendu :** `installed` vaut `true` et `daemon_running` vaut `true` ; `engram doctor`
+affiche `[ ok ] daemon: serving, pid ...` et `[ ok ] endpoint: http://127.0.0.1:8377/mcp accepts`.
 
 Ce que la commande fait, et ce qu'elle ne fait pas :
 
 | Action | Effet | Code de sortie |
 |---|---|---|
-| `--install` | Enregistre ou met a jour **une seule** tache pour ce `engram.toml`, puis demarre le daemon si la base est libre. Rejouer la commande converge, sans doublon. | `0` |
-| `--status` | N'ecrit rien. Repond dans le JSON, jamais par le code de sortie. Le champ `interpreter_present` dit si l'interpreteur **enregistre dans la tache** existe toujours : `installed: true` avec `interpreter_present: false` decrit une tache qui ne demarrera plus. | `0` dans tous les cas |
-| `--uninstall` | Supprime la tache. Sur une tache deja absente, `removed` vaut `false`. | `0` |
+| `--install` | Enregistre ou met à jour **une seule** tâche pour ce `engram.toml`, puis démarre le démon si la base est libre. Rejouer la commande converge, sans doublon. | `0` |
+| `--status` | N'écrit rien. Répond dans le JSON, jamais par le code de sortie. Le champ `interpreter_present` dit si l'interpréteur **enregistré dans la tâche** existe toujours : `installed: true` avec `interpreter_present: false` décrit une tâche qui ne démarrera plus. | `0` dans tous les cas |
+| `--uninstall` | Supprime la tâche. Sur une tâche déjà absente, `removed` vaut `false`. | `0` |
 
-### Reprendre une installation anterieure
+#### Reprendre une installation antérieure
 
-Si Engram etait deja lance au demarrage par un autre mecanisme - une tache planifiee posee a la
-main, un script de lancement - `--install` **refuse** et nomme la tache concernee :
+Si Engram était déjà lancé au démarrage par un autre mécanisme — une tâche planifiée posée à la
+main, un script de lancement — `--install` **refuse** et nomme la tâche concernée :
 
-```powershell
+```text
 uv run --python 3.14.6 engram setup autostart --install
 ```
 
-**Resultat attendu :** code de sortie non nul, et un message de la forme
+**Résultat attendu :** code de sortie non nul, et un message de la forme
 `Another registered task would open this database: 'Engram Local Daemon' ...`.
 
-La detection compare **la base de donnees visee**, pas le nom de la tache. Une tache qui passe par
-un script intermediaire n'annonce pas sa configuration : dans ce cas la commande ne conclut pas a
-l'absence de conflit, elle signale l'indetermination et refuse quand meme. Une reponse inconnue
-n'est pas une reponse negative.
+La détection compare **la base de données visée**, pas le nom de la tâche. Une tâche qui passe par
+un script intermédiaire n'annonce pas sa configuration : dans ce cas la commande ne conclut pas à
+l'absence de conflit, elle signale l'indétermination et refuse quand même. Une réponse inconnue
+n'est pas une réponse négative.
 
 Pour reprendre l'installation :
 
-```powershell
+```text
 uv run --python 3.14.6 engram setup autostart --install --replace
 ```
 
-**Resultat attendu :** code 0, et un JSON dont `disabled` nomme la tache reprise.
+**Résultat attendu :** code 0, et un JSON dont `disabled` nomme la tâche reprise.
 
-```powershell
+```text
 uv run --python 3.14.6 engram setup autostart --status
 ```
 
-**Resultat attendu :** `installed` vaut `true`, `daemon_running` vaut `true`, et `conflicts` est
+**Résultat attendu :** `installed` vaut `true`, `daemon_running` vaut `true`, et `conflicts` est
 vide.
 
-> **La tache reprise est desactivee, pas supprimee.** Sa definition reste intacte dans le
-> planificateur. Pour revenir en arriere :
-> `Enable-ScheduledTask -TaskName "<nom rapporte dans disabled>"`, puis desactivez celle
-> d'Engram. La suppression definitive reste votre geste, jamais celui de la commande.
+> **La tâche reprise est désactivée, pas supprimée.** Sa définition reste intacte dans le
+> planificateur. Pour revenir en arrière, réactivez-la depuis PowerShell puis désactivez celle
+> d'Engram :
+>
+> ```powershell
+> Enable-ScheduledTask -TaskName "<nom rapporte dans disabled>"
+> ```
+>
+> La suppression définitive reste votre geste, jamais celui de la commande.
 
-`--replace` arrete proprement le daemon issu de la tache reprise et **attend la liberation du
-verrou de la base**, pas un delai fixe. Rejouer `--install --replace` sur un systeme deja converge
+`--replace` arrête proprement le démon issu de la tâche reprise et **attend la libération du
+verrou de la base**, pas un délai fixe. Rejouer `--install --replace` sur un système déjà convergé
 sort en 0 sans rien changer.
 
-En dernier recours, `--force` installe malgre un conflit ou une indetermination. A n'utiliser que
-si vous savez que l'autre tache n'ouvrira pas cette base : deux daemons sur la meme base, c'est le
+En dernier recours, `--force` installe malgré un conflit ou une indétermination. À n'utiliser que
+si vous savez que l'autre tâche n'ouvrira pas cette base : deux démons sur la même base, c'est le
 second qui meurt sur le verrou.
 
-Points a connaitre :
+Points à connaître :
 
-- la tache est nommee d'apres le chemin de votre `engram.toml`. Deux installations distinctes ont
-  deux taches distinctes, et aucune ne remplace l'autre en silence ;
-- `--install` ne demarre pas un second daemon si la base est deja detenue. Il l'ecrit dans
-  `start_skipped_reason` au lieu de faire semblant d'avoir reussi ;
-- hors Windows, la commande echoue explicitement en code `2` et ne fait rien. Sur un autre systeme,
-  supervisez `engram serve` avec le gestionnaire de services local ;
-- pour cibler un fichier de configuration precis, ajoutez `--config <chemin>` avant la
-  sous-commande. La tache enregistre ce chemin en clair, elle n'herite d'aucune variable
+- la tâche est nommée d'après le chemin de votre `engram.toml`. Deux installations distinctes ont
+  deux tâches distinctes, et aucune ne remplace l'autre en silence ;
+- `--install` ne démarre pas un second démon si la base est déjà détenue. Il l'écrit dans
+  `start_skipped_reason` au lieu de faire semblant d'avoir réussi ;
+- hors Windows, la commande échoue explicitement en code `2` et ne fait rien. Sur un autre système,
+  utilisez [Installer en service sous macOS et Linux](installation-unix.md) ;
+- pour cibler un fichier de configuration précis, ajoutez `--config <chemin>` avant la
+  sous-commande. La tâche enregistre ce chemin en clair, elle n'hérite d'aucune variable
   d'environnement.
 
-### Arreter le daemon proprement
+### macOS et Linux : systemd ou launchd
 
-Un daemon sans console ne peut recevoir ni `Ctrl+C` ni `Ctrl+Break`. Pour lui demander de
-s'arreter, deposez un fichier vide `<base>.stop` a cote de la base - le meme repertoire que le
-verrou :
+`engram setup autostart` construit une tâche planifiée Windows et rien d'autre ; sur toute autre
+plateforme elle refuse avec le code `2` plutôt que de faire croire à une installation. Les fichiers
+d'unité équivalents, prêts à remplir, sont dans
+[Installer en service sous macOS et Linux](installation-unix.md) : une unité **utilisateur** systemd
+pour Linux et un **LaunchAgent** launchd pour macOS, tous deux lançant `engram serve` avec un
+chemin `--config` absolu.
 
-```powershell
-New-Item -ItemType File -Path "local\runtime\engram.db.stop" -Force
+En attendant d'en installer un, lancez le démon dans un terminal :
+
+```text
+uv run --python 3.14.6 engram serve
 ```
 
-**Resultat attendu :** le processus sort seul en code `0`, et **`engram.db-wal` comme
-`engram.db-shm` disparaissent**. C'est la preuve observable d'une fermeture propre : SQLite ne
-supprime ces deux fichiers qu'a la fermeture de la derniere connexion. Le daemon efface lui-meme la
-sentinelle en partant.
+### Arrêter le démon proprement
 
-Le droit d'arreter Engram est donc exactement le droit d'ecrire dans le repertoire de sa base, qui
-est deja le droit de la corrompre. Aucun port n'expose cette capacite.
+Quel que soit ce qui l'a lancé — tâche d'ouverture de session, systemd, launchd ou un terminal —
+une seule commande demande au démon propriétaire de cette base de la fermer et de sortir, puis
+attend et rapporte ce qui s'est réellement passé :
 
-Une sentinelle oubliee n'empeche pas le demarrage suivant : le daemon efface celle qu'il trouve
-**apres** avoir pris le verrou. Un second `serve` lance par erreur echoue sur le verrou sans
-toucher a une demande d'arret destinee au daemon en place.
+```text
+uv run --python 3.14.6 engram stop
+```
+
+**Résultat attendu :** un JSON avec `"stopped": true`, et **`engram.db-wal` comme `engram.db-shm`
+disparaissent**. C'est la preuve observable d'une fermeture propre : SQLite ne supprime ces deux
+fichiers qu'à la fermeture de la dernière connexion. Si aucun processus ne détient la base, la
+commande répond `"requested": false, "stopped": true` et ne change rien.
+
+`engram stop` n'annonce pas une réussite qu'il n'a pas obtenue. Il attend sur le verrou de
+propriété, et si le démon détient toujours la base à l'expiration du délai, il échoue et le dit,
+en laissant la demande en place.
+
+Le mécanisme sous-jacent est un fichier sentinelle : un démon sans console ne peut recevoir ni
+`Ctrl+C` ni `Ctrl+Break`, donc `engram stop` dépose un `<base>.stop` vide à côté du
+`[database].path` configuré — le même répertoire que le `<base>.lock` — et le démon l'efface en
+partant. Utilisez la commande plutôt que le fichier : la commande résout ce chemin depuis la
+configuration même que le démon a chargée, alors qu'un chemin tapé à la main qui ne correspond à
+aucune configuration livrée écrit la demande là où personne ne regarde, et donne l'illusion d'avoir
+fonctionné.
+
+Le droit d'arrêter Engram est donc exactement le droit d'écrire dans le répertoire de sa base, qui
+est déjà le droit de la corrompre. Aucun port n'expose cette capacité.
+
+Une sentinelle oubliée n'empêche pas le démarrage suivant : le démon efface celle qu'il trouve
+**après** avoir pris le verrou. Un second `serve` lancé par erreur échoue sur le verrou sans
+toucher à une demande d'arrêt destinée au démon en place.
 
 Pour un diagnostic au premier plan, `engram serve` reste disponible et se comporte comme avant :
-il occupe le terminal et s'arrete a sa fermeture. Arretez d'abord le daemon, car un seul processus
-Engram peut ecrire cette base.
+il occupe le terminal et s'arrête à sa fermeture ou sur `Ctrl+C`. Arrêtez d'abord le démon, car un
+seul processus Engram peut écrire cette base.
 
 Testez avec un client MCP, pas avec un navigateur.
 
 ## 3. Choisir un seul client
 
-Les options suivantes sont independantes. Configurez-en une, puis passez directement a la
-[verification](#4-verification-fonctionnelle).
+### La commande unique qui configure n'importe lequel
+
+```text
+uv run --python 3.14.6 engram setup client claude
+uv run --python 3.14.6 engram setup client codex
+uv run --python 3.14.6 engram setup client gemini
+```
+
+N'en lancez qu'une. Chacune écrit la configuration MCP du fournisseur en utilisant **l'endpoint de
+la configuration chargée**, pas le `8377` qu'affiche cette page : une installation qui a changé de
+port reste donc correcte sans que personne n'ait à remarquer la différence.
+
+| Client | Fichier écrit | Fichier d'instructions pour `--protocol` |
+| --- | --- | --- |
+| `claude` | `.mcp.json` dans le répertoire courant | `CLAUDE.md` dans le répertoire courant |
+| `codex` | `~/.codex/config.toml` | `AGENTS.md` dans le répertoire courant |
+| `gemini` | `~/.gemini/settings.json` | `GEMINI.md` dans le répertoire courant |
+
+| Option | Effet |
+| --- | --- |
+| `--protocol` | Ajoute aussi le [protocole client](client-protocol.md) au fichier d'instructions de ce client, une seule fois. Rejouer la commande ne change rien. |
+| `--print` | Affiche le bloc au lieu de l'écrire. Rien n'est modifié. |
+| `--force` | Remplace une entrée `engram` existante qui nomme un endpoint **différent**. Sans cette option, la commande refuse plutôt que de réorienter en silence un client qui fonctionne. |
+
+Elle fusionne, elle n'écrase pas : les autres serveurs MCP, les clés sans rapport et les
+commentaires TOML de ces fichiers survivent. Rejouée alors que l'entrée est déjà correcte, elle
+n'écrit rien et le dit.
+
+**Résultat attendu :** le fichier existe et contient votre endpoint. Redémarrez le client, puis
+passez à la [vérification](#4-verification-fonctionnelle).
+
+La suite de cette section est la solution de repli, à écrire à la main, pour un client que cette
+commande ne couvre pas ou un fichier que vous préférez rédiger vous-même. Les options sont
+indépendantes ; configurez-en une.
 
 ### Option A : Claude
 
 #### Claude Code
 
-```powershell
+```text
 claude mcp add --transport http engram http://127.0.0.1:8377/mcp --scope user
 claude mcp list
 ```
 
-Equivalent dans un `.mcp.json` de projet :
+Équivalent dans un `.mcp.json` de projet — c'est ce qu'écrit `engram setup client claude` :
 
 ```json
 {
@@ -190,20 +281,20 @@ Equivalent dans un `.mcp.json` de projet :
 ```
 
 Ajoutez le [protocole client](client-protocol.md) aux instructions utilisateur de Claude Code ou
-dans un `CLAUDE.md` local non commite.
+dans un `CLAUDE.md` local non commité.
 
-**Resultat attendu :** `claude mcp list` affiche `engram` connecte. Reference :
+**Résultat attendu :** `claude mcp list` affiche `engram` connecté. Référence :
 [guide MCP Claude Code](https://code.claude.com/docs/en/mcp).
 
 #### Claude Desktop
 
-Claude Desktop resout ses connecteurs HTTP depuis une infrastructure distante : `127.0.0.1` sur
-votre PC n'est pas joignable. Pour Desktop, placez Engram derriere un proxy HTTPS authentifie, puis
+Claude Desktop résout ses connecteurs HTTP depuis une infrastructure distante : `127.0.0.1` sur
+votre PC n'est pas joignable. Pour Desktop, placez Engram derrière un proxy HTTPS authentifié, puis
 ajoutez cette URL dans **Settings > Connectors > Add custom connector**.
 
-Les extensions Desktop et les serveurs MCP locaux sont un mecanisme distinct. Engram ne livre pas
+Les extensions Desktop et les serveurs MCP locaux sont un mécanisme distinct. Engram ne livre pas
 encore d'extension Desktop ni de transport stdio ; pour cette release HTTP, choisissez Claude Code
-en local ou un connecteur distant securise. References :
+en local ou un connecteur distant sécurisé. Références :
 [connecteurs MCP distants](https://support.claude.com/en/articles/11175166-get-started-with-custom-connectors-using-remote-mcp) et
 [connecteurs Desktop ou web](https://support.claude.com/en/articles/11725091-when-to-use-desktop-and-web-connectors).
 
@@ -215,17 +306,21 @@ Ajoutez dans `~/.codex/config.toml` :
 [mcp_servers.engram]
 url = "http://127.0.0.1:8377/mcp"
 enabled = true
-required = true
 startup_timeout_sec = 10
 tool_timeout_sec = 30
 ```
 
-Redemarrez Codex, puis ajoutez le [protocole client](client-protocol.md) aux instructions
-utilisateur ou a un `AGENTS.md` de portee adaptee.
+**N'ajoutez jamais la clé `required` à ce bloc.** OpenAI la définit comme faisant échouer le
+démarrage de Codex quand le serveur ne peut pas s'initialiser : un courtier de mémoire simplement
+arrêté emporterait alors tout votre assistant avec lui. Le bloc ci-dessus est exactement ce
+qu'écrit `engram setup client codex`, et il omet cette clé délibérément.
 
-**Resultat attendu :** Codex voit `recall` et `remember` sous `engram`. Dans l'application desktop,
-le meme reglage se trouve dans **Settings > MCP servers > Add server > Streamable HTTP**.
-Reference : [guide MCP Codex](https://developers.openai.com/codex/mcp/).
+Redémarrez Codex, puis ajoutez le [protocole client](client-protocol.md) aux instructions
+utilisateur ou à un `AGENTS.md` de portée adaptée.
+
+**Résultat attendu :** Codex voit `recall` et `remember` sous `engram`. Dans l'application desktop,
+le même réglage se trouve dans **Settings > MCP servers > Add server > Streamable HTTP**.
+Référence : [guide MCP Codex](https://developers.openai.com/codex/mcp/).
 
 ### Option C : Gemini
 
@@ -242,24 +337,36 @@ Gemini CLI et Gemini Code Assist pour VS Code partagent `~/.gemini/settings.json
 ```
 
 Placez le [protocole client](client-protocol.md) dans le `GEMINI.md` utilisateur ou projet, puis
-executez `/mcp`. Rechargez VS Code si necessaire.
+exécutez `/mcp`. Rechargez VS Code si nécessaire.
 
-**Resultat attendu :** `/mcp` affiche Engram et ses deux outils. Gemini Code Assist pour IntelliJ
-prend aussi en charge MCP, mais utilise un fichier `mcp.json` separe dans le dossier de
-configuration de l'IDE ; ne reutilisez pas automatiquement `~/.gemini/settings.json`.
-Reference : [documentation Gemini Code Assist](https://developers.google.com/gemini-code-assist/docs/use-agentic-chat-pair-programmer).
+**Résultat attendu :** `/mcp` affiche Engram et ses deux outils. Gemini Code Assist pour IntelliJ
+prend aussi en charge MCP, mais utilise un fichier `mcp.json` séparé dans le dossier de
+configuration de l'IDE ; ne réutilisez pas automatiquement `~/.gemini/settings.json`.
+Référence : [documentation Gemini Code Assist](https://developers.google.com/gemini-code-assist/docs/use-agentic-chat-pair-programmer).
 
-## 4. Verification fonctionnelle
+<a id="4-verification-fonctionnelle"></a>
+
+## 4. Vérification fonctionnelle
+
+Avant d'ouvrir le client, confirmez une fois le côté serveur :
+
+```text
+uv run --python 3.14.6 engram doctor
+```
+
+**Résultat attendu :** aucune ligne `[fail]`, `daemon` indique `serving`, et `endpoint` indique que
+votre URL accepte les connexions. Si le client ne se connecte toujours pas après cela, le problème
+est dans le fichier de configuration du client, pas dans Engram.
 
 Dans le client choisi :
 
-1. appelez `recall` avec une requete de contexte et `scope="user"` ;
-2. appelez `remember` avec un episode de test non sensible ;
-3. rappelez la meme requete depuis le meme client ;
-4. verifiez que le candidat apparait dans `own_pending`, pas dans `current`.
+1. appelez `recall` avec une requête de contexte et `scope="user"` ;
+2. appelez `remember` avec un épisode de test non sensible ;
+3. rappelez la même requête depuis le même client ;
+4. vérifiez que le candidat apparaît dans `own_pending`, pas dans `current`.
 
 Le candidat est volontairement en quarantaine. Un autre client ne doit pas le voir dans son propre
 `own_pending`.
 
-**Etape suivante :** suivez le [guide utilisateur](user-guide.md). Si un resultat manque, ouvrez
-la [FAQ](faq.md) avant de modifier plusieurs reglages.
+**Étape suivante :** suivez le [guide utilisateur](user-guide.md). Si un résultat manque, ouvrez
+la [FAQ](faq.md) avant de modifier plusieurs réglages.

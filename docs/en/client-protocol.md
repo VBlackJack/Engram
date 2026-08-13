@@ -1,6 +1,6 @@
 # Engram client protocol
 
-[Francais](../fr/client-protocol.md) | [English](client-protocol.md)
+[Français](../fr/client-protocol.md) | [English](client-protocol.md)
 
 > **Goal:** teach the client when to call Engram.<br>
 > **Action:** copy the [ready-to-paste block](#ready-to-paste-instruction), then return to the
