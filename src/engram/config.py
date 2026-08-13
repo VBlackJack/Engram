@@ -10,8 +10,10 @@ import os
 import shlex
 import tomllib
 import unicodedata
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import InitVar, dataclass, field
+from dataclasses import fields as dataclass_fields
+from difflib import get_close_matches
 from enum import StrEnum
 from ipaddress import ip_address
 from pathlib import Path
@@ -423,6 +425,7 @@ def load_config(
     except tomllib.TOMLDecodeError as exc:
         raise ConfigError(f"Invalid TOML configuration: {exc}") from exc
 
+    _reject_unknown_configuration(raw)
     database = _section(raw, "database")
     ttl_days = _section(raw, "ttl_days")
     limits = _section(raw, "limits")
@@ -703,6 +706,7 @@ def load_preflight_config(
     except tomllib.TOMLDecodeError as exc:
         raise ConfigError(f"Invalid TOML configuration: {exc}") from exc
 
+    _reject_unknown_configuration(raw)
     database = _section(raw, "database")
     limits = _section(raw, "limits")
     logging_config = _section(raw, "logging")
@@ -762,6 +766,48 @@ def load_preflight_config(
     if result.logging.console_level not in SUPPORTED_LOG_LEVELS:
         raise ConfigError(f"Unsupported console log level: {result.logging.console_level}")
     return result
+
+
+def _known_sections() -> dict[str, frozenset[str]]:
+    """Map every configuration section to the keys Engram actually reads from it."""
+    return {
+        "database": frozenset(field.name for field in dataclass_fields(DatabaseConfig)),
+        "ttl_days": frozenset(field.name for field in dataclass_fields(TtlConfig)),
+        "limits": frozenset(field.name for field in dataclass_fields(LimitsConfig)),
+        "logging": frozenset(field.name for field in dataclass_fields(LoggingConfig)),
+        "attestation": frozenset(field.name for field in dataclass_fields(AttestationConfig)),
+        "server": frozenset(field.name for field in dataclass_fields(ServerConfig)),
+        "capsule": frozenset(field.name for field in dataclass_fields(CapsuleConfig)),
+        "retrieval": frozenset(field.name for field in dataclass_fields(RetrievalConfig)),
+        "datacron": frozenset(field.name for field in dataclass_fields(DatacronConfig)),
+    }
+
+
+def _reject_unknown_configuration(raw: Mapping[str, Any]) -> None:
+    """Refuse a key Engram does not read, instead of running on the default it hides.
+
+    A misspelt key loads without a word and leaves the value the user meant to
+    set at its default. Measured before this check existed: `[server] prot` and
+    `[servr] port` both left the endpoint on 8377, and a misspelt `[database]
+    path` opens a different database from the configured one, so new memories go
+    somewhere nobody will look for them again. The loader validated types and
+    never names.
+    """
+    known = _known_sections()
+    for name in sorted(raw):
+        if name not in known:
+            raise ConfigError(f"Unknown configuration section: [{name}]{_suggestion(name, known)}")
+        table = raw[name]
+        if not isinstance(table, dict):
+            continue
+        for key in sorted(table):
+            if key not in known[name]:
+                raise ConfigError(f"Unknown key in [{name}]: {key}{_suggestion(key, known[name])}")
+
+
+def _suggestion(value: str, candidates: Iterable[str]) -> str:
+    close = get_close_matches(value, list(candidates), n=1)
+    return f". Did you mean {close[0]}?" if close else ""
 
 
 def _section(raw: dict[str, Any], name: str) -> dict[str, Any]:

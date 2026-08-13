@@ -25,8 +25,10 @@ from engram.config import (
     RetrievalMode,
     ServerConfig,
     load_config,
+    load_preflight_config,
 )
 from engram.logging_setup import FileLogger
+from engram.resources import example_config_text
 
 
 def test_load_config_applies_environment_overrides(tmp_path: Path) -> None:
@@ -506,3 +508,54 @@ handler.close()
     log_files = [log_path, *sorted(tmp_path.glob("shared.log.[1-3]"))]
     assert len(log_files) == 4
     assert all(path.stat().st_size <= 1150 for path in log_files)
+
+
+def test_a_misspelt_key_is_refused_instead_of_silently_ignored(tmp_path: Path) -> None:
+    """A key Engram does not read is a value the user set and never got."""
+    path = tmp_path / "engram.toml"
+    path.write_text("[server]\nprot = 9000\n", encoding="utf-8")
+
+    with pytest.raises(ConfigError, match=r"Unknown key in \[server\]: prot"):
+        load_config(path)
+
+
+def test_a_misspelt_key_names_the_one_it_resembles(tmp_path: Path) -> None:
+    path = tmp_path / "engram.toml"
+    path.write_text("[server]\nprot = 9000\n", encoding="utf-8")
+
+    with pytest.raises(ConfigError, match="Did you mean port"):
+        load_config(path)
+
+
+def test_a_misspelt_section_is_refused(tmp_path: Path) -> None:
+    """[servr] used to load with every server value left at its default."""
+    path = tmp_path / "engram.toml"
+    path.write_text("[servr]\nport = 9000\n", encoding="utf-8")
+
+    with pytest.raises(ConfigError, match=r"Unknown configuration section: \[servr\]"):
+        load_config(path)
+
+
+def test_a_misspelt_database_path_cannot_open_a_different_database(tmp_path: Path) -> None:
+    """The worst case of the class: memories written where nobody will look."""
+    path = tmp_path / "engram.toml"
+    path.write_text('[database]\npathh = "elsewhere.db"\n', encoding="utf-8")
+
+    with pytest.raises(ConfigError, match=r"Unknown key in \[database\]: pathh"):
+        load_config(path)
+
+
+def test_the_shipped_template_passes_its_own_key_check(tmp_path: Path) -> None:
+    """The check is worthless if the configuration the project ships cannot clear it."""
+    path = tmp_path / "engram.toml"
+    path.write_text(example_config_text(), encoding="utf-8")
+
+    assert load_config(path).server.port == 8377
+
+
+def test_the_preflight_loader_refuses_the_same_keys(tmp_path: Path) -> None:
+    path = tmp_path / "engram.toml"
+    path.write_text("[limits]\nmax_statement_charss = 10\n", encoding="utf-8")
+
+    with pytest.raises(ConfigError, match=r"Unknown key in \[limits\]"):
+        load_preflight_config(path)
