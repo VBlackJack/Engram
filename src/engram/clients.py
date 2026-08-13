@@ -19,11 +19,13 @@ from __future__ import annotations
 import json
 import os
 import tomllib
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from .config import format_endpoint
 from .resources import client_protocol_text
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -57,7 +59,7 @@ class ClientPlan:
 
 def endpoint_url(config: AppConfig) -> str:
     """Return the endpoint a client must be pointed at for this configuration."""
-    return f"http://{config.server.host}:{config.server.port}{config.server.path}"
+    return format_endpoint(config.server.host, config.server.port, config.server.path)
 
 
 def plan_client(kind: ClientKind, config: AppConfig, *, home: Path | None = None) -> ClientPlan:
@@ -91,7 +93,7 @@ def plan_client(kind: ClientKind, config: AppConfig, *, home: Path | None = None
         config_path=path,
         instructions_path=Path.cwd() / "AGENTS.md",
         block=_render_codex_block(url),
-        already_correct=_codex_url(path) == url,
+        already_correct=_codex_declares(path, url),
     )
 
 
@@ -184,21 +186,39 @@ def _write_json_client(plan: ClientPlan, *, force: bool) -> None:
     plan.config_path.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
 
 
-def _codex_url(path: Path) -> str | None:
+def _codex_declares(path: Path, url: str) -> bool:
+    """Return whether Codex already names exactly this endpoint."""
+    entry = _codex_entry(path)
+    return entry is not None and entry.get("url") == url
+
+
+def _codex_entry(path: Path) -> Mapping[str, object] | None:
+    """Return the table Codex already declares for Engram, or None when it has none.
+
+    Reading only the url conflated three different states: no table, a table
+    naming another endpoint, and a table that exists without a url. The last one
+    read as "nothing is configured", so a second table of the same name was
+    appended -- which TOML forbids -- and the command reported success over a
+    file Codex can no longer parse. A document that does not parse is likewise
+    not an absent table: appending to it would confirm a configuration nobody
+    can load.
+    """
     if not path.is_file():
         return None
     try:
         document = tomllib.loads(path.read_text(encoding="utf-8"))
-    except (OSError, tomllib.TOMLDecodeError):
-        return None
+    except OSError as exc:
+        raise ClientConfigError(f"{path} cannot be read: {exc}") from exc
+    except tomllib.TOMLDecodeError as exc:
+        raise ClientConfigError(
+            f"{path} is not valid TOML: {exc}. Repair it before connecting a client; "
+            "appending to it would leave Codex unable to start."
+        ) from exc
     servers = document.get("mcp_servers")
     if not isinstance(servers, dict):
         return None
     entry = servers.get(SERVER_KEY)
-    if not isinstance(entry, dict):
-        return None
-    url = entry.get("url")
-    return url if isinstance(url, str) else None
+    return entry if isinstance(entry, Mapping) else None
 
 
 def _write_codex(plan: ClientPlan, *, force: bool) -> None:
@@ -211,9 +231,10 @@ def _write_codex(plan: ClientPlan, *, force: bool) -> None:
     silently destroyed.
     """
     del force
-    if _codex_url(plan.config_path) is not None:
+    if _codex_entry(plan.config_path) is not None:
         raise ClientConfigError(
-            f"{plan.config_path} already configures '{SERVER_KEY}' with a different endpoint. "
+            f"{plan.config_path} already declares [mcp_servers.{SERVER_KEY}]. TOML forbids the "
+            "same table twice, so appending a second one would leave a file Codex cannot parse. "
             "It is not rewritten even with --force, because substituting a table textually in a "
             "document this project does not own loses comments and ordering. Edit the url in "
             "place, or run with --print and merge the block yourself."

@@ -70,6 +70,24 @@ def validate_loopback_host(host: str) -> None:
         raise ConfigError("server.host must be a loopback IP literal")
 
 
+def format_endpoint(host: str, port: int, path: str) -> str:
+    """Render the URL a client must be pointed at, for any accepted loopback host.
+
+    An IPv6 literal has to be bracketed inside a URL, because the character that
+    separates a host from its port is the same one the address is written with:
+    `http://::1:8377/mcp` parses as neither a host nor a port, and every client
+    rejects it. `server.host` accepts any loopback literal, `::1` included, so a
+    configuration this project documents as supported produced an endpoint no
+    client could resolve, printed by commands whose whole purpose is to hand that
+    endpoint over.
+
+    The socket API takes the address unbracketed, so only what is shown or
+    written to a client configuration goes through here.
+    """
+    rendered = f"[{host}]" if ":" in host else host
+    return f"http://{rendered}:{port}{path}"
+
+
 @dataclass(frozen=True, slots=True)
 class DatabaseConfig:
     """SQLite connection settings."""

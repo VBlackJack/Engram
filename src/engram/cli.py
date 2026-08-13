@@ -861,7 +861,7 @@ def _init(config_path: Path, *, force: bool) -> None:
     _write_lines(
         f"Wrote {config_path}",
         f"Database: {config.database.path}",
-        f"Endpoint: http://{config.server.host}:{config.server.port}{config.server.path}",
+        f"Endpoint: {endpoint_url(config)}",
         "",
         "Next: engram doctor",
     )

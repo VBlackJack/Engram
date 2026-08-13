@@ -7,7 +7,9 @@ from __future__ import annotations
 
 import json
 import tomllib
+from dataclasses import replace
 from pathlib import Path
+from urllib.parse import urlparse
 
 import pytest
 
@@ -20,7 +22,7 @@ from engram.clients import (
     install_protocol,
     plan_client,
 )
-from engram.config import AppConfig
+from engram.config import AppConfig, ServerConfig
 from engram.resources import client_protocol_text
 
 DOCUMENTED_PROTOCOL = Path(__file__).resolve().parent.parent / "docs" / "en" / "client-protocol.md"
@@ -188,3 +190,77 @@ def test_the_packaged_protocol_is_the_one_the_documentation_publishes() -> None:
     published = DOCUMENTED_PROTOCOL.read_text(encoding="utf-8")
 
     assert client_protocol_text().strip() in published
+
+
+@pytest.mark.parametrize(
+    ("host", "expected"),
+    [
+        ("127.0.0.1", "http://127.0.0.1:8377/mcp"),
+        ("127.0.0.5", "http://127.0.0.5:8377/mcp"),
+        ("::1", "http://[::1]:8377/mcp"),
+    ],
+)
+def test_an_ipv6_endpoint_is_bracketed_so_a_client_can_parse_it(
+    host: str,
+    expected: str,
+    app_config: AppConfig,
+) -> None:
+    """server.host accepts every loopback literal, so the URL has to survive all of them."""
+    config = replace(app_config, server=ServerConfig(host=host, port=8377, path="/mcp"))
+
+    url = endpoint_url(config)
+    parsed = urlparse(url)
+
+    assert url == expected
+    assert parsed.hostname == host
+    assert parsed.port == 8377
+
+
+def test_a_codex_table_without_a_url_is_refused_rather_than_duplicated(
+    app_config: AppConfig,
+    workspace: Path,
+) -> None:
+    """TOML forbids the same table twice; appending one produced a file Codex cannot read."""
+    plan = plan_client(ClientKind.CODEX, app_config, home=workspace)
+    plan.config_path.parent.mkdir(parents=True, exist_ok=True)
+    plan.config_path.write_text("[mcp_servers.engram]\nenabled = true\n", encoding="utf-8")
+
+    with pytest.raises(ClientConfigError, match="already declares"):
+        connect(plan_client(ClientKind.CODEX, app_config, home=workspace), force=False)
+
+    text = plan.config_path.read_text(encoding="utf-8")
+    assert text.count("[mcp_servers.engram]") == 1
+    assert tomllib.loads(text)
+
+
+def test_a_codex_file_that_is_not_valid_toml_is_never_appended_to(
+    app_config: AppConfig,
+    workspace: Path,
+) -> None:
+    """A document that does not parse is not an absent table."""
+    plan = plan_client(ClientKind.CODEX, app_config, home=workspace)
+    plan.config_path.parent.mkdir(parents=True, exist_ok=True)
+    plan.config_path.write_text("[mcp_servers.engram\nbroken\n", encoding="utf-8")
+
+    with pytest.raises(ClientConfigError, match="not valid TOML"):
+        plan_client(ClientKind.CODEX, app_config, home=workspace)
+
+    assert plan.config_path.read_text(encoding="utf-8") == "[mcp_servers.engram\nbroken\n"
+
+
+def test_a_codex_table_naming_another_endpoint_is_refused_even_with_force(
+    app_config: AppConfig,
+    workspace: Path,
+) -> None:
+    """Rewriting a table textually would lose the comments and ordering around it."""
+    plan = plan_client(ClientKind.CODEX, app_config, home=workspace)
+    plan.config_path.parent.mkdir(parents=True, exist_ok=True)
+    plan.config_path.write_text(
+        '# kept\n[mcp_servers.engram]\nurl = "http://127.0.0.1:9999/mcp"\n',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ClientConfigError, match="already declares"):
+        connect(plan_client(ClientKind.CODEX, app_config, home=workspace), force=True)
+
+    assert "# kept" in plan.config_path.read_text(encoding="utf-8")

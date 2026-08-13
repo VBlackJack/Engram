@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from .autostart import DatabaseOwnership, database_ownership
-from .config import ConfigError, load_config
+from .config import ConfigError, format_endpoint, load_config
 from .db import MINIMUM_SQLITE_VERSION, WINDOWS_SQLITE_GUIDE_URL, latest_schema_version
 from .process_lock import DatabaseLockRole, database_lock_path
 
@@ -212,7 +212,11 @@ def _check_endpoint(config: AppConfig, *, serving: bool) -> Check:
     and a client pointed there reaches whatever answers rather than the database
     the operator is looking at.
     """
-    endpoint = f"http://{config.server.host}:{config.server.port}{config.server.path}"
+    endpoint = format_endpoint(
+        config.server.host,
+        config.server.port,
+        config.server.path,
+    )
     accepting = _endpoint_accepts(config)
     if serving and accepting:
         return Check(name="endpoint", outcome=Outcome.OK, detail=f"{endpoint} accepts")
