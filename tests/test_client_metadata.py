@@ -1,12 +1,14 @@
 # Copyright 2026 Julien Bombled
 # SPDX-License-Identifier: Apache-2.0
 
-"""File metadata a vendor configuration keeps across an atomic replacement.
+"""What a vendor configuration keeps when Engram writes to it.
 
-Replacing a path is not the same act as writing a file. A rename carries the
-permissions of whatever is renamed, and it replaces a symlink rather than the
-file that symlink names. Both cost the user something the command claimed not to
-touch, so both are pinned here.
+Replacing a path is not the same act as writing a file: a rename discards the
+destination inode and everything only it carried -- the permission bits, the
+owner, the extended attributes, the hard links, and on Windows the security
+descriptor, the file attributes and the alternate data streams. Writing through
+the existing file keeps all of them because nothing is discarded, and these tests
+are what says so on each platform rather than in a comment.
 """
 
 from __future__ import annotations
@@ -15,6 +17,7 @@ import json
 import os
 import socket
 import stat
+import subprocess
 import sys
 import tomllib
 from pathlib import Path
@@ -202,39 +205,37 @@ def test_a_symlinked_configuration_keeps_the_permissions_of_its_target(
 
 def _staging_leftovers(directory: Path) -> list[str]:
     """Return any file the write staged in and failed to clean up."""
-    return sorted(entry.name for entry in directory.iterdir() if entry.name.endswith(".part"))
+    return sorted(entry.name for entry in directory.iterdir() if entry.name.endswith(".engram-new"))
 
 
-@posix_only
 @pytest.mark.parametrize("kind", [ClientKind.CLAUDE, ClientKind.CODEX, ClientKind.GEMINI])
-def test_a_hard_linked_configuration_is_refused_rather_than_detached(
+def test_a_hard_linked_configuration_keeps_every_name_on_the_same_file(
     kind: ClientKind,
     app_config: AppConfig,
     workspace: Path,
     tmp_path: Path,
 ) -> None:
-    """A rename swaps a directory entry, so the other names keep the old content.
+    """A rename would swap the directory entry and leave the other names behind.
 
-    Replacing a hard-linked configuration silently makes this name a different
-    file from the one its other names still point at.
+    Writing through the file keeps every name on one inode, which is what a hard
+    link means: all of them see the change.
     """
     plan = plan_client(kind, app_config, home=workspace)
-    seeded = _seed(kind, plan.config_path)
+    _seed(kind, plan.config_path)
     peer = tmp_path / f"peer-{kind.value}"
     os.link(plan.config_path, peer)
     assert plan.config_path.stat().st_nlink == 2
 
-    with pytest.raises(ClientConfigError, match="hard links"):
-        connect(plan_client(kind, app_config, home=workspace), force=False)
+    connect(plan_client(kind, app_config, home=workspace), force=False)
 
-    assert plan.config_path.read_bytes() == seeded
-    assert peer.samefile(plan.config_path)
+    assert peer.samefile(plan.config_path), "the link was broken"
     assert plan.config_path.stat().st_nlink == 2
+    assert peer.read_bytes() == plan.config_path.read_bytes()
+    assert endpoint_url(app_config).encode("utf-8") in peer.read_bytes()
     assert _staging_leftovers(plan.config_path.parent) == []
 
 
-@posix_only
-def test_a_hard_linked_instructions_file_is_refused_rather_than_detached(
+def test_a_hard_linked_instructions_file_keeps_every_name_on_the_same_file(
     app_config: AppConfig,
     workspace: Path,
     tmp_path: Path,
@@ -244,16 +245,16 @@ def test_a_hard_linked_instructions_file_is_refused_rather_than_detached(
     peer = tmp_path / "peer-CLAUDE.md"
     os.link(plan.instructions_path, peer)
 
-    with pytest.raises(ClientConfigError, match="hard links"):
-        install_protocol(plan)
+    assert install_protocol(plan) is True
 
-    assert plan.instructions_path.read_bytes() == b"# Shared guidance\n"
-    assert peer.samefile(plan.instructions_path)
+    assert peer.samefile(plan.instructions_path), "the link was broken"
+    assert peer.read_bytes().startswith(b"# Shared guidance\n")
+    assert b"Engram session protocol" in peer.read_bytes()
     assert _staging_leftovers(plan.instructions_path.parent) == []
 
 
 @posix_only
-@pytest.mark.parametrize("maker", ["fifo", "socket", "directory"])
+@pytest.mark.parametrize("maker", ["fifo", "socket"])
 def test_a_destination_that_is_not_a_regular_file_is_refused(
     maker: str,
     app_config: AppConfig,
@@ -337,3 +338,118 @@ def test_a_successful_write_leaves_no_temporary_behind(
     connect(plan_client(kind, app_config, home=workspace), force=False)
 
     assert _staging_leftovers(plan.config_path.parent) == []
+
+
+def test_a_directory_in_the_way_is_refused_on_every_platform(
+    app_config: AppConfig,
+    workspace: Path,
+) -> None:
+    """Every platform has directories, so this is not a POSIX-only contract."""
+    plan = plan_client(ClientKind.GEMINI, app_config, home=workspace)
+    plan.config_path.parent.mkdir(parents=True, exist_ok=True)
+    plan.config_path.mkdir()
+
+    with pytest.raises(ClientConfigError, match="a directory"):
+        connect(plan_client(ClientKind.GEMINI, app_config, home=workspace), force=False)
+
+    assert plan.config_path.is_dir()
+    assert _staging_leftovers(plan.config_path.parent) == []
+
+
+windows_only = pytest.mark.skipif(
+    sys.platform != "win32",
+    reason="NTFS security descriptors, attributes and alternate data streams",
+)
+
+
+@windows_only
+@pytest.mark.parametrize("kind", [ClientKind.CLAUDE, ClientKind.CODEX, ClientKind.GEMINI])
+def test_an_alternate_data_stream_survives_the_replacement(
+    kind: ClientKind,
+    app_config: AppConfig,
+    workspace: Path,
+) -> None:
+    """NTFS keeps side data in named streams, which a new file does not carry."""
+    plan = plan_client(kind, app_config, home=workspace)
+    _seed(kind, plan.config_path)
+    stream = Path(f"{plan.config_path}:engram-review")
+    stream.write_bytes(b"keep-me")
+
+    connect(plan_client(kind, app_config, home=workspace), force=False)
+
+    assert stream.read_bytes() == b"keep-me"
+    assert endpoint_url(app_config).encode("utf-8") in plan.config_path.read_bytes()
+
+
+@windows_only
+def test_an_alternate_data_stream_survives_the_protocol_append(
+    app_config: AppConfig,
+    workspace: Path,
+) -> None:
+    plan = plan_client(ClientKind.CLAUDE, app_config, home=workspace)
+    plan.instructions_path.write_bytes(b"# My project\n")
+    stream = Path(f"{plan.instructions_path}:engram-review")
+    stream.write_bytes(b"keep-me")
+
+    assert install_protocol(plan) is True
+
+    assert stream.read_bytes() == b"keep-me"
+
+
+@windows_only
+def test_a_file_attribute_survives_the_replacement(
+    app_config: AppConfig,
+    workspace: Path,
+) -> None:
+    """Hidden is a property of the file; a newly created one comes back Archive."""
+    if sys.platform != "win32":  # pragma: no cover - the decorator already skips
+        return
+    plan = plan_client(ClientKind.GEMINI, app_config, home=workspace)
+    _seed(ClientKind.GEMINI, plan.config_path)
+    subprocess.run(  # noqa: S603
+        ["attrib", "+H", str(plan.config_path)],  # noqa: S607
+        capture_output=True,
+        check=True,
+    )
+    before = plan.config_path.stat().st_file_attributes
+    assert before & stat.FILE_ATTRIBUTE_HIDDEN
+
+    connect(plan_client(ClientKind.GEMINI, app_config, home=workspace), force=False)
+
+    after = plan.config_path.stat().st_file_attributes
+    assert after & stat.FILE_ATTRIBUTE_HIDDEN, f"Hidden was lost: {before:#x} -> {after:#x}"
+
+
+@windows_only
+def test_an_explicit_security_descriptor_survives_the_replacement(
+    app_config: AppConfig,
+    workspace: Path,
+) -> None:
+    """A protected DACL must not come back inherited, which is a weaker grant."""
+    plan = plan_client(ClientKind.GEMINI, app_config, home=workspace)
+    _seed(ClientKind.GEMINI, plan.config_path)
+    subprocess.run(  # noqa: S603
+        ["icacls", str(plan.config_path), "/inheritance:r", "/grant:r", f"{os.getlogin()}:F"],  # noqa: S607
+        capture_output=True,
+        check=True,
+    )
+    before = _security_descriptor(plan.config_path)
+
+    connect(plan_client(ClientKind.GEMINI, app_config, home=workspace), force=False)
+
+    assert _security_descriptor(plan.config_path) == before
+
+
+def _security_descriptor(path: Path) -> str:
+    """Return the access control list as Windows itself reports it.
+
+    Read through icacls rather than a typed binding so the assertion does not
+    depend on a package that is only a transitive dependency here.
+    """
+    completed = subprocess.run(  # noqa: S603
+        ["icacls", str(path)],  # noqa: S607
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return completed.stdout.replace(str(path), "<path>")

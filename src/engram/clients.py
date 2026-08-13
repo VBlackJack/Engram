@@ -19,8 +19,6 @@ from __future__ import annotations
 import json
 import os
 import stat
-import sys
-import tempfile
 import tomllib
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -47,21 +45,6 @@ class ClientKind(StrEnum):
 
 class ClientConfigError(RuntimeError):
     """Raised when a vendor configuration cannot be read or would be clobbered."""
-
-
-@dataclass(frozen=True, slots=True)
-class _Metadata:
-    """What a replacement promises to carry over from the file it replaces.
-
-    The promise is deliberately narrow and stated here rather than implied: the
-    permission bits, and every extended attribute this process can reproduce.
-    Anything a rename cannot preserve at all -- an inode's identity, and so its
-    hard links and its type -- is refused by `_require_replaceable` instead of
-    being lost quietly.
-    """
-
-    mode: int | None
-    xattrs: Mapping[str, bytes]
 
 
 @dataclass(frozen=True, slots=True)
@@ -132,7 +115,7 @@ def install_protocol(plan: ClientPlan) -> bool:
     existing = plan.instructions_path.read_bytes() if plan.instructions_path.is_file() else b""
     if protocol.encode("utf-8") in existing.replace(b"\r\n", b"\n"):
         return False
-    _replace_atomically(
+    _write_preserving_identity(
         plan.instructions_path,
         existing + _line_separated_appendix(existing, f"{protocol}\n"),
     )
@@ -194,7 +177,7 @@ def _write_json_client(plan: ClientPlan, *, force: bool) -> None:
         )
     servers[SERVER_KEY] = json.loads(plan.block)["mcpServers"][SERVER_KEY]
     document["mcpServers"] = servers
-    _replace_atomically(
+    _write_preserving_identity(
         plan.config_path,
         (json.dumps(document, indent=2) + "\n").encode("utf-8"),
     )
@@ -286,7 +269,7 @@ def _write_codex(plan: ClientPlan, *, force: bool) -> None:
             "The file is untouched. Repair the conflicting entry, or run with --print and "
             "merge the block yourself."
         ) from exc
-    _replace_atomically(plan.config_path, candidate)
+    _write_preserving_identity(plan.config_path, candidate)
 
 
 def _line_separated_appendix(existing: bytes, block: str) -> bytes:
@@ -304,88 +287,86 @@ def _line_separated_appendix(existing: bytes, block: str) -> bytes:
     return newline + newline + encoded
 
 
-def _require_written(temporary: Path, path: Path, data: bytes) -> None:
-    """Compare what reached the disk with what was checked, not with what was meant."""
-    if temporary.read_bytes() != data:
+def _write_preserving_identity(path: Path, data: bytes) -> None:
+    """Write bytes to a path while keeping everything about the file that is not content.
+
+    Five review rounds chased metadata off the edge of a rename: the permission
+    bits, then the symlink, then the hard links, then the extended attributes,
+    and on Windows the security descriptor, the file attributes and the alternate
+    data streams. The edge is structural, not a run of oversights. Renaming swaps
+    a directory entry, so the destination inode is discarded with everything only
+    it carried, and each of those properties then has to be collected and
+    reapplied by hand through a different native interface per platform, or it is
+    lost in silence. Enumerating them one review at a time was always going to
+    leave the next one out.
+
+    Writing through the existing file removes the class instead of enumerating
+    it. The inode is never replaced, so the security descriptor, the alternate
+    streams, the file attributes, the owner, the mode, the extended attributes
+    and every hard link survive because nothing discarded them -- on both
+    platforms, with no platform-specific code. A symlink is followed by the open
+    itself, so the link keeps pointing at the file that receives the change.
+
+    The cost is the rename's all-or-nothing guarantee, and it is bought back
+    rather than dropped: the complete content is written and flushed to a sidecar
+    first, the destination is then rewritten and read back, and the sidecar is
+    removed only once the destination is proven. An interrupted run leaves the
+    sidecar holding exactly what was intended, and the failure names it.
+    """
+    _require_writable_target(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    sidecar = path.with_name(f".{path.name}.engram-new")
+    _write_and_verify(sidecar, data, exclusive=False)
+    try:
+        _write_and_verify(path, data, exclusive=not path.exists())
+    except OSError as exc:
         raise ClientConfigError(
-            f"{path} was not written: the bytes on disk differ from the ones checked"
+            f"{path} could not be written: {exc}. The content that was meant for it is "
+            f"complete in {sidecar}; move that file into place once the cause is repaired."
+        ) from exc
+    sidecar.unlink(missing_ok=True)
+
+
+def _write_and_verify(path: Path, data: bytes, *, exclusive: bool) -> None:
+    """Put bytes in one file and prove they are the bytes on disk afterwards.
+
+    An existing file is rewritten through its own descriptor rather than
+    recreated, which is what keeps its identity and everything attached to it.
+    """
+    mode = "wb" if exclusive or not path.exists() else "r+b"
+    with path.open(mode) as stream:
+        stream.seek(0)
+        stream.write(data)
+        stream.truncate()
+        stream.flush()
+        os.fsync(stream.fileno())
+    landed = path.read_bytes()
+    if landed != data:
+        raise ClientConfigError(
+            f"{path} holds {len(landed)} bytes after a {len(data)}-byte write; "
+            "the file system did not store what was written"
         )
 
 
-def _replace_atomically(path: Path, data: bytes) -> None:
-    """Put bytes at a path without the destination ever holding a partial state.
+def _require_writable_target(path: Path) -> None:
+    """Refuse a destination that writing through would destroy rather than update.
 
-    The destination is never opened for writing. The candidate is written beside
-    it, read back so that what landed on disk is what was checked rather than
-    what was intended, and moved into place by a single rename. An interrupted
-    run therefore leaves either the previous file or a stray temporary one, never
-    a half-written configuration a client cannot parse.
-
-    The earlier attempt wrote the destination first and undid it afterwards,
-    which is not the same thing. It validated a variable rather than a file, and
-    the undo went through a text write that rewrote every line ending on Windows:
-    a refusal that announced the file was unchanged had turned it from LF to
-    CRLF. Bytes are read and written as bytes here for that reason.
-
-    A symlink names a file rather than being one. Renaming onto the link would
-    replace the link itself with a regular file, detaching a configuration a
-    dotfiles repository owns from the source it is kept in, while reporting
-    success. The target is resolved and written instead, so the link survives
-    and the canonical file receives the change.
-    """
-    destination = path.resolve() if path.is_symlink() else path
-    _require_replaceable(destination)
-    carried = _carried_metadata(destination)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, name = tempfile.mkstemp(
-        dir=destination.parent,
-        prefix=f".{destination.name}.",
-        suffix=".part",
-    )
-    temporary = Path(name)
-    try:
-        with os.fdopen(descriptor, "wb") as stream:
-            stream.write(data)
-            stream.flush()
-            os.fsync(stream.fileno())
-        _require_written(temporary, destination, data)
-        _apply_metadata(temporary, destination, carried)
-        temporary.replace(destination)
-    except BaseException:
-        temporary.unlink(missing_ok=True)
-        raise
-
-
-def _require_replaceable(destination: Path) -> None:
-    """Refuse a destination whose identity a rename is unable to preserve.
-
-    Renaming swaps a directory entry, so the inode behind the old name is
-    discarded together with everything only that inode carried. Two properties
-    are lost without a sound in the process, and neither is a change this command
-    is entitled to make: a hard-linked configuration keeps the old content under
-    its other names while this one silently becomes a different file, and a FIFO,
-    a socket or a device is replaced by an ordinary file.
-
-    Neither can be preserved by any atomic write -- preserving them means writing
-    through the existing inode, which is exactly the non-atomic operation this
-    function exists to avoid. So the contract is narrowed instead of quietly
-    broken: what cannot be honoured is refused, and the message says why.
+    A FIFO blocks on open, a socket cannot be opened at all, and a directory is
+    not a file. None of them is something a configuration writer should be
+    turning into one, and unlike the properties above, none can be preserved by
+    any means: the refusal is the contract, not a limitation of the method.
     """
     try:
-        info = destination.lstat()
+        info = path.stat()
     except (FileNotFoundError, NotADirectoryError):
         return
+    except OSError as exc:
+        raise ClientConfigError(f"{path} cannot be inspected: {exc}") from exc
     if not stat.S_ISREG(info.st_mode):
         raise ClientConfigError(
-            f"{destination} is {_describe_file_type(info.st_mode)}, not a regular file. "
-            "Engram replaces a configuration by writing a new file in its place, which would "
-            "destroy this one. Point the client at a regular file, or use --print."
-        )
-    if info.st_nlink > 1:
-        raise ClientConfigError(
-            f"{destination} has {info.st_nlink} hard links. Replacing it would leave every other "
-            "name holding the old content while this one changed, so it is refused rather than "
-            "done silently. Break the link first, or use --print and edit the file in place."
+            f"{path} is {_describe_file_type(info.st_mode)}, not a regular file. "
+            "Engram will not write a configuration over it. Point the client at a regular "
+            "file, or use --print and place the block yourself."
         )
 
 
@@ -396,107 +377,10 @@ def _describe_file_type(mode: int) -> str:
         (stat.S_ISSOCK, "a socket"),
         (stat.S_ISBLK, "a block device"),
         (stat.S_ISCHR, "a character device"),
-        (stat.S_ISLNK, "a symbolic link"),
     ):
         if predicate(mode):
             return description
     return "of an unsupported type"
-
-
-def _carried_metadata(destination: Path) -> _Metadata:
-    """Collect everything the replacement promises to bring across."""
-    return _Metadata(mode=_destination_mode(destination), xattrs=_read_xattrs(destination))
-
-
-def _read_xattrs(path: Path) -> Mapping[str, bytes]:
-    # The guard is a platform comparison rather than hasattr so that the type
-    # checker follows it: Windows has no extended attributes at all.
-    if sys.platform == "win32" or not path.exists():
-        return {}
-    try:
-        names = os.listxattr(path)
-    except OSError:
-        return {}
-    carried: dict[str, bytes] = {}
-    for name in names:
-        try:
-            carried[name] = os.getxattr(path, name)
-        except OSError:
-            continue
-    return carried
-
-
-def _carry_xattrs(temporary: Path, xattrs: Mapping[str, bytes]) -> None:
-    """Copy every extended attribute across, tolerating the ones we may not set.
-
-    A namespace such as `security.` belongs to the kernel rather than to this
-    process. Failing to set one is only acceptable when the value already there
-    matches, which the caller's read-back is what decides.
-    """
-    if sys.platform == "win32":
-        return
-    for name, value in xattrs.items():
-        try:
-            os.setxattr(temporary, name, value)
-        except OSError:
-            continue
-
-
-def _apply_metadata(temporary: Path, destination: Path, carried: _Metadata) -> None:
-    """Put the carried metadata on the replacement and prove each promise landed.
-
-    Extended attributes survive nothing about a rename either: the new file is a
-    new inode and starts with whatever the kernel gives it. They are copied, then
-    read back, because setting one can fail silently for a namespace that belongs
-    to the kernel rather than to this process. A value the kernel already applied
-    identically is honoured; anything genuinely lost is a refusal, so the command
-    never reports a success that dropped metadata a user put there.
-    """
-    if carried.mode is not None:
-        temporary.chmod(carried.mode)
-        landed = stat.S_IMODE(temporary.stat().st_mode)
-        if landed != carried.mode:
-            raise ClientConfigError(
-                f"{destination} could not be replaced: the new file carries mode {landed:o} "
-                f"rather than the {carried.mode:o} it had"
-            )
-    _carry_xattrs(temporary, carried.xattrs)
-    lost = tuple(
-        sorted(
-            name
-            for name, value in carried.xattrs.items()
-            if _read_xattrs(temporary).get(name) != value
-        )
-    )
-    if lost:
-        raise ClientConfigError(
-            f"{destination} could not be replaced without dropping the extended "
-            f"attribute(s) {', '.join(lost)}. The file is untouched; copy them across by hand, "
-            "or use --print and edit the file in place."
-        )
-
-
-def _destination_mode(path: Path) -> int | None:
-    """Return the permission bits the replacement has to carry, or None off POSIX.
-
-    A temporary file is created private, which is right while it is a temporary
-    file and wrong the moment it becomes the destination: renaming it over a
-    configuration that was readable by the group left that configuration at 0600,
-    so a file a dotfiles repository or a shared machine relied on stopped being
-    readable, silently. An existing file keeps the bits it had; a new one gets
-    what any other tool would have created under this umask, rather than the
-    stricter mode that is an artefact of how it was written.
-
-    Windows has no POSIX mode -- chmod there only toggles a read-only flag -- so
-    nothing is imposed on it.
-    """
-    if os.name == "nt":
-        return None
-    if path.exists():
-        return stat.S_IMODE(path.stat().st_mode)
-    umask = os.umask(0)
-    os.umask(umask)
-    return 0o666 & ~umask
 
 
 def default_home() -> Path:
