@@ -12,7 +12,7 @@ from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from types import MappingProxyType
-from typing import Annotated, Any, Literal, cast
+from typing import Annotated, Any, Literal, Self, cast
 
 import anyio
 from mcp.server.fastmcp import Context, FastMCP
@@ -20,16 +20,20 @@ from mcp.server.fastmcp.exceptions import ToolError
 from mcp.server.fastmcp.tools import Tool
 from mcp.server.fastmcp.utilities.func_metadata import ArgModelBase
 from mcp.server.session import ServerSession
+from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+from mcp.server.transport_security import TransportSecurityMiddleware, TransportSecuritySettings
 from mcp.types import (
     INVALID_PARAMS,
     INVALID_REQUEST,
     PARSE_ERROR,
     AnyFunction,
     CallToolResult,
+    ClientRequest,
     ErrorData,
     JSONRPCError,
     JSONRPCMessage,
     JSONRPCRequest,
+    RequestId,
     TextContent,
     ToolAnnotations,
 )
@@ -42,6 +46,7 @@ from pydantic import (
     field_validator,
 )
 from starlette.applications import Starlette
+from starlette.datastructures import Headers
 from starlette.requests import Request
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
@@ -79,14 +84,24 @@ MAX_HTTP_BODY_CHUNKS = 256
 # the guard in front of it cannot drift from the transport behind it.
 CONTENT_TYPE_JSON = "application/json"
 CONTENT_TYPE_SSE = "text/event-stream"
-MCP_SESSION_HEADER = b"mcp-session-id"
+MCP_SESSION_ID_HEADER = "mcp-session-id"
 INITIALIZE_METHOD = "initialize"
 MISSING_SESSION_DETAIL = "Bad Request: Missing session ID"
 NOT_ACCEPTABLE_POST_DETAIL = (
     "Not Acceptable: Client must accept both application/json and text/event-stream"
 )
 NOT_ACCEPTABLE_STREAM_DETAIL = "Not Acceptable: Client must accept text/event-stream"
+NOT_ACCEPTABLE_JSON_DETAIL = "Not Acceptable: Client must accept application/json"
 UNSUPPORTED_MEDIA_TYPE_DETAIL = "Unsupported Media Type: Content-Type must be application/json"
+INVALID_REQUEST_PARAMS_DETAIL = "Invalid request parameters"
+GENERAL_ERROR_ID = "server-error"
+HTTP_OK = 200
+SSE_EVENT_NAME = "message"
+# Each refusal is rendered in the shape of the SDK layer that owns it.
+RefusalFraming = Literal["text", "json", "stream"]
+REFUSAL_FRAMING_TEXT: RefusalFraming = "text"
+REFUSAL_FRAMING_JSON: RefusalFraming = "json"
+REFUSAL_FRAMING_STREAM: RefusalFraming = "stream"
 MAX_CLIENT_COMPONENT_CHARS = MAX_MCP_CLIENT_COMPONENT_CHARS
 ASCII_ZERO = ord("0")
 ASCII_NINE = ord("9")
@@ -192,25 +207,44 @@ class RequestBodyLimitMiddleware:
     without bound under a misconfigured client, or under anything that can reach
     the port.
 
-    Without a session id there is exactly one request the transport can accept:
-    a POST carrying a valid JSON-RPC ``initialize`` request. That is the rule
-    applied here, one layer earlier, using the SDK's own message model so the two
-    cannot disagree about what "valid" means. Every refusal below reproduces the
-    transport's status code, its JSON-RPC error code and its wording, so a client
-    cannot tell which layer answered. Requests carrying a session id are untouched:
-    they reach an existing transport and create nothing.
+    Without a session id there is exactly one request the SDK can accept: a POST
+    carrying an ``initialize`` that is both a valid JSON-RPC message and a valid
+    MCP request. Those are two separate checks made by two separate layers, and
+    2026.813.2 made only the first: ``params: {}`` is well-formed JSON-RPC and
+    invalid MCP, so it passed the guard, registered a transport, and was refused
+    by the session behind it — 100 requests, 100 sessions, for each of seven
+    parameter shapes. Both checks now run here, against the SDK's own models, so
+    the guard cannot disagree with either layer about what valid means.
+
+    Every refusal reproduces the status code, the JSON-RPC error code, the
+    wording and the framing of the layer that owns it, so a client cannot tell
+    which one answered. Requests carrying a session id are untouched: they reach
+    an existing transport and create nothing.
     """
 
-    def __init__(self, app: ASGIApp, *, max_body_bytes: int, mcp_path: str) -> None:
+    def __init__(
+        self,
+        app: ASGIApp,
+        *,
+        max_body_bytes: int,
+        mcp_path: str,
+        json_response: bool = False,
+        security_settings: TransportSecuritySettings | None = None,
+    ) -> None:
         """Bind one downstream ASGI application, its byte ceiling and its path."""
         self._app = app
         self._max_body_bytes = max_body_bytes
         self._mcp_path = mcp_path
+        self._json_response = json_response
+        self._security = TransportSecurityMiddleware(security_settings)
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         """Screen one request, then replay its bounded body exactly once."""
         if scope["type"] != "http" or scope.get("path") != self._mcp_path:
             await self._app(scope, receive, send)
+            return
+
+        if await self._refuse_on_security(scope, receive, send):
             return
 
         try:
@@ -240,10 +274,37 @@ class RequestBodyLimitMiddleware:
 
         await self._app(scope, replay_receive, send)
 
+    async def _refuse_on_security(self, scope: Scope, receive: Receive, send: Send) -> bool:
+        """Run the transport's security middleware, and answer with its own refusal.
+
+        FastMCP turns DNS rebinding protection on by default for a loopback host,
+        so a request whose Host or Origin is not one of the permitted patterns is
+        refused with 421 or 400 — inside ``handle_request``, which is to say after
+        the session has been registered. Measured before this ran here: 100
+        requests carrying a foreign Host, 100 sessions.
+
+        These rules depend on settings rather than on constants, so they are not
+        transcribed: the middleware itself is asked, and the response object it
+        builds is the one sent. There is nothing left that could disagree.
+        """
+        request = Request(scope)
+        if MCP_SESSION_ID_HEADER in request.headers:
+            return False
+        refusal = await self._security.validate_request(
+            request, is_post=scope.get("method") == "POST"
+        )
+        if refusal is None:
+            return False
+        await refusal(scope, receive, send)
+        return True
+
     async def _screen(self, scope: Scope, receive: Receive) -> bytes | None:
         """Return the buffered POST body, or None when there is nothing to replay."""
-        headers = {name.lower(): value for name, value in scope.get("headers", ())}
-        opening = MCP_SESSION_HEADER not in headers
+        headers = Request(scope).headers
+        # The session manager treats a present header as a session reference
+        # whatever it holds, and answers 404 for one it never issued without
+        # allocating anything. Presence is therefore the whole test here too.
+        opening = MCP_SESSION_ID_HEADER not in headers
         if scope.get("method") != "POST":
             if opening:
                 self._refuse_streaming_opening(scope, headers)
@@ -255,26 +316,35 @@ class RequestBodyLimitMiddleware:
         return body
 
     @staticmethod
-    def _refuse_streaming_opening(scope: Scope, headers: Mapping[bytes, bytes]) -> None:
+    def _refuse_streaming_opening(scope: Scope, headers: Headers) -> None:
         """Refuse a GET or DELETE that carries no session, before one is created.
 
         Neither method can ever open a session: the transport answers 400 once it
         finds the session id missing. A GET is checked for the event stream first,
         exactly as the transport checks it.
         """
-        if scope.get("method") == "GET" and CONTENT_TYPE_SSE not in _offered_media(
-            headers, b"accept"
-        ):
+        if scope.get("method") == "GET" and not _accepted_media(headers)[1]:
             raise _RequestBodyRejectedError(406, NOT_ACCEPTABLE_STREAM_DETAIL)
         raise _RequestBodyRejectedError(400, MISSING_SESSION_DETAIL)
 
-    @staticmethod
-    def _require_initialize(headers: Mapping[bytes, bytes], body: bytes) -> None:
-        """Refuse a session-opening POST that is not a valid initialize request."""
-        offered = _offered_media(headers, b"accept")
-        if not {CONTENT_TYPE_JSON, CONTENT_TYPE_SSE} <= offered:
+    def _require_initialize(self, headers: Headers, body: bytes) -> None:
+        """Refuse a session-opening POST that is not a valid initialize request.
+
+        Three layers refuse an opening, and each one refuses something the layer
+        before it accepted. The transport rejects a body that is not a JSON-RPC
+        message; the session behind it rejects a JSON-RPC request whose params do
+        not match the method's schema. An initialize carrying `params: {}` is
+        well-formed JSON-RPC and invalid MCP, so it passes the first layer and is
+        refused by the second — after a transport has been registered. Both
+        checks therefore run here, against the SDK's own models, and each answers
+        exactly as its layer would.
+        """
+        has_json, has_sse = _accepted_media(headers)
+        if self._json_response and not has_json:
+            raise _RequestBodyRejectedError(406, NOT_ACCEPTABLE_JSON_DETAIL)
+        if not self._json_response and not (has_json and has_sse):
             raise _RequestBodyRejectedError(406, NOT_ACCEPTABLE_POST_DETAIL)
-        if CONTENT_TYPE_JSON not in _offered_media(headers, b"content-type"):
+        if not _declares_json(headers):
             raise _RequestBodyRejectedError(415, UNSUPPORTED_MEDIA_TYPE_DETAIL)
         try:
             raw = json.loads(body)
@@ -292,6 +362,12 @@ class RequestBodyLimitMiddleware:
             isinstance(message.root, JSONRPCRequest) and message.root.method == INITIALIZE_METHOD
         ):
             raise _RequestBodyRejectedError(400, MISSING_SESSION_DETAIL)
+        try:
+            ClientRequest.model_validate(
+                message.root.model_dump(by_alias=True, mode="json", exclude_none=True)
+            )
+        except ValidationError as exc:
+            raise _RequestBodyRejectedError.invalid_params(message.root.id) from exc
 
     def _validate_content_length(self, scope: Scope) -> None:
         content_lengths = [
@@ -328,47 +404,155 @@ class RequestBodyLimitMiddleware:
                 return bytes(body)
         raise _RequestBodyRejectedError(413, "request body too large")
 
-    @staticmethod
-    async def _reject(send: Send, refusal: _RequestBodyRejectedError) -> None:
-        """Answer with the JSON-RPC error body the transport itself would send."""
-        error = JSONRPCError(
-            jsonrpc="2.0",
-            id="server-error",
-            error=ErrorData(code=refusal.error_code, message=refusal.detail),
-        )
-        body = error.model_dump_json(by_alias=True, exclude_none=True).encode("utf-8")
+    async def _reject(self, send: Send, refusal: _RequestBodyRejectedError) -> None:
+        """Answer exactly as the SDK layer that owns this refusal would answer.
+
+        Three layers refuse an opening and none of them answers in the same shape.
+        The security middleware sends a bare text body with no content type at
+        all. The transport sends a JSON-RPC error as plain JSON. The session
+        behind it answers through the response stream, so its error is framed as
+        one server-sent event unless plain JSON responses were configured.
+        """
+        body, content_type = self._render(refusal)
+        response_headers = [
+            (b"cache-control", b"no-store"),
+            (b"content-length", str(len(body)).encode("ascii")),
+        ]
+        if content_type is not None:
+            response_headers.append((b"content-type", content_type.encode("ascii")))
         await send(
             {
                 "type": "http.response.start",
                 "status": refusal.status_code,
-                "headers": [
-                    (b"cache-control", b"no-store"),
-                    (b"content-length", str(len(body)).encode("ascii")),
-                    (b"content-type", CONTENT_TYPE_JSON.encode("ascii")),
-                ],
+                "headers": response_headers,
             }
         )
         await send({"type": "http.response.body", "body": body})
 
+    def _render(self, refusal: _RequestBodyRejectedError) -> tuple[bytes, str | None]:
+        """Render one refusal in the framing of the layer that owns it."""
+        if refusal.framing is REFUSAL_FRAMING_TEXT:
+            return refusal.detail.encode("utf-8"), None
+        error = JSONRPCError(
+            jsonrpc="2.0",
+            id=refusal.request_id,
+            error=ErrorData(
+                code=refusal.error_code,
+                message=refusal.detail,
+                data=refusal.data,
+            ),
+        )
+        payload = error.model_dump_json(by_alias=True, exclude_none=True)
+        if refusal.framing is REFUSAL_FRAMING_STREAM and not self._json_response:
+            return f"event: {SSE_EVENT_NAME}\r\ndata: {payload}\r\n\r\n".encode(), CONTENT_TYPE_SSE
+        return payload.encode("utf-8"), CONTENT_TYPE_JSON
 
-def _offered_media(headers: Mapping[bytes, bytes], name: bytes) -> set[str]:
-    """Return the media types one header offers, without their parameters."""
-    declared = headers.get(name, b"").decode("latin-1")
-    return {part.split(";")[0].strip() for part in declared.split(",")}
+
+def _accepted_media(headers: Headers) -> tuple[bool, bool]:
+    """Report whether Accept offers JSON and the event stream, as the SDK reads it.
+
+    Transcribed from the transport's own ``_check_accept_headers`` rather than
+    reasoned about. A guard that parses a header its own way disagrees with the
+    layer it protects on the inputs that matter least to a specification and most
+    to an attacker: a duplicated header, a list, a parameter. Every such
+    disagreement in the permissive direction is a session the guard waves through
+    for the SDK to refuse — and keep.
+    """
+    accept_header = headers.get("accept", "")
+    accept_types = [media_type.strip() for media_type in accept_header.split(",")]
+    has_json = any(media_type.startswith(CONTENT_TYPE_JSON) for media_type in accept_types)
+    has_sse = any(media_type.startswith(CONTENT_TYPE_SSE) for media_type in accept_types)
+    return has_json, has_sse
+
+
+def _declares_json(headers: Headers) -> bool:
+    """Report whether Content-Type declares JSON, as the SDK reads it.
+
+    Transcribed from the transport's own ``_check_content_type``. Note that it
+    takes everything before the first semicolon and only then splits on commas,
+    so ``text/plain;charset=utf-8, application/json`` declares ``text/plain``.
+    """
+    content_type = headers.get("content-type", "")
+    content_type_parts = [part.strip() for part in content_type.split(";")[0].split(",")]
+    return any(part == CONTENT_TYPE_JSON for part in content_type_parts)
 
 
 class _RequestBodyRejectedError(Exception):
-    """Carry one deliberate HTTP-layer refusal, with the code the SDK would use."""
+    """Carry one deliberate refusal, shaped exactly as the SDK layer would send it.
 
-    def __init__(self, status_code: int, detail: str, *, error_code: int = INVALID_REQUEST) -> None:
+    A refusal the transport owns answers 4xx with a plain JSON body and no
+    request id to quote. A refusal the session behind it owns answers 200 with
+    the error carried in the response stream and addressed to the request that
+    caused it. Both shapes are described here so the reply can reproduce either.
+    """
+
+    def __init__(
+        self,
+        status_code: int,
+        detail: str,
+        *,
+        error_code: int = INVALID_REQUEST,
+        framing: RefusalFraming = REFUSAL_FRAMING_JSON,
+    ) -> None:
         super().__init__(detail)
         self.status_code = status_code
         self.detail = detail
         self.error_code = error_code
+        self.framing = framing
+        self.request_id: RequestId = GENERAL_ERROR_ID
+        self.data: str | None = None
+
+    @classmethod
+    def invalid_params(cls, request_id: RequestId) -> Self:
+        """Build the refusal the session layer makes for an unusable request.
+
+        It is the only one addressed to a request rather than to the connection:
+        the session knows which message it could not read, quotes its id, and
+        sends the answer back through the response stream.
+        """
+        refusal = cls(
+            HTTP_OK,
+            INVALID_REQUEST_PARAMS_DETAIL,
+            error_code=INVALID_PARAMS,
+            framing=REFUSAL_FRAMING_STREAM,
+        )
+        refusal.request_id = request_id
+        refusal.data = ""
+        return refusal
 
 
 class _RequestAbandonedError(Exception):
     """The client disconnected before its body arrived."""
+
+
+class _ReclaimingSessionManager(StreamableHTTPSessionManager):
+    """Forget a session the client closed, which the SDK terminates but keeps.
+
+    Terminating is a transport operation: it closes the two streams and marks the
+    transport terminated. Both of the manager's removal paths miss that. The idle
+    branch runs only when the deadline cancelled the session task, and closing
+    the streams ends that task by returning rather than by cancellation; the
+    cleanup branch that follows declines to remove a transport which is already
+    terminated. So the entry survives, and the idle deadline can never reclaim it
+    either, because the task it would have cancelled has already finished.
+
+    Measured on 2026.813.2: 25 open-then-close cycles left 25 entries, every one
+    of them terminated, still held after the deadline had passed twice over. That
+    is the ordinary path — an editor restarting, a client reconnecting — so it
+    grows a daemon that is being used correctly, which no refusal in front of the
+    transport can prevent, since the request that closes a session must reach it.
+    """
+
+    async def handle_request(self, scope: Scope, receive: Receive, send: Send) -> None:
+        """Delegate, then drop the session if this request is what closed it."""
+        await super().handle_request(scope, receive, send)
+        session_id = Request(scope).headers.get(MCP_SESSION_ID_HEADER)
+        if session_id is None:
+            return
+        transport = self._server_instances.get(session_id)
+        if transport is not None and transport.is_terminated:
+            del self._server_instances[session_id]
+            self._session_owners.pop(session_id, None)
 
 
 class EngramFastMCP(FastMCP[object]):
@@ -391,6 +575,7 @@ class EngramFastMCP(FastMCP[object]):
 
     def streamable_http_app(self) -> Starlette:
         """Return the SDK application with TTL maintenance bound to its lifespan."""
+        self._adopt_session_manager()
         app = super().streamable_http_app()
         session_lifespan = app.router.lifespan_context
 
@@ -412,8 +597,32 @@ class EngramFastMCP(FastMCP[object]):
             RequestBodyLimitMiddleware,
             max_body_bytes=self._engram_config.server.max_request_body_bytes,
             mcp_path=self._engram_config.server.path,
+            json_response=self.settings.json_response,
+            security_settings=self.settings.transport_security,
         )
         return app
+
+    def _adopt_session_manager(self) -> None:
+        """Build a session manager that reclaims sessions on both ways out.
+
+        Neither way out reclaims one as shipped. A client that closes its session
+        politely leaves a terminated entry the manager never removes; a client
+        that vanishes without closing leaves a live one, because FastMCP sets no
+        deadline. Measured before this: 25 open/close cycles left 25 entries, and
+        300 abandoned initialisations left 300, all for the remaining life of the
+        process. The manager is created here rather than mutated afterwards so
+        the SDK's own validation of the deadline runs.
+        """
+        if self._session_manager is not None:  # pragma: no cover
+            return
+        self._session_manager = _ReclaimingSessionManager(
+            app=self._mcp_server,
+            event_store=self._event_store,
+            json_response=self.settings.json_response,
+            stateless=self.settings.stateless_http,
+            security_settings=self.settings.transport_security,
+            session_idle_timeout=self._engram_config.server.session_idle_timeout_seconds,
+        )
 
 
 def create_mcp_server(

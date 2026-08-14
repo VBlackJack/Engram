@@ -5,11 +5,12 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 import sqlite3
 import time
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from statistics import fmean
@@ -21,8 +22,10 @@ import pytest
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 from mcp.server.fastmcp import FastMCP
+from mcp.server.streamable_http import StreamableHTTPServerTransport
 from mcp.types import CallToolResult, Implementation, TextContent
 from starlette.applications import Starlette
+from starlette.requests import Request
 
 import engram.server as server_module
 import engram.store as store_module
@@ -759,19 +762,82 @@ def _sessions(server: FastMCP[object]) -> int:
     return len(server.session_manager._server_instances)  # noqa: SLF001
 
 
-MCP_HEADERS = {
-    "content-type": "application/json",
-    "accept": "application/json, text/event-stream",
+_ABSENT = object()
+SSE_DATA_PREFIX = "data: "
+
+
+def _refusal_message(response: httpx.Response) -> str:
+    """Read the refusal out of whichever of three framings the SDK layer uses.
+
+    The security middleware sends a bare text body with no content type at all.
+    The transport sends a JSON-RPC error as plain JSON. The session behind it
+    answers through the response stream, so its error arrives as one server-sent
+    event. A guard standing in front of all three has to reproduce whichever
+    applies, so the test reads all three rather than assuming one.
+    """
+    media_type = response.headers.get("content-type", "").split(";")[0].strip()
+    if not media_type:
+        return response.text
+    if media_type == "text/event-stream":
+        payloads = [
+            line[len(SSE_DATA_PREFIX) :]
+            for line in response.text.splitlines()
+            if line.startswith(SSE_DATA_PREFIX)
+        ]
+        assert len(payloads) == 1
+        message = json.loads(payloads[0])
+    else:
+        assert media_type == "application/json"
+        message = response.json()
+    assert isinstance(message, dict)
+    error = message["error"]
+    assert isinstance(error, dict)
+    detail = error["message"]
+    assert isinstance(detail, str)
+    return detail
+
+
+MCP_ACCEPT = "application/json, text/event-stream"
+MCP_HEADERS = {"content-type": "application/json", "accept": MCP_ACCEPT}
+
+
+def _initialize(params: object = _ABSENT) -> bytes:
+    """Build one initialize request, optionally without its params."""
+    body: dict[str, object] = {"jsonrpc": "2.0", "id": 1, "method": "initialize"}
+    if params is not _ABSENT:
+        body["params"] = params
+    return json.dumps(body).encode()
+
+
+VALID_INITIALIZE_PARAMS = {
+    "protocolVersion": "2025-06-18",
+    "capabilities": {},
+    "clientInfo": {"name": "probe", "version": "1.0"},
 }
 # Every shape below reaches the transport without a session id, and no shape but
-# a valid initialize request can ever be accepted. Well-formed JSON is the
-# interesting half: it survives a parse check, so it used to reach the SDK and
-# leave a session behind before the SDK answered 400.
-REJECTED_OPENINGS = {
+# a valid initialize request can ever be accepted. Two halves are the interesting
+# ones. Well-formed JSON that is not an MCP request survives a parse check, so it
+# used to reach the SDK and leave a session behind before the SDK answered 400.
+# Well-formed JSON-RPC whose MCP params are invalid survives that check too, and
+# is refused one layer deeper — by the session, with 200 and -32602, after the
+# transport has already been registered. Both are refused here now, each with the
+# answer its own layer would have given.
+RequestHeaders = Mapping[str, str] | Sequence[tuple[str, str]]
+REJECTED_OPENINGS: dict[str, tuple[str, RequestHeaders, bytes | None, int]] = {
+    # The security middleware runs first and refuses anything whose Content-Type
+    # does not begin with the JSON media type, so this never reaches the 415.
     "content type is not json": (
         "POST",
-        {"content-type": "text/plain", "accept": "application/json, text/event-stream"},
+        {"content-type": "text/plain", "accept": MCP_ACCEPT},
         b"x",
+        400,
+    ),
+    # This one does: it begins with the JSON media type, so the security check
+    # passes it, and the transport's exact comparison refuses it.
+    "content type is a json dialect": (
+        "POST",
+        {"content-type": "application/json-patch+json", "accept": MCP_ACCEPT},
+        _initialize(VALID_INITIALIZE_PARAMS),
         415,
     ),
     "accept header absent": ("POST", {"content-type": "application/json"}, b"{}", 406),
@@ -807,6 +873,105 @@ REJECTED_OPENINGS = {
     "get cannot open a session": ("GET", {"accept": "text/event-stream"}, None, 400),
     "get does not accept the stream": ("GET", {"accept": "application/json"}, None, 406),
     "delete cannot open a session": ("DELETE", {}, None, 400),
+    "initialize params are empty": ("POST", MCP_HEADERS, _initialize({}), 200),
+    "initialize params are absent": ("POST", MCP_HEADERS, _initialize(), 200),
+    "initialize params are null": ("POST", MCP_HEADERS, _initialize(None), 200),
+    # A list is not a JSON-RPC params object at all, so this one never reaches the
+    # session layer: the transport's own envelope check refuses it with 400.
+    "initialize params are a list": ("POST", MCP_HEADERS, _initialize([]), 400),
+    "initialize params have wrong types": (
+        "POST",
+        MCP_HEADERS,
+        _initialize({"protocolVersion": 1, "capabilities": "no", "clientInfo": []}),
+        200,
+    ),
+    "initialize omits clientInfo": (
+        "POST",
+        MCP_HEADERS,
+        _initialize({"protocolVersion": "2025-06-18", "capabilities": {}}),
+        200,
+    ),
+    "initialize omits protocolVersion": (
+        "POST",
+        MCP_HEADERS,
+        _initialize({"capabilities": {}, "clientInfo": {"name": "p", "version": "1"}}),
+        200,
+    ),
+    "initialize clientInfo omits its name": (
+        "POST",
+        MCP_HEADERS,
+        _initialize({**VALID_INITIALIZE_PARAMS, "clientInfo": {"version": "1.0"}}),
+        200,
+    ),
+    # Three layers read Content-Type, and the strictest requires the value to
+    # begin with the JSON media type. A guard that parses the header its own way
+    # is more permissive than one of them on exactly these inputs, and every
+    # disagreement in that direction is a session waved through to be refused.
+    "content type is a list": (
+        "POST",
+        [("content-type", "text/plain, application/json"), ("accept", MCP_ACCEPT)],
+        _initialize(VALID_INITIALIZE_PARAMS),
+        400,
+    ),
+    "content type is a list with a parameter": (
+        "POST",
+        [("content-type", "text/plain;charset=utf-8, application/json"), ("accept", MCP_ACCEPT)],
+        _initialize(VALID_INITIALIZE_PARAMS),
+        400,
+    ),
+    "content type is duplicated": (
+        "POST",
+        [
+            ("content-type", "text/plain"),
+            ("content-type", "application/json"),
+            ("accept", MCP_ACCEPT),
+        ],
+        _initialize(VALID_INITIALIZE_PARAMS),
+        400,
+    ),
+    "accept is duplicated": (
+        "POST",
+        [
+            ("accept", "text/plain"),
+            ("accept", MCP_ACCEPT),
+            ("content-type", "application/json"),
+        ],
+        _initialize(VALID_INITIALIZE_PARAMS),
+        406,
+    ),
+    # FastMCP turns DNS rebinding protection on by default for a loopback host,
+    # and those refusals are made inside the request handler — after the session
+    # has been registered.
+    "host carries no port": (
+        "POST",
+        {**MCP_HEADERS, "host": "127.0.0.1"},
+        _initialize(VALID_INITIALIZE_PARAMS),
+        421,
+    ),
+    "host is a name": (
+        "POST",
+        {**MCP_HEADERS, "host": "engram.local:8377"},
+        _initialize(VALID_INITIALIZE_PARAMS),
+        421,
+    ),
+    "host is a foreign address": (
+        "POST",
+        {**MCP_HEADERS, "host": "10.0.0.5:8377"},
+        _initialize(VALID_INITIALIZE_PARAMS),
+        421,
+    ),
+    "origin is hostile": (
+        "POST",
+        {**MCP_HEADERS, "origin": "http://evil.example"},
+        _initialize(VALID_INITIALIZE_PARAMS),
+        403,
+    ),
+    "origin is https loopback": (
+        "POST",
+        {**MCP_HEADERS, "origin": "https://127.0.0.1:8377"},
+        _initialize(VALID_INITIALIZE_PARAMS),
+        403,
+    ),
 }
 
 
@@ -836,7 +1001,9 @@ async def test_a_rejected_session_opening_creates_no_session(
         response = await client.request(method, "/mcp", headers=headers, content=body)
 
         assert response.status_code == expected_status
-        assert response.json()["error"]["message"]
+        assert _refusal_message(response)
+        # No session was opened, so there is none to name in the reply.
+        assert "mcp-session-id" not in response.headers
         assert _sessions(server) == before
 
 
@@ -900,6 +1067,151 @@ async def test_the_guard_leaves_a_real_session_working_end_to_end(
         capsule = _structured(recalled)
         assert len(capsule["own_pending"]) == 1
         assert _sessions(server) == 1
+
+
+HEADER_READINGS = [
+    "application/json",
+    "application/json, text/event-stream",
+    "application/json;charset=utf-8",
+    "application/json;charset=utf-8, text/event-stream",
+    "text/plain, application/json",
+    "text/plain;charset=utf-8, application/json",
+    "text/event-stream, application/json",
+    "application/json-patch+json",
+    "application/jsonrequest",
+    "*/*",
+    "",
+    "   ",
+    "APPLICATION/JSON",
+]
+
+
+@pytest.mark.parametrize("value", HEADER_READINGS)
+def test_the_guard_reads_a_header_exactly_as_the_transport_reads_it(value: str) -> None:
+    """The two Accept and Content-Type checks here are copies; copies drift.
+
+    They cannot be delegated the way the security middleware is, because the
+    transport holds them as private methods on an object that only exists once a
+    session has been created. So they are transcribed, and pinned here against
+    the original for every shape where two readings of a media-type header could
+    possibly differ. If an SDK upgrade changes one of them, this fails rather
+    than quietly reopening the class it closed.
+    """
+    transport = StreamableHTTPServerTransport(mcp_session_id=None)
+    request = Request({"type": "http", "headers": [(b"accept", value.encode("latin-1"))]})
+    assert server_module._accepted_media(request.headers) == transport._check_accept_headers(  # noqa: SLF001
+        request
+    )
+
+    request = Request({"type": "http", "headers": [(b"content-type", value.encode("latin-1"))]})
+    assert server_module._declares_json(request.headers) == transport._check_content_type(request)  # noqa: SLF001
+
+
+@pytest.mark.anyio
+async def test_a_refused_initialize_is_answered_exactly_as_the_session_would(
+    app_config: AppConfig,
+    store: EngramStore,
+) -> None:
+    """The guard speaks for the session layer here, so it must speak in its words.
+
+    An initialize whose MCP params are invalid is refused by the session, not the
+    transport: 200, the error carried as one server-sent event, code -32602,
+    addressed to the request that caused it. Anything else is a behaviour change
+    the client can see.
+    """
+    server = create_mcp_server(app_config, store)
+    app = server.streamable_http_app()
+    transport = httpx.ASGITransport(app=app)
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1:8377") as client,
+    ):
+        response = await client.post("/mcp", headers=MCP_HEADERS, content=_initialize({}))
+
+        assert response.status_code == 200
+        assert response.headers["content-type"] == "text/event-stream"
+        assert response.text == (
+            'event: message\r\ndata: {"jsonrpc":"2.0","id":1,'
+            '"error":{"code":-32602,"message":"Invalid request parameters","data":""}}\r\n\r\n'
+        )
+        assert _sessions(server) == 0
+
+
+@pytest.mark.anyio
+async def test_a_session_the_client_closes_is_forgotten_not_only_terminated(
+    app_config: AppConfig,
+    store: EngramStore,
+) -> None:
+    """The ordinary path grew the table, and no refusal could have stopped it.
+
+    Terminating a session closes its streams and marks the transport terminated;
+    neither of the SDK's removal paths then applies, so the entry survives, and
+    the idle deadline cannot reclaim it because the task it would cancel has
+    already ended. Measured on 2026.813.2: 25 open-then-close cycles, 25 entries
+    retained. An editor that restarts does exactly this.
+    """
+    server = create_mcp_server(app_config, store)
+    app = server.streamable_http_app()
+    transport = httpx.ASGITransport(app=app)
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1:8377") as client,
+    ):
+        for _ in range(25):
+            opened = await client.post(
+                "/mcp",
+                headers=MCP_HEADERS,
+                content=_initialize(VALID_INITIALIZE_PARAMS),
+            )
+            assert opened.status_code == 200
+            session_id = opened.headers["mcp-session-id"]
+            assert _sessions(server) == 1
+
+            closed = await client.delete(
+                "/mcp", headers={**MCP_HEADERS, "mcp-session-id": session_id}
+            )
+            assert closed.status_code == 200
+            assert _sessions(server) == 0
+
+
+@pytest.mark.anyio
+async def test_an_abandoned_session_is_reclaimed_once_its_deadline_passes(
+    app_config: AppConfig,
+    store: EngramStore,
+) -> None:
+    """Refusing invalid openings does nothing for openings that are valid.
+
+    A client that initialises and then vanishes — a crash, a closed laptop, a
+    killed editor — leaves a session the SDK removes only on an explicit delete.
+    FastMCP sets no deadline, so before this configuration existed 300 abandoned
+    initialisations were still held after the last request, for the life of the
+    process.
+    """
+    config = replace(
+        app_config,
+        server=replace(app_config.server, session_idle_timeout_seconds=0.2),
+    )
+    server = create_mcp_server(config, store)
+    app = server.streamable_http_app()
+    transport = httpx.ASGITransport(app=app)
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1:8377") as client,
+    ):
+        for _ in range(20):
+            opened = await client.post(
+                "/mcp",
+                headers=MCP_HEADERS,
+                content=_initialize(VALID_INITIALIZE_PARAMS),
+            )
+            assert opened.status_code == 200
+        assert _sessions(server) == 20
+
+        with anyio.fail_after(10):
+            while True:
+                if not _sessions(server):
+                    break
+                await anyio.sleep(0.05)
 
 
 @pytest.mark.anyio

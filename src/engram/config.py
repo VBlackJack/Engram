@@ -181,6 +181,14 @@ class ServerConfig:
     write_wait_timeout_ms: int = 2000
     ttl_sweep_interval_seconds: float = 60.0
     max_request_body_bytes: int = MAX_HTTP_REQUEST_BODY_BYTES
+    # A session the MCP SDK opens is reclaimed only when the client deletes it or
+    # this many seconds pass without a request on it. The SDK leaves the deadline
+    # unset, which means a client that initialises and then vanishes — a crash, a
+    # closed laptop, a killed editor — costs the daemon one session and one task
+    # for the rest of its life. Thirty minutes is long enough to survive an idle
+    # editor and short enough that abandoned sessions cannot accumulate over the
+    # weeks a logon-installed daemon stays up.
+    session_idle_timeout_seconds: float = 1800.0
 
     def __post_init__(self) -> None:
         """Make unsafe direct construction fail closed, including library use."""
@@ -208,6 +216,15 @@ class ServerConfig:
             or self.ttl_sweep_interval_seconds <= 0
         ):
             raise ConfigError("server.ttl_sweep_interval_seconds must be a finite positive number")
+        if (
+            isinstance(self.session_idle_timeout_seconds, bool)
+            or not isinstance(self.session_idle_timeout_seconds, int | float)
+            or not math.isfinite(self.session_idle_timeout_seconds)
+            or self.session_idle_timeout_seconds <= 0
+        ):
+            raise ConfigError(
+                "server.session_idle_timeout_seconds must be a finite positive number"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -548,6 +565,12 @@ def load_config(
                 "max_request_body_bytes",
                 environment,
                 DEFAULT_SERVER_CONFIG.max_request_body_bytes,
+            ),
+            session_idle_timeout_seconds=_float_value(
+                server,
+                "session_idle_timeout_seconds",
+                environment,
+                DEFAULT_SERVER_CONFIG.session_idle_timeout_seconds,
             ),
         ),
         capsule=CapsuleConfig(
