@@ -27,6 +27,10 @@ port = 8377
 path = "/mcp"
 write_wait_timeout_ms = 2000
 ttl_sweep_interval_seconds = 60
+# A client that initialises and then vanishes leaves a session behind; the MCP
+# SDK reclaims one only on an explicit delete. This deadline reclaims the rest.
+# Raise it if a client of yours legitimately idles longer between requests.
+session_idle_timeout_seconds = 1800
 # Hard ceiling: 524288 bytes. Lower values are allowed for constrained deployments.
 max_request_body_bytes = 524288
 

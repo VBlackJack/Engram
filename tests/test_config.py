@@ -61,6 +61,7 @@ port = 8377
 path = "/mcp"
 write_wait_timeout_ms = 2000
 max_request_body_bytes = 65536
+session_idle_timeout_seconds = 900
 
 [capsule]
 default_token_budget = 4800
@@ -93,6 +94,7 @@ rrf_k = 60
         "ENGRAM_SERVER_PATH": "/memory",
         "ENGRAM_SERVER_TTL_SWEEP_INTERVAL_SECONDS": "0.25",
         "ENGRAM_SERVER_MAX_REQUEST_BODY_BYTES": "32768",
+        "ENGRAM_SERVER_SESSION_IDLE_TIMEOUT_SECONDS": "450",
         "ENGRAM_CAPSULE_DEFAULT_TOKEN_BUDGET": "2800",
         "ENGRAM_RETRIEVAL_MODE": "hybrid",
         "ENGRAM_RETRIEVAL_FTS_TOP_K": "48",
@@ -123,6 +125,7 @@ rrf_k = 60
     assert config.server.write_wait_timeout_ms == 2000
     assert config.server.ttl_sweep_interval_seconds == 0.25
     assert config.server.max_request_body_bytes == 32768
+    assert config.server.session_idle_timeout_seconds == 450
     assert config.capsule.default_token_budget == 2800
     assert config.retrieval.mode is RetrievalMode.HYBRID
     assert config.retrieval.fts_top_k == 48
