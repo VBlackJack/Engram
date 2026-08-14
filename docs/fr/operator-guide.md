@@ -60,6 +60,8 @@ terminer un démon en pleine écriture est précisément ce qui laisse un journa
 derrière lui. `uv run --python 3.14.6 engram doctor` indique le propriétaire et s'il s'agit d'un
 démon ou d'un writer hors ligne.
 
+<a id="2-creer-une-sauvegarde-sqlite-coherente"></a>
+
 ### 2. Créer une sauvegarde SQLite cohérente
 
 Remplacez le chemin par la valeur effective de `[database].path`, que `engram doctor` affiche.
@@ -250,8 +252,14 @@ s'appliquer.
 [capsule]
 default_token_budget = 4800
 min_token_budget = 1200
-max_token_budget = 6000
+max_token_budget = 32768
 ```
+
+`max_token_budget` est le plafond qu'un client a le droit de demander, pas ce que coûte un rappel :
+l'élever n'agrandit aucun rappel, puisque c'est `default_token_budget` qui décide de cela. Il valait
+`6000` jusqu'à 2026.813.1, et une famille de conflits à six versions enregistrées dépasse 6000
+octets sérialisés — ces familles étaient donc inatteignables par les outils MCP, quel que soit le
+budget qu'un client pouvait demander.
 
 ### 3. Prouver la migration sans toucher la source
 
@@ -305,6 +313,30 @@ uv run --python 3.14.6 engram reindex
 
 Redémarrez ensuite le démon selon son mode d'installation — voir
 [Savoir comment redémarrer](#3-savoir-comment-redemarrer) — et testez un rappel connu.
+
+### 6. Revenir à la version précédente
+
+Une migration ne se remonte pas. Un Engram plus ancien refuse une base dont le schéma est plus
+récent que celui qu'il connaît — `Database schema version 6 is newer than supported version 5` —
+donc revenir à la version précédente est une **restauration**, pas un simple changement de version.
+Réinstaller l'ancienne version seule laisse un démon qui n'ouvre plus la base du tout.
+
+1. Arrêtez le démon : `uv run --python 3.14.6 engram stop`.
+2. Sauvegardez la base actuelle, déjà migrée, comme dans
+   [Créer une sauvegarde SQLite cohérente](#2-creer-une-sauvegarde-sqlite-coherente). Conservez-la :
+   c'est la seule copie de tout ce qui a été écrit depuis la migration.
+3. Remettez en place la sauvegarde d'avant migration, et supprimez les éventuels `-wal` et `-shm`
+   à côté d'elle. Un journal d'écriture anticipée appartient à la base pour laquelle il a été
+   écrit ; en laisser un auprès d'un fichier restauré est la façon dont un retour arrière perd des
+   données qu'il semblait conserver.
+4. Installez la version précédente.
+5. Redémarrez, puis vérifiez avec `engram doctor`, `PRAGMA integrity_check` et le nombre d'entrées
+   relevé avant la migration.
+
+**Tout ce qui a été écrit après la migration est perdu par cette procédure**, puisque la sauvegarde
+restaurée à l'étape 3 lui est antérieure. Le point de reprise est l'instant où cette sauvegarde a
+été prise : prenez-la juste avant de migrer, et traitez l'étape 2 comme le relevé de ce qu'un retour
+arrière jetterait.
 
 <a id="reindexer-engram"></a>
 
