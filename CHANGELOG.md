@@ -9,6 +9,21 @@ different version strings.
 
 ## [Unreleased]
 
+## [2026.813.4] - 2026-08-13
+
+### Fixed
+
+- Free a session whose close never reached the client. 2026.813.3 reclaimed a terminated session
+  after delegating to the SDK, and the SDK terminates the transport *before* it answers the request
+  that closed it. A client that has already gone makes that answer raise, so the reclaiming written
+  after the delegation is precisely the reclaiming that never runs. Measured on the published
+  wheel: 25 closes interrupted before their response left 25 entries, permanently, since the idle
+  deadline can only cancel a task that is still running and this one had already ended.
+
+  The session id is now read before the delegation and the reclaiming happens in a `finally`, so it
+  runs on every way out — a normal answer, a peer that vanished, a cancellation. The exception
+  belongs to the caller and still propagates; only the table is guaranteed.
+
 ## [2026.813.3] - 2026-08-13
 
 ### Fixed
@@ -59,6 +74,8 @@ different version strings.
   was being used correctly, and no refusal in front of the transport could have prevented it: the
   request that closes a session must reach the session it closes. Engram's session manager now drops
   the entry once the request that terminated it has been answered.
+  Corrected in 2026.813.4: "once it has been answered" was itself the defect, because a close
+  whose answer never leaves the server does not reach that point.
 
 ### Added
 
@@ -429,7 +446,8 @@ different version strings.
 - Mirrored French and English product documentation, CI gates, release artifacts, and MCP Registry
   metadata.
 
-[Unreleased]: https://github.com/VBlackJack/Engram/compare/v2026.813.3...HEAD
+[Unreleased]: https://github.com/VBlackJack/Engram/compare/v2026.813.4...HEAD
+[2026.813.4]: https://github.com/VBlackJack/Engram/compare/v2026.813.3...v2026.813.4
 [2026.813.3]: https://github.com/VBlackJack/Engram/compare/v2026.813.2...v2026.813.3
 [2026.813.2]: https://github.com/VBlackJack/Engram/compare/v2026.813.1...v2026.813.2
 [2026.813.1]: https://github.com/VBlackJack/Engram/compare/v2026.0730.02...v2026.813.1

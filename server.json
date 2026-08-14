@@ -8,13 +8,13 @@
     "source": "github"
   },
   "websiteUrl": "https://github.com/VBlackJack/Engram",
-  "version": "2026.813.3",
+  "version": "2026.813.4",
   "packages": [
     {
       "registryType": "pypi",
       "registryBaseUrl": "https://pypi.org",
       "identifier": "engram-memory-broker",
-      "version": "2026.813.3",
+      "version": "2026.813.4",
       "runtimeHint": "uvx",
       "transport": {
         "type": "streamable-http",
