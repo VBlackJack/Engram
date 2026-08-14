@@ -241,8 +241,14 @@ identity: review them manually or leave their previous TTL policy in effect.
 [capsule]
 default_token_budget = 4800
 min_token_budget = 1200
-max_token_budget = 6000
+max_token_budget = 32768
 ```
+
+`max_token_budget` is the ceiling a client may ask for, not what a recall usually costs: raising it
+does not make any recall larger, because `default_token_budget` still decides that. It was `6000`
+until 2026.813.1, and a conflict family of six recorded versions needs more than 6000 serialized
+bytes, so those families were unreachable through the MCP tools at any budget a client was allowed
+to request.
 
 ### 3. Prove the migration without touching the source
 
@@ -294,6 +300,28 @@ uv run --python 3.14.6 engram reindex
 
 Then restart the daemon the way it was installed — see
 [Know how you will restart](#3-know-how-you-will-restart) — and test one known recall.
+
+### 6. Going back to the previous build
+
+A migration is one-way. An older Engram refuses a database whose schema is newer than the one it
+knows — `Database schema version 6 is newer than supported version 5` — so returning to the
+previous build is a **restore**, not a checkout. Reinstalling the old version alone leaves a daemon
+that will not open the database at all.
+
+1. Stop the daemon: `uv run --python 3.14.6 engram stop`.
+2. Back up the current, migrated database, the same way as in
+   [Take a consistent SQLite backup](#2-take-a-consistent-sqlite-backup). Keep it: it is the only
+   copy of everything written since the migration.
+3. Put the pre-migration backup back in place, and delete any `-wal` and `-shm` beside it. A
+   write-ahead log belongs to the database it was written for; leaving one next to a restored file
+   is how a rollback loses data it appeared to keep.
+4. Install the previous version.
+5. Restart, then verify with `engram doctor`, `PRAGMA integrity_check`, and the entry count you
+   recorded before the migration.
+
+**Everything written after the migration is lost by this procedure**, because the backup restored
+in step 3 predates it. The recovery point is the moment the backup was taken, so take it
+immediately before migrating, and treat step 2 as the record of what a rollback would discard.
 
 ## Reindex Engram
 
