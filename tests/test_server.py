@@ -26,6 +26,7 @@ from mcp.server.streamable_http import StreamableHTTPServerTransport
 from mcp.types import CallToolResult, Implementation, TextContent
 from starlette.applications import Starlette
 from starlette.requests import Request
+from starlette.types import Message
 
 import engram.server as server_module
 import engram.store as store_module
@@ -1171,6 +1172,74 @@ async def test_a_session_the_client_closes_is_forgotten_not_only_terminated(
                 "/mcp", headers={**MCP_HEADERS, "mcp-session-id": session_id}
             )
             assert closed.status_code == 200
+            assert _sessions(server) == 0
+
+
+def _delete_scope(session_id: str) -> dict[str, Any]:
+    """One DELETE addressed to an established session."""
+    return {
+        "type": "http",
+        "asgi": {"version": "3.0", "spec_version": "2.3"},
+        "http_version": "1.1",
+        "method": "DELETE",
+        "scheme": "http",
+        "path": "/mcp",
+        "raw_path": b"/mcp",
+        "query_string": b"",
+        "root_path": "",
+        "headers": [
+            (b"host", b"127.0.0.1:8377"),
+            (b"accept", b"application/json, text/event-stream"),
+            (b"content-type", b"application/json"),
+            (b"mcp-session-id", session_id.encode("ascii")),
+        ],
+        "client": ("127.0.0.1", 50000),
+        "server": ("127.0.0.1", 8377),
+        "state": {},
+    }
+
+
+@pytest.mark.anyio
+async def test_a_close_interrupted_before_its_answer_still_frees_the_session(
+    app_config: AppConfig,
+    store: EngramStore,
+) -> None:
+    """The SDK terminates the transport and only then answers.
+
+    A client that has already gone makes that answer raise, so anything the
+    manager does after awaiting the SDK is exactly what never runs. Measured on
+    2026.813.3, which reclaimed only after a normal return: 25 interrupted closes
+    left 25 entries, permanently — the idle deadline cannot reach them, because
+    the task it would cancel has already ended. The exception belongs to the
+    caller and is left to propagate; the table must be empty regardless.
+    """
+    server = create_mcp_server(app_config, store)
+    app = server.streamable_http_app()
+    transport = httpx.ASGITransport(app=app)
+
+    async def receive() -> Message:
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def peer_is_gone(message: Message) -> None:
+        del message
+        raise OSError("client went away")
+
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1:8377") as client,
+    ):
+        for _ in range(25):
+            opened = await client.post(
+                "/mcp",
+                headers=MCP_HEADERS,
+                content=_initialize(VALID_INITIALIZE_PARAMS),
+            )
+            assert opened.status_code == 200
+            assert _sessions(server) == 1
+
+            with pytest.raises(OSError, match="client went away"):
+                await app(_delete_scope(opened.headers["mcp-session-id"]), receive, peer_is_gone)
+
             assert _sessions(server) == 0
 
 
