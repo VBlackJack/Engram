@@ -9,6 +9,66 @@ different version strings.
 
 ## [Unreleased]
 
+## [2026.813.3] - 2026-08-13
+
+### Fixed
+
+- Refuse a session opening on every rule the SDK applies to one, not only the rule the guard
+  happened to know about. 2026.813.2 checked that a session-opening body was a valid JSON-RPC
+  message; the SDK checks more than that, in three layers, and each of the checks it makes that the
+  guard did not was a session waved through to be refused and kept.
+
+  An `initialize` whose MCP parameters are invalid is well-formed JSON-RPC, so it passed the guard,
+  registered a transport, and was refused one layer deeper by the session — `200` with `-32602`,
+  after the allocation. Measured on the published wheel, 100 requests each: `params: {}`, `params`
+  absent, `params: null`, parameters of the wrong types, `clientInfo` absent, `protocolVersion`
+  absent, and a `clientInfo` without a name — 100 sessions each. The guard now validates the same
+  discriminated `ClientRequest` the session validates.
+
+  The guard also read `Accept` and `Content-Type` its own way, and its way was more permissive than
+  the SDK's on the inputs where the two can differ at all: a header sent twice, a list of media
+  types, a parameter before a comma. Each such input passed the guard and was refused by the SDK.
+  Both checks are now transcribed from the transport, and read through the same Starlette header
+  view, so there is no parsing left to disagree about. Transcribing the transport's checks also
+  surfaced a third reading of `Content-Type`, stricter than the other two, in the security
+  middleware that runs before everything on every POST; that one is applied here too.
+
+  Transcribing turned out to be the wrong instrument for one of those layers. FastMCP enables DNS
+  rebinding protection by default for a loopback host, and its Host and Origin rules are built from
+  settings rather than from constants, so a foreign `Host` was answered `421` — after the session
+  had been registered; measured, 100 requests, 100 sessions. That middleware is now invoked rather
+  than copied, and the response object it builds is the one sent, so there is nothing left in that
+  layer that could disagree. The two checks that must still be copied, because the transport holds
+  them privately, are pinned against the originals by a test that fails if an SDK upgrade moves
+  either of them.
+
+  Every refusal now reproduces the framing of the layer that owns it as well as its status and its
+  wording: bare text for the security middleware, a JSON-RPC error body for the transport, and one
+  server-sent event for the session.
+
+- Forget a session the client closed, instead of only terminating it. Terminating is a transport
+  operation: it closes the streams and marks the transport terminated. Neither of the session
+  manager's removal paths then applies — the idle branch runs only when the deadline cancelled the
+  session task, and closing the streams ends that task by returning; the cleanup branch that
+  follows declines to remove a transport which is already terminated. The entry survived, and the
+  idle deadline could never reclaim it either, because the task it would have cancelled had already
+  finished. Measured on 2026.813.2: 25 open-then-close cycles left 25 entries, every one of them
+  terminated, still held long after the deadline had passed.
+
+  This is the ordinary path — an editor restarting, a client reconnecting — so it grew a daemon that
+  was being used correctly, and no refusal in front of the transport could have prevented it: the
+  request that closes a session must reach the session it closes. Engram's session manager now drops
+  the entry once the request that terminated it has been answered.
+
+### Added
+
+- `[server].session_idle_timeout_seconds`, defaulting to 1800. Refusing invalid openings does
+  nothing about openings that are valid: the SDK reclaims a session only when the client deletes
+  it, and FastMCP sets no deadline, so a client that initialises and then vanishes — a crash, a
+  closed laptop, a killed editor — cost one session and one task for the remaining life of the
+  process. Measured before the deadline existed: 300 initialisations never closed, 300 sessions
+  still held after the last request. Engram now builds the session manager itself to set it.
+
 ## [2026.813.2] - 2026-08-13
 
 ### Fixed
@@ -33,6 +93,8 @@ different version strings.
   Measured after the change: 500 requests of each of the eleven refused shapes, and of each refused
   method, grow the session table by zero, while a session initialising alongside the flood lists
   both tools, remembers and recalls without noticing it.
+  Corrected in 2026.813.3: the rule checked here was narrower than the one the SDK applies, so an
+  initialize with invalid MCP parameters, and several header shapes, were still waved through.
 
 ## [2026.813.1] - 2026-08-13
 
@@ -367,7 +429,8 @@ different version strings.
 - Mirrored French and English product documentation, CI gates, release artifacts, and MCP Registry
   metadata.
 
-[Unreleased]: https://github.com/VBlackJack/Engram/compare/v2026.813.2...HEAD
+[Unreleased]: https://github.com/VBlackJack/Engram/compare/v2026.813.3...HEAD
+[2026.813.3]: https://github.com/VBlackJack/Engram/compare/v2026.813.2...v2026.813.3
 [2026.813.2]: https://github.com/VBlackJack/Engram/compare/v2026.813.1...v2026.813.2
 [2026.813.1]: https://github.com/VBlackJack/Engram/compare/v2026.0730.02...v2026.813.1
 [2026.0730.02]: https://github.com/VBlackJack/Engram/compare/v2026.0721.04...v2026.0730.02
