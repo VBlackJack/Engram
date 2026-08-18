@@ -98,13 +98,25 @@ class DatabaseConfig:
 
 @dataclass(frozen=True, slots=True)
 class TtlConfig:
-    """Fixed entry lifetime in days, where zero disables expiration."""
+    """Entry lifetime in days, where zero disables expiration.
+
+    The per-kind values answer "how long is this statement believed to hold?",
+    which is a property of trusted content. An unattested candidate poses a
+    different question — "how long do we keep an unreviewed guess?" — and it used
+    to be answered with the same number. For the three kinds set to zero that
+    meant never, so a model's unverified claim inherited the lifetime of a
+    human-verified fact and accumulated without bound.
+    """
 
     preference: int = 0
     decision: int = 0
     fact: int = 0
     project_state: int = 30
     episode: int = 7
+    # A candidate nobody has trusted in this many days will not be trusted. Zero
+    # restores the previous behaviour for an installation with its own retention
+    # story, and is an escape hatch rather than a default.
+    candidate_max_days: int = 90
 
     def for_kind(self, kind: EntryKind) -> int:
         """Return the configured lifetime for an entry kind."""
@@ -116,6 +128,21 @@ class TtlConfig:
             EntryKind.EPISODE: self.episode,
         }
         return values[kind]
+
+    def for_candidate(self, kind: EntryKind) -> int:
+        """Return the lifetime an unattested candidate of this kind receives.
+
+        The ceiling only ever shortens: an episode keeps its seven days and a
+        project state its thirty, because a candidate must not outlive what the
+        same statement would get once trusted. It governs exactly the kinds whose
+        trusted lifetime is unbounded.
+        """
+        kind_days = self.for_kind(kind)
+        if self.candidate_max_days == 0:
+            return kind_days
+        if kind_days == 0:
+            return self.candidate_max_days
+        return min(kind_days, self.candidate_max_days)
 
 
 @dataclass(frozen=True, slots=True)
@@ -503,6 +530,12 @@ def load_config(
                 DEFAULT_TTL_CONFIG.project_state,
             ),
             episode=_integer_value(ttl_days, "episode", environment, DEFAULT_TTL_CONFIG.episode),
+            candidate_max_days=_integer_value(
+                ttl_days,
+                "candidate_max_days",
+                environment,
+                DEFAULT_TTL_CONFIG.candidate_max_days,
+            ),
         ),
         limits=LimitsConfig(
             max_statement_chars=_integer_value(
@@ -1025,6 +1058,7 @@ def _validate_storage_config(config: AppConfig) -> None:
         config.ttl_days.fact,
         config.ttl_days.project_state,
         config.ttl_days.episode,
+        config.ttl_days.candidate_max_days,
     )
     if any(value < 0 for value in ttl_values):
         raise ConfigError("ttl_days values must be zero or greater")

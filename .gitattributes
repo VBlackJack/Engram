@@ -4,4 +4,8 @@
 *.toml text eol=lf
 *.yml text eol=lf
 *.json text eol=lf
+# A packaged resource must not depend on the platform it was built on:
+# client-protocol.txt ships inside the wheel and is written verbatim into
+# CLAUDE.md, AGENTS.md or GEMINI.md by `setup client --protocol`.
+*.txt text eol=lf
 uv.lock text eol=lf

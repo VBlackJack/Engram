@@ -51,6 +51,9 @@ def app_config(tmp_path: Path) -> AppConfig:
             fact=0,
             project_state=30,
             episode=7,
+            # Stated rather than inherited: every store fixture declares the
+            # ceiling that bounds the candidates it creates.
+            candidate_max_days=90,
         ),
         limits=LimitsConfig(max_statement_chars=2000, max_subject_keys=8),
         logging=LoggingConfig(
