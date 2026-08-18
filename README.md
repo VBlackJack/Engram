@@ -285,6 +285,14 @@ uv run --python 3.14.6 pytest
 uv build --python 3.14.6
 ```
 
+## Contribuer
+
+Les portillons, les conventions de commit et la règle de miroir FR/EN de la documentation sont
+décrits dans [CONTRIBUTING.md](CONTRIBUTING.md). Une faille se signale en privé, jamais dans une
+issue publique : voir [SECURITY.md](SECURITY.md), qui décrit aussi le modèle de menace — endpoint
+en loopback seul, absence d'authentification sur le port, et confiance accordée uniquement par un
+geste humain.
+
 ## Licence
 
 Apache License 2.0. Copyright 2026 Julien Bombled. Voir [LICENSE](LICENSE) et les

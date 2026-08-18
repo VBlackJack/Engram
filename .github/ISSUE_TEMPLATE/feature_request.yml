@@ -1,0 +1,24 @@
+name: Feature request
+description: Propose something Engram should do and does not
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: >-
+        What are you trying to do, and where does Engram stop you? Describe the situation rather
+        than the feature, so that a different solution stays possible.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you have in mind
+      description: Optional. If you already know the shape it should take, say so.
+  - type: textarea
+    id: workaround
+    attributes:
+      label: What you do today instead
+      description: >-
+        A workaround tells us how much the gap costs, which decides whether it is worth code.
