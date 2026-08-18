@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Security report
+    url: https://github.com/VBlackJack/Engram/security/advisories/new
+    about: Report a vulnerability privately, never in a public issue.
+  - name: Documentation
+    url: https://github.com/VBlackJack/Engram/tree/main/docs
+    about: Setup, operator guide and architecture, mirrored in French and English.

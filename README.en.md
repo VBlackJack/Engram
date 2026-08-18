@@ -271,6 +271,13 @@ uv run --python 3.14.6 pytest
 uv build --python 3.14.6
 ```
 
+## Contributing
+
+The gates, the commit convention and the FR/EN documentation mirroring rule are described in
+[CONTRIBUTING.md](CONTRIBUTING.md). Report a vulnerability privately, never in a public issue: see
+[SECURITY.md](SECURITY.md), which also states the threat model — a loopback-only endpoint, no
+authentication on the port, and trust granted only by a human gesture.
+
 ## License
 
 Apache License 2.0. Copyright 2026 Julien Bombled. See [LICENSE](LICENSE) and the

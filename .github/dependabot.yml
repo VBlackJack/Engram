@@ -1,0 +1,18 @@
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    commit-message:
+      prefix: "ci"
+  - package-ecosystem: "uv"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    commit-message:
+      prefix: "build"
+    # The runtime dependencies are pinned exactly on purpose: the MCP SDK's
+    # transport behaviour is load-bearing here, and an unreviewed minor bump has
+    # already reopened a defect this project had closed.
+    open-pull-requests-limit: 5

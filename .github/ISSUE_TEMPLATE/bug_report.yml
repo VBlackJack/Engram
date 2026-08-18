@@ -1,0 +1,48 @@
+name: Bug report
+description: Something behaves differently from what the documentation says
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        For anything with a security dimension, please use
+        [SECURITY.md](https://github.com/VBlackJack/Engram/blob/main/SECURITY.md) instead.
+  - type: textarea
+    id: doctor
+    attributes:
+      label: engram doctor
+      description: >-
+        Paste the full output. It reports the interpreter, the SQLite version, which configuration
+        was resolved, the schema version and the state of the endpoint, which is most of what is
+        needed to place a defect.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected, and what happened
+      description: Quote the page or the command output that led you to expect it, if there is one.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: How to reproduce
+      description: The commands, in order, starting from a state you can describe.
+      render: shell
+    validations:
+      required: true
+  - type: input
+    id: client
+    attributes:
+      label: MCP client
+      description: Which client and version was connected, if the problem involves one.
+      placeholder: Claude Code 2.x, Codex CLI 0.148, Gemini CLI, none
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      placeholder: Windows 11, Ubuntu 24.04, macOS 15
+    validations:
+      required: true
