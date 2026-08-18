@@ -1683,7 +1683,16 @@ class EngramStore:
                     statuses=(EntryStatus.SUPERSEDED, EntryStatus.EXPIRED),
                 )
                 other_live_candidate = bool(candidate_rows)
-                ttl_days = self._config.ttl_days.for_kind(normalized_kind)
+                # This path creates both candidates and directly attested
+                # entries, so the ceiling is chosen by what is being written, not
+                # by the path. Attestation elsewhere recomputes the expiry with
+                # for_kind, which is what lifts the bound when a person takes
+                # responsibility for the statement.
+                ttl_days = (
+                    self._config.ttl_days.for_candidate(normalized_kind)
+                    if status is EntryStatus.QUARANTINED
+                    else self._config.ttl_days.for_kind(normalized_kind)
+                )
                 expires_at = None if ttl_days == 0 else now + timedelta(days=ttl_days)
                 entry_id = _new_ulid(now)
                 entry = Entry(

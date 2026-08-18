@@ -126,7 +126,7 @@ dossier du fichier TOML.
 | Section TOML | Variables principales | Rôle |
 | --- | --- | --- |
 | `[database]` | `ENGRAM_DATABASE_PATH`, `ENGRAM_DATABASE_BUSY_TIMEOUT_MS` | Base et attente SQLite |
-| `[ttl_days]` | `ENGRAM_TTL_DAYS_PREFERENCE`, `_DECISION`, `_FACT`, `_PROJECT_STATE`, `_EPISODE` | Durée par kind ; `0` désactive l'expiration |
+| `[ttl_days]` | `ENGRAM_TTL_DAYS_PREFERENCE`, `_DECISION`, `_FACT`, `_PROJECT_STATE`, `_EPISODE`, `_CANDIDATE_MAX_DAYS` | Durée de vie fiable par kind, où `0` désactive l'expiration ; `candidate_max_days` (90) borne en plus un candidat non attesté |
 | `[limits]` | `ENGRAM_LIMITS_MAX_STATEMENT_CHARS`, `ENGRAM_LIMITS_MAX_SUBJECT_KEYS` | Bornes d'entrée |
 | `[logging]` | `ENGRAM_LOGGING_PATH`, `_FILE_LEVEL`, `_CONSOLE_LEVEL` | Fichier et niveaux de log |
 | `[attestation]` | `ENGRAM_ATTESTATION_DEFAULT_ACTOR` | Acteur par défaut des mutations locales de confiance |

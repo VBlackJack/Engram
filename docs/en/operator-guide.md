@@ -164,7 +164,8 @@ discovery hint and is not a substitute.
 
 `--valid-from` and `--valid-until` are calendar days; `--observed-at` is an instant and requires an
 explicit offset. `--valid-until` is a lifetime bound on one statement and is unrelated to the
-`[ttl_days]` policy, which applies per kind.
+`[ttl_days]` policy, which applies per kind — and, for a candidate nobody has attested, the
+`candidate_max_days` ceiling that bounds it whatever its kind says.
 
 ### Accepted evidence types
 

@@ -118,7 +118,7 @@ overridden as `ENGRAM_<SECTION>_<KEY>`; relative paths resolve from the TOML fil
 | TOML section | Main variables | Purpose |
 | --- | --- | --- |
 | `[database]` | `ENGRAM_DATABASE_PATH`, `ENGRAM_DATABASE_BUSY_TIMEOUT_MS` | Database and SQLite wait |
-| `[ttl_days]` | `ENGRAM_TTL_DAYS_PREFERENCE`, `_DECISION`, `_FACT`, `_PROJECT_STATE`, `_EPISODE` | Lifetime by kind; `0` disables expiry |
+| `[ttl_days]` | `ENGRAM_TTL_DAYS_PREFERENCE`, `_DECISION`, `_FACT`, `_PROJECT_STATE`, `_EPISODE`, `_CANDIDATE_MAX_DAYS` | Trusted lifetime by kind, where `0` disables expiry; `candidate_max_days` (90) additionally bounds an unattested candidate |
 | `[limits]` | `ENGRAM_LIMITS_MAX_STATEMENT_CHARS`, `ENGRAM_LIMITS_MAX_SUBJECT_KEYS` | Input bounds |
 | `[logging]` | `ENGRAM_LOGGING_PATH`, `_FILE_LEVEL`, `_CONSOLE_LEVEL` | Log file and levels |
 | `[attestation]` | `ENGRAM_ATTESTATION_DEFAULT_ACTOR` | Default actor for trusted local mutations |

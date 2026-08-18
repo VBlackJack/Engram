@@ -45,6 +45,7 @@ decision = 0
 fact = 0
 project_state = 30
 episode = 7
+candidate_max_days = 120
 
 [limits]
 max_statement_chars = 2000
@@ -87,6 +88,7 @@ rrf_k = 60
         "ENGRAM_DATABASE_PATH": "override.db",
         "ENGRAM_DATABASE_BUSY_TIMEOUT_MS": "7500",
         "ENGRAM_TTL_DAYS_EPISODE": "3",
+        "ENGRAM_TTL_DAYS_CANDIDATE_MAX_DAYS": "45",
         "ENGRAM_LIMITS_MAX_SUBJECT_KEYS": "4",
         "ENGRAM_LOGGING_FILE_LEVEL": "debug",
         "ENGRAM_ATTESTATION_DEFAULT_ACTOR": "reviewer@example",
@@ -116,6 +118,7 @@ rrf_k = 60
     assert config.database.busy_timeout_ms == 7500
     assert config.ttl_days.episode == 3
     assert config.ttl_days.project_state == 30
+    assert config.ttl_days.candidate_max_days == 45
     assert config.limits.max_subject_keys == 4
     assert config.logging.file_level == "DEBUG"
     assert config.logging.path == (tmp_path / "logs" / "base.log").resolve()

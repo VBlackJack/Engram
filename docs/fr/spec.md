@@ -18,7 +18,12 @@ des décisions du serveur, pas des affirmations libres du client.
 | `fact` | Fait stable vérifié | Sans expiration |
 | `episode` | Événement de session utile à court terme | 7 jours |
 
-Les TTL sont configurables dans `[ttl_days]`. La valeur `0` désactive l'expiration. Recall exclut
+Les TTL sont configurables dans `[ttl_days]`. La valeur `0` désactive l'expiration d'une entrée
+**fiable**. Un candidat non attesté est en plus borné par `candidate_max_days`, 90 par défaut :
+un `kind` réglé à `0` n'accorde donc jamais à la supposition non relue d'un modèle la durée de vie
+d'un fait vérifié par un humain. Le plafond ne fait que raccourcir, et attester un candidat le lève. L'expiration d'un candidat le
+retire de la recall sans rien supprimer : `engram list --status expired` montre toujours l'énoncé,
+et l'attester le ramène en fiable sous la forme d'une nouvelle entrée. Recall exclut
 immédiatement les entrées à ou après `expires_at`, puis le démon passe périodiquement leur status
 à `expired`. La validité métier est inclusive : une entrée ne peut être rappelée ou consolidée que
 si la date UTC du store respecte `valid_from <= aujourd'hui <= valid_until` ; une borne

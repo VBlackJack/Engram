@@ -9,6 +9,35 @@ different version strings.
 
 ## [Unreleased]
 
+### Added
+
+- `[ttl_days].candidate_max_days`, 90 by default, bounding how long an unattested candidate is kept.
+  Until now one table answered two different questions with one number: how long a statement is
+  believed to hold, which is a property of trusted content, and how long an unreviewed guess is
+  worth keeping. `preference`, `decision` and `fact` ship as `0`, correct for the first question and
+  wrong for the second, so a model's claim inherited the lifetime of a human-verified fact and
+  accumulated without bound — measured on a two-month-old installation: 900 entries, 4 trusted, 228
+  candidates that would never expire, and 27 more arriving daily.
+
+  The ceiling only ever shortens: an episode candidate keeps its seven days and a project state its
+  thirty, because a candidate must not outlive what the same statement would get once trusted. It
+  therefore governs exactly the kinds whose trusted lifetime is unbounded. Attesting a candidate
+  recomputes the expiry from the kind alone, so taking responsibility for a statement is what lifts
+  the bound. Setting the ceiling to `0` restores the previous behaviour for an installation with its
+  own retention story.
+
+  Expiring a candidate removes it from recall and from `own_pending`; it does not delete anything.
+  The statement stays in the database, `engram list --status expired` shows it with the date it
+  lapsed, and attesting the same statement returns it to trusted as a new entry with outcome
+  `renewed` — what is lost is the entry id, the first-seen timestamp and any corroboration it had
+  accumulated, not the claim itself.
+
+  The change is forward-only. Candidates already carrying no expiry keep none, deliberately: a
+  backfill would have to run inside a migration, migrations run on every database open including
+  `engram serve`, and the result would be a large part of an existing memory leaving recall a minute
+  after an upgrade with nothing said about it.
+
+
 ## [2026.813.4] - 2026-08-13
 
 ### Fixed

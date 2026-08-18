@@ -18,7 +18,12 @@ decisions, not free-form client claims.
 | `fact` | Stable verified fact | No expiry |
 | `episode` | Short-lived useful session event | 7 days |
 
-TTLs are configurable in `[ttl_days]`. A value of `0` disables expiry. Recall excludes entries at
+TTLs are configurable in `[ttl_days]`. A value of `0` disables expiry for a **trusted** entry.
+An unattested candidate is additionally bounded by `candidate_max_days`, 90 by default, so a kind
+set to `0` never grants a model's unreviewed guess the lifetime of a human-verified fact; the
+ceiling only ever shortens, and attesting a candidate lifts it. Expiring a candidate removes it
+from recall without deleting it: `engram list --status expired` still shows the statement, and
+attesting it returns it to trusted as a new entry. Recall excludes entries at
 or past `expires_at` immediately, while the daemon periodically changes their status to `expired`.
 Business validity is inclusive: an entry is recallable and consolidatable only when the store's UTC
 date satisfies `valid_from <= today <= valid_until`; either missing bound is open-ended.

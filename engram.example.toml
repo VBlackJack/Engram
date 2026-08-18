@@ -8,6 +8,11 @@ decision = 0
 fact = 0
 project_state = 30
 episode = 7
+# An unattested candidate is bounded by this ceiling as well as by its kind, so a
+# kind set to 0 above never grants a model's unreviewed guess the lifetime of a
+# human-verified fact. Attesting one lifts the bound. Zero here restores the
+# previous behaviour for an installation with its own retention story.
+candidate_max_days = 90
 
 [limits]
 max_statement_chars = 2000

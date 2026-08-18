@@ -172,7 +172,8 @@ famille de conflit, et une entrée qui en est dépourvue est omise du rappel en 
 
 `--valid-from` et `--valid-until` sont des jours calendaires ; `--observed-at` est un instant et
 exige un décalage explicite. `--valid-until` borne la durée de vie d'un énoncé et n'a rien à voir
-avec la politique `[ttl_days]`, qui s'applique par `kind`.
+avec la politique `[ttl_days]`, qui s'applique par `kind` — et, pour un candidat que personne n'a
+attesté, avec le plafond `candidate_max_days` qui le borne quoi que dise son `kind`.
 
 ### Types de preuve acceptés
 
